@@ -76,6 +76,13 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
+    /// Close stdin (send EOF to the process)
+    CloseStdin {
+        /// Remote host
+        host: String,
+        /// Process ID
+        id: String,
+    },
     /// Kill a process
     Kill {
         /// Remote host
@@ -189,6 +196,10 @@ fn route_via_daemon(command: &Command) -> ExitCode {
             input: input.clone(),
             raw: *raw,
         },
+        Command::CloseStdin { host, id } => DaemonRequest::CloseStdin {
+            host: host.clone(),
+            id: id.clone(),
+        },
         Command::Kill { host, id } => DaemonRequest::Kill {
             host: host.clone(),
             id: id.clone(),
@@ -263,6 +274,10 @@ fn route_via_ssh(command: &Command) -> ExitCode {
             raw,
         } => {
             let args = RemoteArgs::write(id, input, *raw);
+            ssh_exec(host, &args.as_str_slice())
+        }
+        Command::CloseStdin { host, id } => {
+            let args = RemoteArgs::close_stdin(id);
             ssh_exec(host, &args.as_str_slice())
         }
         Command::Kill { host, id } => {

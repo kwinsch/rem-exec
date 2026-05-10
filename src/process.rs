@@ -5,8 +5,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{RemExecError, Result};
 
-/// Default base directory for process state on the remote side.
-pub const REMOTE_BASE: &str = "/tmp/rem-exec";
+/// Return the per-user base directory for process state on the remote side.
+/// Uses /tmp/rem-exec-<uid>/ to avoid collisions and permission issues on
+/// shared hosts.
+pub fn remote_base() -> PathBuf {
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/tmp/rem-exec-{uid}"))
+}
 
 /// Per-process state directory layout.
 pub struct ProcessDir {
@@ -38,6 +43,9 @@ impl ProcessDir {
     }
     pub fn stdin_pipe_path(&self) -> PathBuf {
         self.dir.join("stdin_pipe")
+    }
+    pub fn stdin_holder_path(&self) -> PathBuf {
+        self.dir.join("stdin_holder_pid")
     }
     pub fn stdout_path(&self) -> PathBuf {
         self.dir.join("stdout")
@@ -83,6 +91,14 @@ impl ProcessDir {
     /// Read the command PID.
     pub fn read_pid(&self) -> Result<Option<u32>> {
         match fs::read_to_string(self.pid_path()) {
+            Ok(s) => Ok(s.trim().parse::<u32>().ok()),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Read the stdin holder PID.
+    pub fn read_stdin_holder_pid(&self) -> Result<Option<u32>> {
+        match fs::read_to_string(self.stdin_holder_path()) {
             Ok(s) => Ok(s.trim().parse::<u32>().ok()),
             Err(_) => Ok(None),
         }

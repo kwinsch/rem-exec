@@ -1,18 +1,17 @@
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use crate::process::{ProcessDir, ProcessState, REMOTE_BASE, unix_timestamp};
-use crate::protocol::{ProcessSummary, Response};
-
 use crate::base64_encode;
+use crate::process::{ProcessDir, ProcessState, remote_base, unix_timestamp};
+use crate::protocol::{ProcessSummary, Response};
 
 /// Get process status with self-healing: if status says "running" but process
 /// is dead, update to "exited(unknown)".
 pub fn status(id: &str) -> Response {
-    let pdir = ProcessDir::new(Path::new(REMOTE_BASE), id);
+    let base = remote_base();
+    let pdir = ProcessDir::new(&base, id);
     let state = match pdir.read_status() {
         Ok(s) => s,
         Err(_) => return Response::error(format!("process not found: {id}")),
@@ -23,13 +22,11 @@ pub fn status(id: &str) -> Response {
         if let Ok(Some(pid)) = pdir.read_pid() {
             let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
             if !alive {
-                // Also check runner
                 let runner_alive = pdir
                     .read_runner_pid()
                     .ok()
                     .flatten()
-                    .map(|rp| unsafe { libc::kill(rp as i32, 0) } == 0)
-                    .unwrap_or(false);
+                    .is_some_and(|rp| unsafe { libc::kill(rp as i32, 0) } == 0);
                 if !runner_alive {
                     let _ = fs::write(pdir.status_path(), "exited(unknown)");
                     let _ = fs::write(pdir.ended_path(), unix_timestamp().to_string());
@@ -58,12 +55,13 @@ pub fn status(id: &str) -> Response {
     }
 }
 
-/// Default read limit: 1 MiB. Prevents unbounded memory usage for large outputs.
+/// Default read limit: 1 MiB.
 const DEFAULT_READ_LIMIT: u64 = 1024 * 1024;
 
 /// Read process output (stdout or stderr) with optional byte offset and limit.
 pub fn read_output(id: &str, stream: &str, offset: Option<u64>, limit: Option<u64>) -> Response {
-    let pdir = ProcessDir::new(Path::new(REMOTE_BASE), id);
+    let base = remote_base();
+    let pdir = ProcessDir::new(&base, id);
     let path = match stream {
         "stdout" => pdir.stdout_path(),
         "stderr" => pdir.stderr_path(),
@@ -101,9 +99,9 @@ pub fn read_output(id: &str, stream: &str, offset: Option<u64>, limit: Option<u6
 
 /// Get the byte size of a stream file.
 pub fn size(id: &str, stream: &str) -> Response {
-    let pdir = ProcessDir::new(Path::new(REMOTE_BASE), id);
+    let base = remote_base();
+    let pdir = ProcessDir::new(&base, id);
     let sz = pdir.stream_size(stream);
-    // Reuse Output response with empty data
     Response::Output {
         data: String::new(),
         offset: 0,
@@ -117,22 +115,20 @@ pub fn size(id: &str, stream: &str) -> Response {
 /// input is sent as-is. Uses O_NONBLOCK to avoid hanging if the process has
 /// already exited.
 pub fn write_stdin(id: &str, input: &str, raw: bool) -> Response {
-    let pdir = ProcessDir::new(Path::new(REMOTE_BASE), id);
+    let base = remote_base();
+    let pdir = ProcessDir::new(&base, id);
     let fifo = pdir.stdin_pipe_path();
 
-    // Check process exists
     if !pdir.dir.exists() {
         return Response::error(format!("process not found: {id}"));
     }
 
-    // Check process is still running
     if let Ok(state) = pdir.read_status() {
         if !matches!(state, ProcessState::Running) {
             return Response::error(format!("process already exited: {id}"));
         }
     }
 
-    // Open FIFO with O_NONBLOCK to avoid hanging if no reader
     let fifo_cstr = match std::ffi::CString::new(fifo.to_str().unwrap_or("")) {
         Ok(c) => c,
         Err(e) => return Response::error(format!("invalid path: {e}")),
@@ -162,24 +158,77 @@ pub fn write_stdin(id: &str, input: &str, raw: bool) -> Response {
     }
 }
 
-/// Kill a process by sending SIGTERM to the process group.
+/// Close the stdin FIFO (send EOF to the process).
 ///
-/// After setsid(), the runner is the process group leader (PGID == runner_pid).
-/// The command inherits that PGID. So we kill -runner_pid to hit the entire
-/// group (runner + command + any children that haven't changed their PGID).
-pub fn kill(id: &str) -> Response {
-    let pdir = ProcessDir::new(Path::new(REMOTE_BASE), id);
+/// Kills the holder process, which is the last writer on the FIFO. Once the
+/// holder dies, the command sees EOF on stdin.
+pub fn close_stdin(id: &str) -> Response {
+    let base = remote_base();
+    let pdir = ProcessDir::new(&base, id);
 
     if !pdir.dir.exists() {
         return Response::error(format!("process not found: {id}"));
     }
 
-    // Kill the entire process group via the runner (session/group leader)
-    if let Ok(Some(rpid)) = pdir.read_runner_pid() {
-        unsafe { libc::kill(-(rpid as i32), libc::SIGTERM) };
-    } else if let Ok(Some(pid)) = pdir.read_pid() {
-        // Fallback: kill the command directly
-        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    if let Ok(Some(holder_pid)) = pdir.read_stdin_holder_pid() {
+        let alive = unsafe { libc::kill(holder_pid as i32, 0) } == 0;
+        if alive {
+            unsafe { libc::kill(holder_pid as i32, libc::SIGTERM) };
+            Response::Written { bytes: 0 } // 0 bytes = EOF marker
+        } else {
+            Response::error("stdin already closed")
+        }
+    } else {
+        Response::error("no stdin holder found")
+    }
+}
+
+/// Kill a process with SIGTERM→wait→SIGKILL escalation.
+///
+/// After setsid(), the runner is the process group leader (PGID == runner_pid).
+/// The command and holder inherit that PGID. We kill the entire group.
+pub fn kill(id: &str) -> Response {
+    let base = remote_base();
+    let pdir = ProcessDir::new(&base, id);
+
+    if !pdir.dir.exists() {
+        return Response::error(format!("process not found: {id}"));
+    }
+
+    let rpid = pdir.read_runner_pid().ok().flatten();
+    let cpid = pdir.read_pid().ok().flatten();
+
+    // Phase 1: SIGTERM to process group
+    let sent = if let Some(rpid) = rpid {
+        (unsafe { libc::kill(-(rpid as i32), libc::SIGTERM) }) == 0
+    } else if let Some(cpid) = cpid {
+        (unsafe { libc::kill(cpid as i32, libc::SIGTERM) }) == 0
+    } else {
+        false
+    };
+
+    if !sent {
+        // Process already dead — just update state
+        let _ = fs::write(pdir.status_path(), "exited(killed)");
+        let _ = fs::write(pdir.ended_path(), unix_timestamp().to_string());
+        return Response::Killed { id: id.to_string() };
+    }
+
+    // Phase 2: wait briefly for graceful exit
+    thread::sleep(Duration::from_millis(200));
+
+    // Phase 3: check if still alive, escalate to SIGKILL
+    let still_alive = cpid
+        .map(|p| unsafe { libc::kill(p as i32, 0) } == 0)
+        .unwrap_or(false);
+
+    if still_alive {
+        if let Some(rpid) = rpid {
+            unsafe { libc::kill(-(rpid as i32), libc::SIGKILL) };
+        } else if let Some(cpid) = cpid {
+            unsafe { libc::kill(cpid as i32, libc::SIGKILL) };
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 
     let _ = fs::write(pdir.status_path(), "exited(killed)");
@@ -190,16 +239,16 @@ pub fn kill(id: &str) -> Response {
 
 /// List all managed processes.
 pub fn list() -> Response {
-    let base = Path::new(REMOTE_BASE);
+    let base = remote_base();
     let mut processes = Vec::new();
 
-    if let Ok(entries) = fs::read_dir(base) {
+    if let Ok(entries) = fs::read_dir(&base) {
         for entry in entries.flatten() {
             if !entry.path().is_dir() {
                 continue;
             }
             let id = entry.file_name().to_string_lossy().to_string();
-            let pdir = ProcessDir::new(base, &id);
+            let pdir = ProcessDir::new(&base, &id);
             let state = pdir
                 .read_status()
                 .map(|s| s.to_string())
@@ -212,24 +261,26 @@ pub fn list() -> Response {
     Response::List { processes }
 }
 
-/// Clean up exited processes. Returns the list of removed IDs.
+/// Clean up exited processes.
 pub fn clean() -> Response {
-    let base = Path::new(REMOTE_BASE);
+    let base = remote_base();
     let mut removed = Vec::new();
 
-    if let Ok(entries) = fs::read_dir(base) {
+    if let Ok(entries) = fs::read_dir(&base) {
         for entry in entries.flatten() {
             if !entry.path().is_dir() {
                 continue;
             }
             let id = entry.file_name().to_string_lossy().to_string();
-            let pdir = ProcessDir::new(base, &id);
+            let pdir = ProcessDir::new(&base, &id);
 
             if let Ok(state) = pdir.read_status() {
                 if !matches!(state, ProcessState::Running) {
-                    // Kill runner if still alive
                     if let Ok(Some(rpid)) = pdir.read_runner_pid() {
                         unsafe { libc::kill(rpid as i32, libc::SIGTERM) };
+                    }
+                    if let Ok(Some(hpid)) = pdir.read_stdin_holder_pid() {
+                        unsafe { libc::kill(hpid as i32, libc::SIGTERM) };
                     }
                     let _ = fs::remove_dir_all(&pdir.dir);
                     removed.push(id);
@@ -242,11 +293,11 @@ pub fn clean() -> Response {
 }
 
 /// Follow (tail) a stream file, writing raw bytes to stdout.
-/// This is used by the local daemon's streaming threads.
 /// Streams until the process exits and all output is flushed.
-/// If `offset` is provided, seeks to that position first (for resume after disconnect).
+/// If `offset` is provided, seeks to that position first (for resume).
 pub fn follow(id: &str, stream: &str, offset: Option<u64>) -> Response {
-    let pdir = ProcessDir::new(Path::new(REMOTE_BASE), id);
+    let base = remote_base();
+    let pdir = ProcessDir::new(&base, id);
     let path = match stream {
         "stdout" => pdir.stdout_path(),
         "stderr" => pdir.stderr_path(),
@@ -258,7 +309,6 @@ pub fn follow(id: &str, stream: &str, offset: Option<u64>) -> Response {
         Err(_) => return Response::error(format!("process not found: {id}")),
     };
 
-    // Seek to offset for resume after disconnect
     if let Some(off) = offset {
         if off > 0 {
             let _ = file.seek(SeekFrom::Start(off));
@@ -272,21 +322,19 @@ pub fn follow(id: &str, stream: &str, offset: Option<u64>) -> Response {
     loop {
         match file.read(&mut buf) {
             Ok(0) => {
-                // No data available. Check if process has exited.
                 if let Ok(state) = pdir.read_status() {
                     if !matches!(state, ProcessState::Running) {
-                        // One final read to catch any remaining data
-                        match file.read(&mut buf) {
-                            Ok(n) if n > 0 => {
-                                let _ = stdout.write_all(&buf[..n]);
-                                let _ = stdout.flush();
+                        // Final drain
+                        while let Ok(n) = file.read(&mut buf) {
+                            if n == 0 {
+                                break;
                             }
-                            _ => {}
+                            let _ = stdout.write_all(&buf[..n]);
                         }
+                        let _ = stdout.flush();
                         break;
                     }
                 }
-                // Still running, sleep briefly and retry
                 thread::sleep(Duration::from_millis(100));
             }
             Ok(n) => {
@@ -297,7 +345,5 @@ pub fn follow(id: &str, stream: &str, offset: Option<u64>) -> Response {
         }
     }
 
-    // Don't return a JSON response — follow streams raw bytes.
-    // Return a dummy that the caller won't use.
     Response::error("follow completed")
 }

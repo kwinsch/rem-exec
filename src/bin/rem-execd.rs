@@ -1,10 +1,9 @@
 use std::fs;
-use std::path::Path;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use rem_exec::process::REMOTE_BASE;
+use rem_exec::process::remote_base;
 use rem_exec::protocol::Response;
 use rem_exec::remote::{actions, start};
 
@@ -61,6 +60,11 @@ enum Action {
         #[arg(long)]
         raw: bool,
     },
+    /// Close stdin (send EOF to the process)
+    CloseStdin {
+        /// Process ID
+        id: String,
+    },
     /// Kill a process
     Kill {
         /// Process ID
@@ -84,8 +88,11 @@ enum Action {
 }
 
 fn main() -> ExitCode {
-    // Ensure base directory exists
-    let _ = fs::create_dir_all(Path::new(REMOTE_BASE));
+    // Ensure base directory exists with 0700 permissions
+    let base = remote_base();
+    let _ = fs::create_dir_all(&base);
+    let base_cstr = std::ffi::CString::new(base.to_str().unwrap()).unwrap();
+    unsafe { libc::chmod(base_cstr.as_ptr(), 0o700) };
 
     let cli = Cli::parse();
 
@@ -103,17 +110,16 @@ fn main() -> ExitCode {
         } => actions::read_output(&id, &stream, offset, limit),
         Action::Size { id, stream } => actions::size(&id, &stream),
         Action::Write { id, input, raw } => actions::write_stdin(&id, &input, raw),
+        Action::CloseStdin { id } => actions::close_stdin(&id),
         Action::Kill { id } => actions::kill(&id),
         Action::List => actions::list(),
         Action::Clean => actions::clean(),
         Action::Follow { id, stream, offset } => {
-            // Follow streams raw bytes, not JSON.
             actions::follow(&id, &stream, offset);
             return ExitCode::SUCCESS;
         }
     };
 
-    // All actions (except follow) output a single JSON line
     println!(
         "{}",
         serde_json::to_string(&response).unwrap_or_else(|e| {

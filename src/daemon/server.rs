@@ -201,6 +201,7 @@ fn dispatch(
             input,
             raw,
         } => forward_ssh(&host, RemoteArgs::write(&id, &input, raw)),
+        DaemonRequest::CloseStdin { host, id } => forward_ssh(&host, RemoteArgs::close_stdin(&id)),
         DaemonRequest::Kill { host, id } => forward_ssh(&host, RemoteArgs::kill(&id)),
         DaemonRequest::List { host } => forward_ssh(&host, RemoteArgs::list()),
         DaemonRequest::Clean { host } => {

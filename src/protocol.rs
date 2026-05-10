@@ -81,6 +81,8 @@ pub enum DaemonRequest {
         #[serde(default)]
         raw: bool,
     },
+    #[serde(rename = "close_stdin")]
+    CloseStdin { host: String, id: String },
     #[serde(rename = "kill")]
     Kill { host: String, id: String },
     #[serde(rename = "list")]

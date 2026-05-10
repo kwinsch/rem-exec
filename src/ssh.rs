@@ -78,6 +78,12 @@ impl RemoteArgs {
         Self { args }
     }
 
+    pub fn close_stdin(id: &str) -> Self {
+        Self {
+            args: vec!["close-stdin".to_string(), id.to_string()],
+        }
+    }
+
     pub fn kill(id: &str) -> Self {
         Self {
             args: vec!["kill".to_string(), id.to_string()],
