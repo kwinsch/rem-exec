@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 
+# MUSL_PATH must point to musl-cross-make output/bin directory.
+# Example: export MUSL_PATH=/path/to/musl-cross-make/output/bin
 MUSL_PATH="${MUSL_PATH:?Set MUSL_PATH to your musl-cross-make output/bin directory}"
 STORE="${STORE:-$HOME/.local/share/rem-exec/bin}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
