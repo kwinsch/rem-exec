@@ -113,8 +113,8 @@ enum Command {
         /// Remote host (SSH destination)
         host: String,
     },
-    /// Print LLM-friendly usage guide
-    Llm,
+    /// Print skill file (machine-readable usage guide)
+    Skill,
 }
 
 #[derive(Subcommand)]
@@ -180,7 +180,7 @@ fn main() -> ExitCode {
         };
     }
 
-    if matches!(cli.command, Command::Llm) {
+    if matches!(cli.command, Command::Skill) {
         print!("{}", include_str!("../../docs/llm.txt"));
         return ExitCode::SUCCESS;
     }
@@ -368,7 +368,7 @@ fn route_via_daemon(command: &Command) -> ExitCode {
         Command::List { host } => DaemonRequest::List { host: host.clone() },
         Command::Clean { host } => DaemonRequest::Clean { host: host.clone() },
         Command::Deploy { host } => DaemonRequest::Deploy { host: host.clone() },
-        Command::Llm => unreachable!("handled above"),
+        Command::Skill => unreachable!("handled above"),
         Command::Daemon { .. } => unreachable!(),
     };
 
@@ -503,7 +503,7 @@ fn route_via_ssh(command: &Command) -> ExitCode {
             let args = RemoteArgs::clean();
             ssh_exec_auto_deploy(host, &args.as_str_slice())
         }
-        Command::Deploy { .. } | Command::Llm => unreachable!("handled above"),
+        Command::Deploy { .. } | Command::Skill => unreachable!("handled above"),
         Command::Daemon { .. } => unreachable!(),
     };
 

@@ -75,8 +75,8 @@ enum Action {
     Clean,
     /// Print version and protocol information
     Version,
-    /// Print LLM-friendly usage guide
-    Llm,
+    /// Print skill file (machine-readable usage guide)
+    Skill,
     /// Pipe stdin to a process (streams raw bytes from SSH channel to FIFO)
     PipeStdin {
         /// Process ID
@@ -101,7 +101,7 @@ enum Action {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    if matches!(cli.action, Action::Llm) {
+    if matches!(cli.action, Action::Skill) {
         print!("{}", include_str!("../../docs/llm.txt"));
         return ExitCode::SUCCESS;
     }
@@ -149,7 +149,7 @@ fn main() -> ExitCode {
             actions::follow(&id, &stream, offset);
             return ExitCode::SUCCESS;
         }
-        Action::Version | Action::Llm => unreachable!("handled above"),
+        Action::Version | Action::Skill => unreachable!("handled above"),
     };
 
     println!(
