@@ -1,4 +1,4 @@
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 
 use crate::deploy;
 use crate::error::{RemExecError, Result};
@@ -48,6 +48,19 @@ pub fn ssh_exec_auto_deploy(host: &str, args: &[&str]) -> Result<Response> {
 /// The remote binary name. Uses ~/.local/bin path since it may not be in
 /// the non-login SSH PATH.
 const REMOTE_BIN: &str = ".local/bin/rxd";
+
+/// Spawn an SSH process with stdin piped (for streaming data to remote).
+/// Returns the child process handle. Caller writes to child.stdin and waits.
+pub fn ssh_spawn_piped_stdin(host: &str, args: &[&str]) -> Result<Child> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg(host);
+    cmd.arg(REMOTE_BIN);
+    cmd.args(args);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::inherit());
+    cmd.spawn().map_err(RemExecError::Io)
+}
 
 /// Execute a raw SSH command, returning the Output.
 pub fn ssh_raw(host: &str, args: &[&str]) -> Result<Output> {
@@ -126,6 +139,20 @@ impl RemoteArgs {
         Self {
             args: vec!["version".to_string()],
         }
+    }
+
+    pub fn follow(id: &str) -> Self {
+        Self {
+            args: vec!["follow".to_string(), id.to_string(), "stdout".to_string()],
+        }
+    }
+
+    pub fn pipe_stdin(id: &str, no_close: bool) -> Self {
+        let mut args = vec!["pipe-stdin".to_string(), id.to_string()];
+        if no_close {
+            args.push("--no-close".to_string());
+        }
+        Self { args }
     }
 
     pub fn as_str_slice(&self) -> Vec<&str> {

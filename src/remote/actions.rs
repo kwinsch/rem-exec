@@ -158,6 +158,19 @@ pub fn write_stdin(id: &str, input: &str, raw: bool) -> Response {
     }
 }
 
+/// Kill the stdin holder process to signal EOF to the command.
+/// Returns true if the holder was alive and killed, false otherwise.
+fn kill_stdin_holder(pdir: &ProcessDir) -> bool {
+    if let Ok(Some(holder_pid)) = pdir.read_stdin_holder_pid() {
+        let alive = unsafe { libc::kill(holder_pid as i32, 0) } == 0;
+        if alive {
+            unsafe { libc::kill(holder_pid as i32, libc::SIGTERM) };
+            return true;
+        }
+    }
+    false
+}
+
 /// Close the stdin FIFO (send EOF to the process).
 ///
 /// Kills the holder process, which is the last writer on the FIFO. Once the
@@ -177,16 +190,81 @@ pub fn close_stdin(id: &str) -> Response {
         return Response::error(format!("process already exited: {id}"));
     }
 
-    if let Ok(Some(holder_pid)) = pdir.read_stdin_holder_pid() {
-        let alive = unsafe { libc::kill(holder_pid as i32, 0) } == 0;
-        if alive {
-            unsafe { libc::kill(holder_pid as i32, libc::SIGTERM) };
-            Response::Written { bytes: 0 } // 0 bytes = EOF marker
-        } else {
-            Response::error("stdin already closed")
-        }
+    if kill_stdin_holder(&pdir) {
+        Response::Written { bytes: 0 } // 0 bytes = EOF marker
     } else {
-        Response::error("no stdin holder found")
+        Response::error("stdin already closed or no holder found")
+    }
+}
+
+/// Pipe data from own stdin (SSH channel) to a process's stdin FIFO.
+/// The reverse of `follow`: reads stdin in chunks, writes to FIFO.
+/// No JSON output — this is a raw data channel.
+pub fn pipe_stdin(id: &str, no_close: bool) {
+    let base = remote_base();
+    let pdir = ProcessDir::new(&base, id);
+
+    if !pdir.dir.exists() {
+        std::process::exit(1);
+    }
+
+    if let Ok(state) = pdir.read_status()
+        && !matches!(state, ProcessState::Running)
+    {
+        std::process::exit(1);
+    }
+
+    let fifo = pdir.stdin_pipe_path();
+    let fifo_cstr = match std::ffi::CString::new(fifo.to_str().unwrap_or("")) {
+        Ok(c) => c,
+        Err(_) => std::process::exit(1),
+    };
+
+    // Blocking O_WRONLY — provides backpressure when command's buffer is full
+    let fd = unsafe { libc::open(fifo_cstr.as_ptr(), libc::O_WRONLY) };
+    if fd < 0 {
+        std::process::exit(1);
+    }
+
+    // Ignore SIGPIPE — we handle EPIPE from write() return value
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+
+    let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
+    let mut buf = [0u8; 8192];
+
+    loop {
+        let n = match stdin.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+
+        let mut offset = 0;
+        while offset < n {
+            let written = unsafe {
+                libc::write(
+                    fd,
+                    buf[offset..n].as_ptr() as *const libc::c_void,
+                    n - offset,
+                )
+            };
+            if written <= 0 {
+                unsafe { libc::close(fd) };
+                if !no_close {
+                    kill_stdin_holder(&pdir);
+                }
+                std::process::exit(1);
+            }
+            offset += written as usize;
+        }
+    }
+
+    unsafe { libc::close(fd) };
+
+    if !no_close {
+        kill_stdin_holder(&pdir);
     }
 }
 

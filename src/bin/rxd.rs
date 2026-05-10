@@ -75,6 +75,14 @@ enum Action {
     Clean,
     /// Print version and protocol information
     Version,
+    /// Pipe stdin to a process (streams raw bytes from SSH channel to FIFO)
+    PipeStdin {
+        /// Process ID
+        id: String,
+        /// Keep stdin open after pipe completes (don't kill holder)
+        #[arg(long)]
+        no_close: bool,
+    },
     /// Follow a stream (streams raw bytes, used by daemon)
     Follow {
         /// Process ID
@@ -126,6 +134,10 @@ fn main() -> ExitCode {
         Action::Kill { id } => actions::kill(&id),
         Action::List => actions::list(),
         Action::Clean => actions::clean(),
+        Action::PipeStdin { id, no_close } => {
+            actions::pipe_stdin(&id, no_close);
+            return ExitCode::SUCCESS;
+        }
         Action::Follow { id, stream, offset } => {
             actions::follow(&id, &stream, offset);
             return ExitCode::SUCCESS;

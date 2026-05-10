@@ -55,7 +55,7 @@ fn run_follow(
 
     let mut cmd = Command::new("ssh");
     cmd.arg(host)
-        .arg(".local/bin/rem-execd")
+        .arg(".local/bin/rxd")
         .arg("follow")
         .arg(id)
         .arg(stream_name);
