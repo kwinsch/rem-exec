@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+/// Wire protocol version. Bump when Response/DaemonRequest shapes change incompatibly.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// Response from rem-execd for all actions (except `follow` which streams raw bytes).
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
@@ -39,6 +42,9 @@ pub enum Response {
 
     #[serde(rename = "cleaned")]
     Cleaned { removed: Vec<String> },
+
+    #[serde(rename = "version")]
+    Version { version: String, protocol: u32 },
 
     #[serde(rename = "error")]
     Error { message: String },
@@ -89,6 +95,8 @@ pub enum DaemonRequest {
     List { host: String },
     #[serde(rename = "clean")]
     Clean { host: String },
+    #[serde(rename = "deploy")]
+    Deploy { host: String },
     #[serde(rename = "daemon_status")]
     DaemonStatus,
     #[serde(rename = "daemon_stop")]

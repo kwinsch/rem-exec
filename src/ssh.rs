@@ -1,5 +1,6 @@
 use std::process::{Command, Output};
 
+use crate::deploy;
 use crate::error::{RemExecError, Result};
 use crate::protocol::Response;
 
@@ -23,6 +24,25 @@ pub fn ssh_exec(host: &str, args: &[&str]) -> Result<Response> {
 
     serde_json::from_str(stdout)
         .map_err(|e| RemExecError::Protocol(format!("invalid JSON from remote: {e}: {stdout}")))
+}
+
+/// Execute a rem-execd command with auto-deploy on failure.
+///
+/// When REM_EXEC_AUTO_DEPLOY=1 is set, detects "command not found" or protocol
+/// errors, deploys the correct binary for the remote architecture, and retries once.
+pub fn ssh_exec_auto_deploy(host: &str, args: &[&str]) -> Result<Response> {
+    match ssh_exec(host, args) {
+        Ok(resp) => Ok(resp),
+        Err(e) if deploy::auto_deploy_enabled() && deploy::should_auto_deploy(&e) => {
+            deploy::deploy_to_host(host).map_err(|de| {
+                RemExecError::Ssh(format!(
+                    "auto-deploy to {host} failed: {de} (original: {e})"
+                ))
+            })?;
+            ssh_exec(host, args)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The remote binary name. Uses ~/.local/bin path since it may not be in
@@ -99,6 +119,12 @@ impl RemoteArgs {
     pub fn clean() -> Self {
         Self {
             args: vec!["clean".to_string()],
+        }
+    }
+
+    pub fn version() -> Self {
+        Self {
+            args: vec!["version".to_string()],
         }
     }
 

@@ -1,4 +1,5 @@
 pub mod daemon;
+pub mod deploy;
 pub mod error;
 pub mod process;
 pub mod protocol;

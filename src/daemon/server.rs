@@ -9,7 +9,7 @@ use crate::daemon::state::{DaemonState, TrackedProcess};
 use crate::daemon::stream::spawn_stream_thread;
 use crate::error::Result;
 use crate::protocol::{DaemonRequest, DaemonResponse, Response};
-use crate::ssh::{RemoteArgs, ssh_exec};
+use crate::ssh::{RemoteArgs, ssh_exec_auto_deploy};
 
 /// Start the daemon: fork, set up Unix socket, serve requests.
 pub fn start_daemon() -> Result<()> {
@@ -216,6 +216,19 @@ fn dispatch(
             }
             resp
         }
+        DaemonRequest::Deploy { host } => match crate::deploy::deploy_to_host(&host) {
+            Ok(result) => DaemonResponse::Ok {
+                data: serde_json::json!({
+                    "type": "deployed",
+                    "host": result.host,
+                    "arch": result.arch,
+                    "version": result.version,
+                }),
+            },
+            Err(e) => DaemonResponse::Error {
+                message: e.to_string(),
+            },
+        },
         DaemonRequest::DaemonStatus => {
             let st = state.lock().unwrap();
             let (hosts, procs) = st.summary();
@@ -242,7 +255,7 @@ fn dispatch(
 /// Start a process remotely and begin streaming its output locally.
 fn handle_start(host: &str, command: &[String], state: &Arc<Mutex<DaemonState>>) -> DaemonResponse {
     let args = RemoteArgs::start(command);
-    let response = match ssh_exec(host, &args.as_str_slice()) {
+    let response = match ssh_exec_auto_deploy(host, &args.as_str_slice()) {
         Ok(r) => r,
         Err(e) => {
             return DaemonResponse::Error {
@@ -339,7 +352,7 @@ fn handle_read(
 
 /// Forward a request to the remote host via SSH.
 fn forward_ssh(host: &str, args: RemoteArgs) -> DaemonResponse {
-    match ssh_exec(host, &args.as_str_slice()) {
+    match ssh_exec_auto_deploy(host, &args.as_str_slice()) {
         Ok(r) => wrap_response(r),
         Err(e) => DaemonResponse::Error {
             message: e.to_string(),

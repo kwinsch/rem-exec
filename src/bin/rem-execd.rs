@@ -73,6 +73,8 @@ enum Action {
     List,
     /// Clean up exited processes
     Clean,
+    /// Print version and protocol information
+    Version,
     /// Follow a stream (streams raw bytes, used by daemon)
     Follow {
         /// Process ID
@@ -88,6 +90,16 @@ enum Action {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // Version needs no state dir — must work on a fresh host before first deploy.
+    if matches!(cli.action, Action::Version) {
+        let resp = Response::Version {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol: rem_exec::protocol::PROTOCOL_VERSION,
+        };
+        println!("{}", serde_json::to_string(&resp).unwrap());
+        return ExitCode::SUCCESS;
+    }
 
     let base = remote_base();
     if let Err(e) = rem_exec::process::ensure_base_dir(&base) {
@@ -118,6 +130,7 @@ fn main() -> ExitCode {
             actions::follow(&id, &stream, offset);
             return ExitCode::SUCCESS;
         }
+        Action::Version => unreachable!("handled above"),
     };
 
     println!(

@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use rem_exec::daemon;
 use rem_exec::daemon::server;
 use rem_exec::protocol::{DaemonRequest, DaemonResponse, Response};
-use rem_exec::ssh::{RemoteArgs, ssh_exec};
+use rem_exec::ssh::{RemoteArgs, ssh_exec_auto_deploy};
 
 #[derive(Parser)]
 #[command(name = "rem-exec")]
@@ -100,6 +100,11 @@ enum Command {
         /// Remote host
         host: String,
     },
+    /// Deploy rem-execd to a remote host (detects architecture automatically)
+    Deploy {
+        /// Remote host (SSH destination)
+        host: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -139,6 +144,29 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
+        };
+    }
+
+    // Deploy is always handled locally (no daemon routing)
+    if let Command::Deploy { host } = &cli.command {
+        return match rem_exec::deploy::deploy_to_host(host) {
+            Ok(result) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "type": "deployed",
+                        "host": result.host,
+                        "arch": result.arch,
+                        "version": result.version,
+                    }))
+                    .unwrap()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
         };
     }
 
@@ -206,6 +234,7 @@ fn route_via_daemon(command: &Command) -> ExitCode {
         },
         Command::List { host } => DaemonRequest::List { host: host.clone() },
         Command::Clean { host } => DaemonRequest::Clean { host: host.clone() },
+        Command::Deploy { host } => DaemonRequest::Deploy { host: host.clone() },
         Command::Daemon { .. } => unreachable!(),
     };
 
@@ -243,11 +272,11 @@ fn route_via_ssh(command: &Command) -> ExitCode {
     let result = match command {
         Command::Start { host, command } => {
             let args = RemoteArgs::start(command);
-            ssh_exec(host, &args.as_str_slice())
+            ssh_exec_auto_deploy(host, &args.as_str_slice())
         }
         Command::Status { host, id } => {
             let args = RemoteArgs::status(id);
-            ssh_exec(host, &args.as_str_slice())
+            ssh_exec_auto_deploy(host, &args.as_str_slice())
         }
         Command::Stdout {
             host,
@@ -256,7 +285,7 @@ fn route_via_ssh(command: &Command) -> ExitCode {
             limit,
         } => {
             let args = RemoteArgs::read(id, "stdout", *offset, *limit);
-            ssh_exec(host, &args.as_str_slice())
+            ssh_exec_auto_deploy(host, &args.as_str_slice())
         }
         Command::Stderr {
             host,
@@ -265,7 +294,7 @@ fn route_via_ssh(command: &Command) -> ExitCode {
             limit,
         } => {
             let args = RemoteArgs::read(id, "stderr", *offset, *limit);
-            ssh_exec(host, &args.as_str_slice())
+            ssh_exec_auto_deploy(host, &args.as_str_slice())
         }
         Command::Write {
             host,
@@ -274,24 +303,25 @@ fn route_via_ssh(command: &Command) -> ExitCode {
             raw,
         } => {
             let args = RemoteArgs::write(id, input, *raw);
-            ssh_exec(host, &args.as_str_slice())
+            ssh_exec_auto_deploy(host, &args.as_str_slice())
         }
         Command::CloseStdin { host, id } => {
             let args = RemoteArgs::close_stdin(id);
-            ssh_exec(host, &args.as_str_slice())
+            ssh_exec_auto_deploy(host, &args.as_str_slice())
         }
         Command::Kill { host, id } => {
             let args = RemoteArgs::kill(id);
-            ssh_exec(host, &args.as_str_slice())
+            ssh_exec_auto_deploy(host, &args.as_str_slice())
         }
         Command::List { host } => {
             let args = RemoteArgs::list();
-            ssh_exec(host, &args.as_str_slice())
+            ssh_exec_auto_deploy(host, &args.as_str_slice())
         }
         Command::Clean { host } => {
             let args = RemoteArgs::clean();
-            ssh_exec(host, &args.as_str_slice())
+            ssh_exec_auto_deploy(host, &args.as_str_slice())
         }
+        Command::Deploy { .. } => unreachable!("handled above"),
         Command::Daemon { .. } => unreachable!(),
     };
 
