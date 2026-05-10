@@ -6,8 +6,9 @@ use std::time::Duration;
 
 /// Spawn a background thread that streams remote output to a local file.
 ///
-/// Runs `ssh host rem-execd follow <id> <stream>` and pipes the raw bytes
-/// into `local_path`. Retries with exponential backoff on SSH failure.
+/// Runs `ssh host rem-execd follow <id> <stream> --offset N` and pipes the raw
+/// bytes into `local_path`. Retries with exponential backoff on SSH failure,
+/// using the current local file size as the resume offset to prevent duplication.
 pub fn spawn_stream_thread(
     host: String,
     id: String,
@@ -19,17 +20,15 @@ pub fn spawn_stream_thread(
     })
 }
 
-fn stream_with_retry(
-    host: &str,
-    id: &str,
-    stream_name: &str,
-    local_path: &std::path::Path,
-) {
+fn stream_with_retry(host: &str, id: &str, stream_name: &str, local_path: &std::path::Path) {
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(30);
 
     loop {
-        match run_follow(host, id, stream_name, local_path) {
+        // Resume from current local file size to prevent duplication
+        let resume_offset = fs::metadata(local_path).map(|m| m.len()).unwrap_or(0);
+
+        match run_follow(host, id, stream_name, local_path, resume_offset) {
             Ok(()) => return, // follow completed normally (process exited)
             Err(e) => {
                 eprintln!(
@@ -47,28 +46,32 @@ fn run_follow(
     id: &str,
     stream_name: &str,
     local_path: &std::path::Path,
+    resume_offset: u64,
 ) -> io::Result<()> {
     // Ensure parent directory exists
     if let Some(parent) = local_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let mut child = Command::new("ssh")
-        .arg(host)
+    let mut cmd = Command::new("ssh");
+    cmd.arg(host)
         .arg(".local/bin/rem-execd")
         .arg("follow")
         .arg(id)
-        .arg(stream_name)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .arg(stream_name);
+
+    if resume_offset > 0 {
+        cmd.arg("--offset").arg(resume_offset.to_string());
+    }
+
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
 
     let mut remote_stdout = child
         .stdout
         .take()
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no stdout from SSH"))?;
 
-    // Append to local file (in case we're retrying after a disconnect)
+    // Append to local file
     let mut local_file = fs::OpenOptions::new()
         .create(true)
         .append(true)

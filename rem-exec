@@ -1,0 +1,36 @@
+#!/bin/sh
+# rem-exec — local client for rem-execd
+# Usage: rem-exec <host> <action> [args...]
+
+HOST="$1"; shift
+ACTION="$1"; shift
+
+case "$ACTION" in
+  start)
+    ssh "$HOST" rem-execd start "$@"
+    ;;
+  status)
+    ssh "$HOST" rem-execd status "$1"
+    ;;
+  stdout)
+    ssh "$HOST" rem-execd read "$1" stdout "$2"
+    ;;
+  stderr)
+    ssh "$HOST" rem-execd read "$1" stderr "$2"
+    ;;
+  size)
+    ssh "$HOST" rem-execd size "$1" "${2:-stdout}"
+    ;;
+  write)
+    ssh "$HOST" rem-execd write "$1" "$2"
+    ;;
+  kill)
+    ssh "$HOST" rem-execd kill "$1"
+    ;;
+  list)
+    ssh "$HOST" rem-execd list
+    ;;
+  clean)
+    ssh "$HOST" rem-execd clean
+    ;;
+esac

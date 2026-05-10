@@ -47,6 +47,9 @@ enum Command {
         /// Byte offset for incremental reads
         #[arg(long)]
         offset: Option<u64>,
+        /// Max bytes to read (default: 1 MiB)
+        #[arg(long)]
+        limit: Option<u64>,
     },
     /// Read stderr
     Stderr {
@@ -57,6 +60,9 @@ enum Command {
         /// Byte offset for incremental reads
         #[arg(long)]
         offset: Option<u64>,
+        /// Max bytes to read (default: 1 MiB)
+        #[arg(long)]
+        limit: Option<u64>,
     },
     /// Write to process stdin
     Write {
@@ -64,8 +70,11 @@ enum Command {
         host: String,
         /// Process ID
         id: String,
-        /// Text to send (newline appended automatically)
+        /// Text to send (newline appended unless --raw)
         input: String,
+        /// Send input without appending a newline
+        #[arg(long)]
+        raw: bool,
     },
     /// Kill a process
     Kill {
@@ -147,45 +156,70 @@ fn route_via_daemon(command: &Command) -> ExitCode {
             host: host.clone(),
             id: id.clone(),
         },
-        Command::Stdout { host, id, offset } => DaemonRequest::Stdout {
+        Command::Stdout {
+            host,
+            id,
+            offset,
+            limit,
+        } => DaemonRequest::Stdout {
             host: host.clone(),
             id: id.clone(),
             offset: *offset,
+            limit: *limit,
         },
-        Command::Stderr { host, id, offset } => DaemonRequest::Stderr {
+        Command::Stderr {
+            host,
+            id,
+            offset,
+            limit,
+        } => DaemonRequest::Stderr {
             host: host.clone(),
             id: id.clone(),
             offset: *offset,
+            limit: *limit,
         },
-        Command::Write { host, id, input } => DaemonRequest::Write {
+        Command::Write {
+            host,
+            id,
+            input,
+            raw,
+        } => DaemonRequest::Write {
             host: host.clone(),
             id: id.clone(),
             input: input.clone(),
+            raw: *raw,
         },
         Command::Kill { host, id } => DaemonRequest::Kill {
             host: host.clone(),
             id: id.clone(),
         },
-        Command::List { host } => DaemonRequest::List {
-            host: host.clone(),
-        },
-        Command::Clean { host } => DaemonRequest::Clean {
-            host: host.clone(),
-        },
+        Command::List { host } => DaemonRequest::List { host: host.clone() },
+        Command::Clean { host } => DaemonRequest::Clean { host: host.clone() },
         Command::Daemon { .. } => unreachable!(),
     };
 
     match daemon::send_request(&request) {
-        Ok(resp) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&resp).unwrap_or_default()
-            );
-            match resp {
-                DaemonResponse::Error { .. } => ExitCode::FAILURE,
-                _ => ExitCode::SUCCESS,
+        Ok(resp) => match resp {
+            // Unwrap the DaemonResponse envelope so the CLI output matches
+            // direct SSH mode (agent sees identical JSON regardless of daemon state)
+            DaemonResponse::Ok { data } => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&data).unwrap_or_default()
+                );
+                // Check if the inner response is an error
+                if data.get("type").and_then(|v| v.as_str()) == Some("error") {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                }
             }
-        }
+            DaemonResponse::Error { message } => {
+                let err = Response::error(message);
+                println!("{}", serde_json::to_string_pretty(&err).unwrap_or_default());
+                ExitCode::FAILURE
+            }
+        },
         Err(e) => {
             eprintln!("daemon error: {e}");
             ExitCode::FAILURE
@@ -204,16 +238,31 @@ fn route_via_ssh(command: &Command) -> ExitCode {
             let args = RemoteArgs::status(id);
             ssh_exec(host, &args.as_str_slice())
         }
-        Command::Stdout { host, id, offset } => {
-            let args = RemoteArgs::read(id, "stdout", *offset);
+        Command::Stdout {
+            host,
+            id,
+            offset,
+            limit,
+        } => {
+            let args = RemoteArgs::read(id, "stdout", *offset, *limit);
             ssh_exec(host, &args.as_str_slice())
         }
-        Command::Stderr { host, id, offset } => {
-            let args = RemoteArgs::read(id, "stderr", *offset);
+        Command::Stderr {
+            host,
+            id,
+            offset,
+            limit,
+        } => {
+            let args = RemoteArgs::read(id, "stderr", *offset, *limit);
             ssh_exec(host, &args.as_str_slice())
         }
-        Command::Write { host, id, input } => {
-            let args = RemoteArgs::write(id, input);
+        Command::Write {
+            host,
+            id,
+            input,
+            raw,
+        } => {
+            let args = RemoteArgs::write(id, input, *raw);
             ssh_exec(host, &args.as_str_slice())
         }
         Command::Kill { host, id } => {

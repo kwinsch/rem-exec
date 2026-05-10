@@ -64,18 +64,22 @@ pub enum DaemonRequest {
         host: String,
         id: String,
         offset: Option<u64>,
+        limit: Option<u64>,
     },
     #[serde(rename = "stderr")]
     Stderr {
         host: String,
         id: String,
         offset: Option<u64>,
+        limit: Option<u64>,
     },
     #[serde(rename = "write")]
     Write {
         host: String,
         id: String,
         input: String,
+        #[serde(default)]
+        raw: bool,
     },
     #[serde(rename = "kill")]
     Kill { host: String, id: String },

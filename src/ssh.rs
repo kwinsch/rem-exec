@@ -21,9 +21,8 @@ pub fn ssh_exec(host: &str, args: &[&str]) -> Result<Response> {
         return Err(RemExecError::Ssh("empty response from remote".to_string()));
     }
 
-    serde_json::from_str(stdout).map_err(|e| {
-        RemExecError::Protocol(format!("invalid JSON from remote: {e}: {stdout}"))
-    })
+    serde_json::from_str(stdout)
+        .map_err(|e| RemExecError::Protocol(format!("invalid JSON from remote: {e}: {stdout}")))
 }
 
 /// The remote binary name. Uses ~/.local/bin path since it may not be in
@@ -58,19 +57,25 @@ impl RemoteArgs {
         }
     }
 
-    pub fn read(id: &str, stream: &str, offset: Option<u64>) -> Self {
+    pub fn read(id: &str, stream: &str, offset: Option<u64>, limit: Option<u64>) -> Self {
         let mut args = vec!["read".to_string(), id.to_string(), stream.to_string()];
         if let Some(off) = offset {
             args.push("--offset".to_string());
             args.push(off.to_string());
         }
+        if let Some(lim) = limit {
+            args.push("--limit".to_string());
+            args.push(lim.to_string());
+        }
         Self { args }
     }
 
-    pub fn write(id: &str, input: &str) -> Self {
-        Self {
-            args: vec!["write".to_string(), id.to_string(), input.to_string()],
+    pub fn write(id: &str, input: &str, raw: bool) -> Self {
+        let mut args = vec!["write".to_string(), id.to_string(), input.to_string()];
+        if raw {
+            args.push("--raw".to_string());
         }
+        Self { args }
     }
 
     pub fn kill(id: &str) -> Self {

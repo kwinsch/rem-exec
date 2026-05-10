@@ -15,9 +15,7 @@ pub struct ProcessDir {
 
 impl ProcessDir {
     pub fn new(base: &Path, id: &str) -> Self {
-        Self {
-            dir: base.join(id),
-        }
+        Self { dir: base.join(id) }
     }
 
     pub fn cmd_path(&self) -> PathBuf {
@@ -50,8 +48,8 @@ impl ProcessDir {
 
     /// Read the status string from the status file.
     pub fn read_status(&self) -> Result<ProcessState> {
-        let s = fs::read_to_string(self.status_path())
-            .map_err(|_| RemExecError::ProcessNotFound {
+        let s =
+            fs::read_to_string(self.status_path()).map_err(|_| RemExecError::ProcessNotFound {
                 id: self.id().to_string(),
             })?;
         Ok(ProcessState::parse(s.trim()))

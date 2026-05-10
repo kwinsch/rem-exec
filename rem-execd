@@ -1,0 +1,102 @@
+#!/bin/sh
+# rem-execd — remote process manager for agent-friendly I/O
+# Runs on the target machine. Manages processes with file-based I/O.
+
+BASE="/tmp/rem-exec"
+mkdir -p "$BASE"
+
+case "$1" in
+  start)
+    shift
+    id=$(head -c 4 /dev/urandom | xxd -p)
+    dir="$BASE/$id"
+    mkdir -p "$dir"
+
+    mkfifo "$dir/stdin_pipe"
+    echo "running" > "$dir/status"
+    echo "$*" > "$dir/cmd"
+    date +%s > "$dir/started"
+
+    # Write a runner script that manages the process lifecycle.
+    # Runs via setsid so it fully detaches from the SSH session.
+    cat > "$dir/run.sh" <<'RUNNER'
+#!/bin/sh
+dir="$1"; shift
+# Hold FIFO open for writing — prevents reader from getting EOF
+sleep 86400 > "$dir/stdin_pipe" &
+holder=$!
+# Run the actual command with FIFO as stdin
+"$@" < "$dir/stdin_pipe" > "$dir/stdout" 2> "$dir/stderr"
+rc=$?
+echo "exited($rc)" > "$dir/status"
+date +%s > "$dir/ended"
+kill $holder 2>/dev/null
+RUNNER
+
+    # setsid detaches into a new session — survives SSH disconnect
+    setsid sh "$dir/run.sh" "$dir" "$@" < /dev/null > /dev/null 2>&1 &
+    runner_pid=$!
+    # Brief wait for the runner to start and write its PID
+    sleep 0.2
+    # Store runner PID (the actual command is a child of this)
+    echo "$runner_pid" > "$dir/pid"
+
+    echo "$id"
+    ;;
+
+  status)
+    cat "$BASE/$2/status" 2>/dev/null || echo "not found"
+    ;;
+
+  read)
+    # $2=id, $3=stdout|stderr, $4=optional byte offset
+    file="$BASE/$2/$3"
+    if [ -n "$4" ]; then
+      tail -c +"$4" "$file" 2>/dev/null
+    else
+      cat "$file" 2>/dev/null
+    fi
+    ;;
+
+  size)
+    # $2=id, $3=stdout|stderr — returns byte count for incremental reads
+    wc -c < "$BASE/$2/$3" 2>/dev/null || echo "0"
+    ;;
+
+  write)
+    # $2=id, $3=text to send to stdin
+    printf '%s\n' "$3" > "$BASE/$2/stdin_pipe"
+    ;;
+
+  kill)
+    pid=$(cat "$BASE/$2/pid" 2>/dev/null)
+    # Kill the process group (runner + command + holder)
+    [ -n "$pid" ] && kill -- -"$pid" 2>/dev/null
+    echo "exited(killed)" > "$BASE/$2/status"
+    ;;
+
+  list)
+    for dir in "$BASE"/*/; do
+      [ -d "$dir" ] || continue
+      id=$(basename "$dir")
+      status=$(cat "$dir/status" 2>/dev/null)
+      cmd=$(cat "$dir/cmd" 2>/dev/null)
+      printf "%s\t%s\t%s\n" "$id" "$status" "$cmd"
+    done
+    ;;
+
+  clean)
+    for dir in "$BASE"/*/; do
+      [ -d "$dir" ] || continue
+      status=$(cat "$dir/status" 2>/dev/null)
+      case "$status" in
+        exited*)
+          holder=$(cat "$dir/stdin_holder" 2>/dev/null)
+          [ -n "$holder" ] && kill "$holder" 2>/dev/null
+          rm -rf "$dir"
+          ;;
+      esac
+    done
+    echo "cleaned"
+    ;;
+esac

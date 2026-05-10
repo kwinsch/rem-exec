@@ -39,6 +39,9 @@ enum Action {
         /// Byte offset for incremental reads
         #[arg(long)]
         offset: Option<u64>,
+        /// Max bytes to read (default: 1 MiB)
+        #[arg(long)]
+        limit: Option<u64>,
     },
     /// Get output file size
     Size {
@@ -52,8 +55,11 @@ enum Action {
     Write {
         /// Process ID
         id: String,
-        /// Text to send (newline appended automatically)
+        /// Text to send (newline appended unless --raw)
         input: String,
+        /// Send input without appending a newline
+        #[arg(long)]
+        raw: bool,
     },
     /// Kill a process
     Kill {
@@ -71,6 +77,9 @@ enum Action {
         /// Stream: stdout or stderr
         #[arg(default_value = "stdout")]
         stream: String,
+        /// Byte offset to resume from (for reconnect)
+        #[arg(long)]
+        offset: Option<u64>,
     },
 }
 
@@ -90,15 +99,16 @@ fn main() -> ExitCode {
             id,
             stream,
             offset,
-        } => actions::read_output(&id, &stream, offset),
+            limit,
+        } => actions::read_output(&id, &stream, offset, limit),
         Action::Size { id, stream } => actions::size(&id, &stream),
-        Action::Write { id, input } => actions::write_stdin(&id, &input),
+        Action::Write { id, input, raw } => actions::write_stdin(&id, &input, raw),
         Action::Kill { id } => actions::kill(&id),
         Action::List => actions::list(),
         Action::Clean => actions::clean(),
-        Action::Follow { id, stream } => {
+        Action::Follow { id, stream, offset } => {
             // Follow streams raw bytes, not JSON.
-            actions::follow(&id, &stream);
+            actions::follow(&id, &stream, offset);
             return ExitCode::SUCCESS;
         }
     };

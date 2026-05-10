@@ -130,9 +130,7 @@ fn run_server(sock_path: &Path, base: std::path::PathBuf) {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Set a timeout so we can check the stop flag periodically
-    listener
-        .set_nonblocking(false)
-        .unwrap_or(());
+    listener.set_nonblocking(false).unwrap_or(());
 
     for stream_result in listener.incoming() {
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -185,11 +183,24 @@ fn dispatch(
     match request {
         DaemonRequest::Start { host, command } => handle_start(&host, &command, state),
         DaemonRequest::Status { host, id } => forward_ssh(&host, RemoteArgs::status(&id)),
-        DaemonRequest::Stdout { host, id, offset } => handle_read(&host, &id, "stdout", offset, state),
-        DaemonRequest::Stderr { host, id, offset } => handle_read(&host, &id, "stderr", offset, state),
-        DaemonRequest::Write { host, id, input } => {
-            forward_ssh(&host, RemoteArgs::write(&id, &input))
-        }
+        DaemonRequest::Stdout {
+            host,
+            id,
+            offset,
+            limit,
+        } => handle_read(&host, &id, "stdout", offset, limit, state),
+        DaemonRequest::Stderr {
+            host,
+            id,
+            offset,
+            limit,
+        } => handle_read(&host, &id, "stderr", offset, limit, state),
+        DaemonRequest::Write {
+            host,
+            id,
+            input,
+            raw,
+        } => forward_ssh(&host, RemoteArgs::write(&id, &input, raw)),
         DaemonRequest::Kill { host, id } => forward_ssh(&host, RemoteArgs::kill(&id)),
         DaemonRequest::List { host } => forward_ssh(&host, RemoteArgs::list()),
         DaemonRequest::Clean { host } => {
@@ -229,11 +240,7 @@ fn dispatch(
 }
 
 /// Start a process remotely and begin streaming its output locally.
-fn handle_start(
-    host: &str,
-    command: &[String],
-    state: &Arc<Mutex<DaemonState>>,
-) -> DaemonResponse {
+fn handle_start(host: &str, command: &[String], state: &Arc<Mutex<DaemonState>>) -> DaemonResponse {
     let args = RemoteArgs::start(command);
     let response = match ssh_exec(host, &args.as_str_slice()) {
         Ok(r) => r,
@@ -282,12 +289,16 @@ fn handle_start(
     wrap_response(response)
 }
 
+/// Default read limit for daemon-side reads (same as remote).
+const DEFAULT_READ_LIMIT: u64 = 1024 * 1024;
+
 /// Read from local cached file if available, otherwise forward to SSH.
 fn handle_read(
     host: &str,
     id: &str,
     stream_name: &str,
     offset: Option<u64>,
+    limit: Option<u64>,
     state: &Arc<Mutex<DaemonState>>,
 ) -> DaemonResponse {
     let st = state.lock().unwrap();
@@ -295,21 +306,24 @@ fn handle_read(
     drop(st);
 
     if local_path.exists() {
-        // Read from local cached file
+        // Read from local cached file (bounded)
         use std::io::{Read, Seek, SeekFrom};
+        let file_size = fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
         match fs::File::open(&local_path) {
             Ok(mut file) => {
                 let offset = offset.unwrap_or(0);
                 if offset > 0 {
                     let _ = file.seek(SeekFrom::Start(offset));
                 }
-                let mut data = Vec::new();
-                let _ = file.read_to_end(&mut data);
-                let total = offset + data.len() as u64;
+                let limit = limit.unwrap_or(DEFAULT_READ_LIMIT);
+                let to_read = limit.min(file_size.saturating_sub(offset)) as usize;
+                let mut data = vec![0u8; to_read];
+                let n = file.read(&mut data).unwrap_or(0);
+                data.truncate(n);
                 let response = Response::Output {
                     data: base64_encode(&data),
                     offset,
-                    size: total,
+                    size: file_size,
                 };
                 wrap_response(response)
             }
@@ -319,7 +333,7 @@ fn handle_read(
         }
     } else {
         // Not cached — forward to SSH
-        forward_ssh(host, RemoteArgs::read(id, stream_name, offset))
+        forward_ssh(host, RemoteArgs::read(id, stream_name, offset, limit))
     }
 }
 

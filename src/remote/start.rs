@@ -70,9 +70,7 @@ pub fn start(command: &[String]) -> Result<Response> {
             }
 
             // Open the FIFO with O_RDWR (Linux-specific: non-blocking, prevents deadlock)
-            let fifo_fd = unsafe {
-                libc::open(fifo_cstr.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC)
-            };
+            let fifo_fd = unsafe { libc::open(fifo_cstr.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
             assert!(fifo_fd >= 0, "failed to open FIFO O_RDWR");
 
             // Open stdout/stderr output files
@@ -191,9 +189,7 @@ pub fn start(command: &[String]) -> Result<Response> {
             // lives until the command exits. It will be reparented to init when
             // we exit. The SIGCHLD for the zombie is harmless and brief.
 
-            Ok(Response::Started {
-                id: id.to_string(),
-            })
+            Ok(Response::Started { id: id.to_string() })
         }
     }
 }
@@ -210,11 +206,7 @@ fn write_pid_to_pipe(fd: RawFd, pid: i32) {
 fn read_pid_from_pipe(fd: RawFd) -> i32 {
     let mut buf = [0u8; 4];
     let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 4) };
-    if n == 4 {
-        i32::from_ne_bytes(buf)
-    } else {
-        0
-    }
+    if n == 4 { i32::from_ne_bytes(buf) } else { 0 }
 }
 
 fn open_devnull(flags: i32) -> RawFd {
