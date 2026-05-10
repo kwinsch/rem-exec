@@ -156,6 +156,27 @@ cat script.sh | rx start host sh
 echo "" | rx start --pipe host ls -la
 # stdout contains ls output directly, no base64
 
+## Privilege elevation
+
+Use `doas` for root or other-user commands. Hosts are configured with
+passwordless doas (`permit nopass USER` in /etc/doas.conf). No TTY needed.
+
+### Run as root
+rx start host doas apt update
+printf 'config line\n' | rx start host doas tee /etc/some.conf
+
+### Run as another user
+rx start host doas -u postgres pg_dump mydb
+
+### Piped script as root
+cat install.sh | rx start host doas sh
+
+### Bidirectional as root
+echo "input" | rx start --pipe host doas sh script.sh
+
+All pipe modes work through doas — stdin flows through transparently.
+Do NOT use `su` (requires /dev/tty for password). Use `doas` or `sudo -n`.
+
 ## Error recovery
 
 - "process not found": ID doesn't exist or was cleaned. Start a new process.
