@@ -1,0 +1,345 @@
+use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use crate::daemon::state::{DaemonState, TrackedProcess};
+use crate::daemon::stream::spawn_stream_thread;
+use crate::error::Result;
+use crate::protocol::{DaemonRequest, DaemonResponse, Response};
+use crate::ssh::{RemoteArgs, ssh_exec};
+
+/// Start the daemon: fork, set up Unix socket, serve requests.
+pub fn start_daemon() -> Result<()> {
+    let sock_path = super::socket_path();
+    let pid_path = super::pid_path();
+    let base = super::local_base();
+
+    // Check for stale socket
+    if sock_path.exists() {
+        if super::is_running() {
+            eprintln!("daemon already running");
+            std::process::exit(1);
+        }
+        // Stale socket — remove it
+        let _ = fs::remove_file(&sock_path);
+    }
+
+    // Create directories
+    if let Some(parent) = sock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::create_dir_all(&base)?;
+
+    // Fork to daemonize
+    let pid = unsafe { libc::fork() };
+    match pid {
+        -1 => {
+            eprintln!("fork failed");
+            std::process::exit(1);
+        }
+        0 => {
+            // Child: become the daemon
+            unsafe { libc::setsid() };
+
+            // Redirect stdio to /dev/null
+            let devnull_path = std::ffi::CString::new("/dev/null").unwrap();
+            let devnull = unsafe { libc::open(devnull_path.as_ptr(), libc::O_RDWR) };
+            if devnull >= 0 {
+                unsafe {
+                    libc::dup2(devnull, 0);
+                    libc::dup2(devnull, 1);
+                    // Keep stderr for logging
+                    if devnull > 2 {
+                        libc::close(devnull);
+                    }
+                }
+            }
+
+            // Write PID file
+            let _ = fs::write(&pid_path, std::process::id().to_string());
+
+            // Run the server
+            run_server(&sock_path, base);
+            let _ = fs::remove_file(&sock_path);
+            let _ = fs::remove_file(&pid_path);
+            std::process::exit(0);
+        }
+        _child_pid => {
+            // Parent: wait briefly, verify daemon is up, exit
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if super::is_running() {
+                println!("daemon started (pid {_child_pid})");
+            } else {
+                eprintln!("daemon failed to start");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Stop the daemon by sending a stop request.
+pub fn stop_daemon() -> Result<()> {
+    let request = DaemonRequest::DaemonStop;
+    match super::send_request(&request) {
+        Ok(_) => {
+            println!("daemon stopped");
+            Ok(())
+        }
+        Err(crate::error::RemExecError::DaemonNotRunning) => {
+            println!("daemon not running");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Show daemon status.
+pub fn daemon_status() -> Result<()> {
+    let request = DaemonRequest::DaemonStatus;
+    match super::send_request(&request) {
+        Ok(resp) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&resp).unwrap_or_default()
+            );
+            Ok(())
+        }
+        Err(crate::error::RemExecError::DaemonNotRunning) => {
+            println!("daemon not running");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn run_server(sock_path: &Path, base: std::path::PathBuf) {
+    let listener = match UnixListener::bind(sock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("failed to bind socket: {e}");
+            return;
+        }
+    };
+
+    let state = Arc::new(Mutex::new(DaemonState::new(base)));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Set a timeout so we can check the stop flag periodically
+    listener
+        .set_nonblocking(false)
+        .unwrap_or(());
+
+    for stream_result in listener.incoming() {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+
+        let stream = match stream_result {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let state = Arc::clone(&state);
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            handle_connection(stream, state, stop);
+        });
+    }
+}
+
+fn handle_connection(
+    mut stream: UnixStream,
+    state: Arc<Mutex<DaemonState>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut buf = Vec::new();
+    if stream.read_to_end(&mut buf).is_err() {
+        return;
+    }
+
+    let request: DaemonRequest = match serde_json::from_slice(&buf) {
+        Ok(r) => r,
+        Err(e) => {
+            let resp = DaemonResponse::Error {
+                message: format!("invalid request: {e}"),
+            };
+            let _ = stream.write_all(&serde_json::to_vec(&resp).unwrap_or_default());
+            return;
+        }
+    };
+
+    let response = dispatch(request, &state, &stop);
+    let _ = stream.write_all(&serde_json::to_vec(&response).unwrap_or_default());
+}
+
+fn dispatch(
+    request: DaemonRequest,
+    state: &Arc<Mutex<DaemonState>>,
+    stop: &Arc<std::sync::atomic::AtomicBool>,
+) -> DaemonResponse {
+    match request {
+        DaemonRequest::Start { host, command } => handle_start(&host, &command, state),
+        DaemonRequest::Status { host, id } => forward_ssh(&host, RemoteArgs::status(&id)),
+        DaemonRequest::Stdout { host, id, offset } => handle_read(&host, &id, "stdout", offset, state),
+        DaemonRequest::Stderr { host, id, offset } => handle_read(&host, &id, "stderr", offset, state),
+        DaemonRequest::Write { host, id, input } => {
+            forward_ssh(&host, RemoteArgs::write(&id, &input))
+        }
+        DaemonRequest::Kill { host, id } => forward_ssh(&host, RemoteArgs::kill(&id)),
+        DaemonRequest::List { host } => forward_ssh(&host, RemoteArgs::list()),
+        DaemonRequest::Clean { host } => {
+            // Clean remote and local
+            let resp = forward_ssh(&host, RemoteArgs::clean());
+            // Also clean local cached files for this host
+            if let Ok(mut st) = state.lock() {
+                if let Some(host_state) = st.hosts.get_mut(&host) {
+                    host_state.processes.retain(|_, _| false);
+                }
+                let host_dir = st.local_base.join(&host);
+                let _ = fs::remove_dir_all(&host_dir);
+            }
+            resp
+        }
+        DaemonRequest::DaemonStatus => {
+            let st = state.lock().unwrap();
+            let (hosts, procs) = st.summary();
+            DaemonResponse::Ok {
+                data: serde_json::json!({
+                    "type": "daemon_status",
+                    "hosts": hosts,
+                    "processes": procs,
+                }),
+            }
+        }
+        DaemonRequest::DaemonStop => {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Connect to our own socket to unblock the accept loop
+            let sock = super::socket_path();
+            let _ = std::os::unix::net::UnixStream::connect(&sock);
+            DaemonResponse::Ok {
+                data: serde_json::json!({"type": "stopped"}),
+            }
+        }
+    }
+}
+
+/// Start a process remotely and begin streaming its output locally.
+fn handle_start(
+    host: &str,
+    command: &[String],
+    state: &Arc<Mutex<DaemonState>>,
+) -> DaemonResponse {
+    let args = RemoteArgs::start(command);
+    let response = match ssh_exec(host, &args.as_str_slice()) {
+        Ok(r) => r,
+        Err(e) => {
+            return DaemonResponse::Error {
+                message: e.to_string(),
+            };
+        }
+    };
+
+    // Extract the process ID from the response
+    if let Response::Started { ref id } = response {
+        let mut st = state.lock().unwrap();
+        let local_dir = st.local_dir(host, id);
+        let _ = fs::create_dir_all(&local_dir);
+
+        // Also write a local status file
+        let _ = fs::write(local_dir.join("status"), "running");
+
+        // Spawn streaming threads for stdout and stderr
+        let stdout_thread = spawn_stream_thread(
+            host.to_string(),
+            id.clone(),
+            "stdout".to_string(),
+            local_dir.join("stdout"),
+        );
+        let stderr_thread = spawn_stream_thread(
+            host.to_string(),
+            id.clone(),
+            "stderr".to_string(),
+            local_dir.join("stderr"),
+        );
+
+        let host_state = st.host_mut(host);
+        host_state.processes.insert(
+            id.clone(),
+            TrackedProcess {
+                id: id.clone(),
+                local_dir,
+                stdout_thread: Some(stdout_thread),
+                stderr_thread: Some(stderr_thread),
+            },
+        );
+    }
+
+    wrap_response(response)
+}
+
+/// Read from local cached file if available, otherwise forward to SSH.
+fn handle_read(
+    host: &str,
+    id: &str,
+    stream_name: &str,
+    offset: Option<u64>,
+    state: &Arc<Mutex<DaemonState>>,
+) -> DaemonResponse {
+    let st = state.lock().unwrap();
+    let local_path = st.local_dir(host, id).join(stream_name);
+    drop(st);
+
+    if local_path.exists() {
+        // Read from local cached file
+        use std::io::{Read, Seek, SeekFrom};
+        match fs::File::open(&local_path) {
+            Ok(mut file) => {
+                let offset = offset.unwrap_or(0);
+                if offset > 0 {
+                    let _ = file.seek(SeekFrom::Start(offset));
+                }
+                let mut data = Vec::new();
+                let _ = file.read_to_end(&mut data);
+                let total = offset + data.len() as u64;
+                let response = Response::Output {
+                    data: base64_encode(&data),
+                    offset,
+                    size: total,
+                };
+                wrap_response(response)
+            }
+            Err(e) => DaemonResponse::Error {
+                message: format!("failed to read local cache: {e}"),
+            },
+        }
+    } else {
+        // Not cached — forward to SSH
+        forward_ssh(host, RemoteArgs::read(id, stream_name, offset))
+    }
+}
+
+/// Forward a request to the remote host via SSH.
+fn forward_ssh(host: &str, args: RemoteArgs) -> DaemonResponse {
+    match ssh_exec(host, &args.as_str_slice()) {
+        Ok(r) => wrap_response(r),
+        Err(e) => DaemonResponse::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+fn wrap_response(response: Response) -> DaemonResponse {
+    match serde_json::to_value(&response) {
+        Ok(v) => DaemonResponse::Ok { data: v },
+        Err(e) => DaemonResponse::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+use crate::base64_encode;
