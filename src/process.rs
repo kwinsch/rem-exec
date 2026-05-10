@@ -6,11 +6,71 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::{RemExecError, Result};
 
 /// Return the per-user base directory for process state on the remote side.
-/// Uses /tmp/rem-exec-<uid>/ to avoid collisions and permission issues on
-/// shared hosts.
+///
+/// Prefers XDG_RUNTIME_DIR/rem-exec (already per-user, tmpfs, correct perms).
+/// Falls back to /tmp/rem-exec-<uid> with ownership/symlink validation.
 pub fn remote_base() -> PathBuf {
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        let p = PathBuf::from(runtime_dir).join("rem-exec");
+        return p;
+    }
     let uid = unsafe { libc::getuid() };
     PathBuf::from(format!("/tmp/rem-exec-{uid}"))
+}
+
+/// Validate that the base directory is safe to use: exists, is a real directory
+/// (not a symlink), owned by the current user, and mode 0700. Creates it if
+/// it doesn't exist.
+pub fn ensure_base_dir(base: &std::path::Path) -> Result<()> {
+    let uid = unsafe { libc::getuid() };
+
+    if !base.exists() {
+        fs::create_dir_all(base)?;
+        let cstr = std::ffi::CString::new(base.to_str().unwrap()).unwrap();
+        unsafe { libc::chmod(cstr.as_ptr(), 0o700) };
+        return Ok(());
+    }
+
+    // Validate: use lstat (symlink_metadata) to detect symlinks
+    let meta = fs::symlink_metadata(base).map_err(|e| {
+        RemExecError::Other(format!("cannot stat base dir {}: {e}", base.display()))
+    })?;
+
+    if meta.file_type().is_symlink() {
+        return Err(RemExecError::Other(format!(
+            "base dir {} is a symlink — refusing to use",
+            base.display()
+        )));
+    }
+
+    if !meta.is_dir() {
+        return Err(RemExecError::Other(format!(
+            "base dir {} is not a directory",
+            base.display()
+        )));
+    }
+
+    // Check owner
+    use std::os::unix::fs::MetadataExt;
+    if meta.uid() != uid {
+        return Err(RemExecError::Other(format!(
+            "base dir {} owned by uid {}, expected {}",
+            base.display(),
+            meta.uid(),
+            uid
+        )));
+    }
+
+    // Check permissions (must be 0700 or stricter)
+    if meta.mode() & 0o077 != 0 {
+        return Err(RemExecError::Other(format!(
+            "base dir {} has insecure permissions {:o}",
+            base.display(),
+            meta.mode() & 0o777
+        )));
+    }
+
+    Ok(())
 }
 
 /// Per-process state directory layout.

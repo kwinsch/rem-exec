@@ -1,4 +1,3 @@
-use std::fs;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -88,11 +87,12 @@ enum Action {
 }
 
 fn main() -> ExitCode {
-    // Ensure base directory exists with 0700 permissions
     let base = remote_base();
-    let _ = fs::create_dir_all(&base);
-    let base_cstr = std::ffi::CString::new(base.to_str().unwrap()).unwrap();
-    unsafe { libc::chmod(base_cstr.as_ptr(), 0o700) };
+    if let Err(e) = rem_exec::process::ensure_base_dir(&base) {
+        let resp = Response::error(e.to_string());
+        println!("{}", serde_json::to_string(&resp).unwrap());
+        return ExitCode::FAILURE;
+    }
 
     let cli = Cli::parse();
 

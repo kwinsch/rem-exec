@@ -69,7 +69,7 @@ fn run_follow(
     let mut remote_stdout = child
         .stdout
         .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no stdout from SSH"))?;
+        .ok_or_else(|| io::Error::other("no stdout from SSH"))?;
 
     // Append to local file
     let mut local_file = fs::OpenOptions::new()
@@ -94,9 +94,6 @@ fn run_follow(
     if status.success() {
         Ok(())
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("SSH exited with {status}"),
-        ))
+        Err(io::Error::other(format!("SSH exited with {status}")))
     }
 }

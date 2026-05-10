@@ -76,10 +76,10 @@ pub fn read_output(id: &str, stream: &str, offset: Option<u64>, limit: Option<u6
     };
 
     let offset = offset.unwrap_or(0);
-    if offset > 0 {
-        if let Err(e) = file.seek(SeekFrom::Start(offset)) {
-            return Response::error(format!("seek failed: {e}"));
-        }
+    if offset > 0
+        && let Err(e) = file.seek(SeekFrom::Start(offset))
+    {
+        return Response::error(format!("seek failed: {e}"));
     }
 
     let limit = limit.unwrap_or(DEFAULT_READ_LIMIT);
@@ -123,10 +123,10 @@ pub fn write_stdin(id: &str, input: &str, raw: bool) -> Response {
         return Response::error(format!("process not found: {id}"));
     }
 
-    if let Ok(state) = pdir.read_status() {
-        if !matches!(state, ProcessState::Running) {
-            return Response::error(format!("process already exited: {id}"));
-        }
+    if let Ok(state) = pdir.read_status()
+        && !matches!(state, ProcessState::Running)
+    {
+        return Response::error(format!("process already exited: {id}"));
     }
 
     let fifo_cstr = match std::ffi::CString::new(fifo.to_str().unwrap_or("")) {
@@ -170,6 +170,13 @@ pub fn close_stdin(id: &str) -> Response {
         return Response::error(format!("process not found: {id}"));
     }
 
+    // Don't touch exited processes
+    if let Ok(state) = pdir.read_status()
+        && !matches!(state, ProcessState::Running)
+    {
+        return Response::error(format!("process already exited: {id}"));
+    }
+
     if let Ok(Some(holder_pid)) = pdir.read_stdin_holder_pid() {
         let alive = unsafe { libc::kill(holder_pid as i32, 0) } == 0;
         if alive {
@@ -193,6 +200,13 @@ pub fn kill(id: &str) -> Response {
 
     if !pdir.dir.exists() {
         return Response::error(format!("process not found: {id}"));
+    }
+
+    // Don't overwrite a real exit code with "exited(killed)"
+    if let Ok(state) = pdir.read_status()
+        && !matches!(state, ProcessState::Running)
+    {
+        return Response::error(format!("process already exited: {id}"));
     }
 
     let rpid = pdir.read_runner_pid().ok().flatten();
@@ -274,17 +288,17 @@ pub fn clean() -> Response {
             let id = entry.file_name().to_string_lossy().to_string();
             let pdir = ProcessDir::new(&base, &id);
 
-            if let Ok(state) = pdir.read_status() {
-                if !matches!(state, ProcessState::Running) {
-                    if let Ok(Some(rpid)) = pdir.read_runner_pid() {
-                        unsafe { libc::kill(rpid as i32, libc::SIGTERM) };
-                    }
-                    if let Ok(Some(hpid)) = pdir.read_stdin_holder_pid() {
-                        unsafe { libc::kill(hpid as i32, libc::SIGTERM) };
-                    }
-                    let _ = fs::remove_dir_all(&pdir.dir);
-                    removed.push(id);
+            if let Ok(state) = pdir.read_status()
+                && !matches!(state, ProcessState::Running)
+            {
+                if let Ok(Some(rpid)) = pdir.read_runner_pid() {
+                    unsafe { libc::kill(rpid as i32, libc::SIGTERM) };
                 }
+                if let Ok(Some(hpid)) = pdir.read_stdin_holder_pid() {
+                    unsafe { libc::kill(hpid as i32, libc::SIGTERM) };
+                }
+                let _ = fs::remove_dir_all(&pdir.dir);
+                removed.push(id);
             }
         }
     }
@@ -309,10 +323,10 @@ pub fn follow(id: &str, stream: &str, offset: Option<u64>) -> Response {
         Err(_) => return Response::error(format!("process not found: {id}")),
     };
 
-    if let Some(off) = offset {
-        if off > 0 {
-            let _ = file.seek(SeekFrom::Start(off));
-        }
+    if let Some(off) = offset
+        && off > 0
+    {
+        let _ = file.seek(SeekFrom::Start(off));
     }
 
     let stdout = std::io::stdout();
@@ -322,18 +336,18 @@ pub fn follow(id: &str, stream: &str, offset: Option<u64>) -> Response {
     loop {
         match file.read(&mut buf) {
             Ok(0) => {
-                if let Ok(state) = pdir.read_status() {
-                    if !matches!(state, ProcessState::Running) {
-                        // Final drain
-                        while let Ok(n) = file.read(&mut buf) {
-                            if n == 0 {
-                                break;
-                            }
-                            let _ = stdout.write_all(&buf[..n]);
+                if let Ok(state) = pdir.read_status()
+                    && !matches!(state, ProcessState::Running)
+                {
+                    // Final drain
+                    while let Ok(n) = file.read(&mut buf) {
+                        if n == 0 {
+                            break;
                         }
-                        let _ = stdout.flush();
-                        break;
+                        let _ = stdout.write_all(&buf[..n]);
                     }
+                    let _ = stdout.flush();
+                    break;
                 }
                 thread::sleep(Duration::from_millis(100));
             }
