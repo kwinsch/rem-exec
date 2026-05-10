@@ -263,6 +263,9 @@ pub fn list() -> Response {
             }
             let id = entry.file_name().to_string_lossy().to_string();
             let pdir = ProcessDir::new(&base, &id);
+            if !pdir.status_path().exists() {
+                continue;
+            }
             let state = pdir
                 .read_status()
                 .map(|s| s.to_string())
@@ -287,6 +290,9 @@ pub fn clean() -> Response {
             }
             let id = entry.file_name().to_string_lossy().to_string();
             let pdir = ProcessDir::new(&base, &id);
+            if !pdir.status_path().exists() {
+                continue;
+            }
 
             if let Ok(state) = pdir.read_status()
                 && !matches!(state, ProcessState::Running)
