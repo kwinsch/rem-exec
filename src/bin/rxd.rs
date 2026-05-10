@@ -75,6 +75,8 @@ enum Action {
     Clean,
     /// Print version and protocol information
     Version,
+    /// Print LLM-friendly usage guide
+    Llm,
     /// Pipe stdin to a process (streams raw bytes from SSH channel to FIFO)
     PipeStdin {
         /// Process ID
@@ -98,6 +100,11 @@ enum Action {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    if matches!(cli.action, Action::Llm) {
+        print!("{}", include_str!("../../docs/llm.txt"));
+        return ExitCode::SUCCESS;
+    }
 
     // Version needs no state dir — must work on a fresh host before first deploy.
     if matches!(cli.action, Action::Version) {
@@ -142,7 +149,7 @@ fn main() -> ExitCode {
             actions::follow(&id, &stream, offset);
             return ExitCode::SUCCESS;
         }
-        Action::Version => unreachable!("handled above"),
+        Action::Version | Action::Llm => unreachable!("handled above"),
     };
 
     println!(

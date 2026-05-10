@@ -1,0 +1,171 @@
+# rx — remote process execution for AI agents
+
+rx runs commands on remote hosts via SSH. Processes persist independently —
+start a process, disconnect, read output later. All responses are JSON.
+
+## Quick start
+
+rx start HOST COMMAND...          # start a process, returns {"type":"started","id":"..."}
+rx status HOST ID                 # check state: running, exited(0), exited(1), etc.
+rx stdout HOST ID                 # read stdout (base64-encoded in JSON)
+rx kill HOST ID                   # terminate a process
+rx clean HOST                     # remove all exited process state
+
+## Commands
+
+### rx start HOST COMMAND...
+Start a process on HOST. Returns process ID immediately.
+Flags:
+  --no-close-stdin    Keep remote stdin open after local stdin EOF
+  --pipe              Bidirectional: stdin→remote, remote stdout→local stdout (JSON on stderr)
+Stdin: If stdin is piped, data is forwarded to the remote process automatically.
+
+### rx status HOST ID
+Returns process state, timing, and output sizes.
+
+### rx stdout HOST ID [--offset N] [--limit N]
+Read stdout. Output is base64-encoded in the "data" field.
+Default limit: 1 MiB. Use --offset for incremental reads.
+
+### rx stderr HOST ID [--offset N] [--limit N]
+Same as stdout but for stderr.
+
+### rx write HOST ID [INPUT] [--raw]
+Send data to process stdin. If INPUT is omitted and stdin is piped, reads from pipe.
+Default: appends newline. Use --raw to send exactly as-is.
+
+### rx close-stdin HOST ID
+Send EOF to the process (closes stdin).
+
+### rx kill HOST ID
+SIGTERM → wait 200ms → SIGKILL if still alive.
+
+### rx list HOST
+List all processes with their state and command.
+
+### rx clean HOST
+Remove all exited process state from the remote host.
+
+### rx deploy HOST
+Deploy rxd binary to HOST. Auto-detects architecture (x86_64/aarch64/riscv64).
+Copies binary to ~/.local/bin/rxd on the remote.
+
+### rx daemon start|stop|status
+Manage the local caching daemon. Optional — rx works without it.
+The daemon caches remote output locally for faster reads.
+
+## Stdin piping
+
+Piped stdin is the preferred way to send complex data. It avoids SSH argument
+escaping issues entirely — data flows through a binary-safe channel.
+
+# Create a file on remote (special chars, newlines preserved exactly):
+printf '#!/bin/sh\necho "hello $USER"\n' | rx start host tee /path/to/file
+
+# Run a script from local disk on remote:
+cat script.sh | rx start host sh
+
+# Send input to a running process:
+echo "yes" | rx write host ID
+
+# Bidirectional pipe (JSON response on stderr, data on stdout):
+echo "input" | rx start --pipe host ./script.sh
+
+## Auto-deploy
+
+Set REM_EXEC_AUTO_DEPLOY=1 to automatically deploy rxd when a host doesn't
+have it or has an incompatible version. Detects architecture and copies the
+correct binary. One retry on failure.
+
+export REM_EXEC_AUTO_DEPLOY=1
+rx start new-host uname -a    # auto-deploys if rxd is missing
+
+Binaries are stored in ~/.local/share/rem-exec/bin/rxd-{arch}.
+
+## JSON response types
+
+Every command returns one JSON object on stdout (except --pipe mode which
+uses stderr for JSON). The "type" field identifies the response.
+
+### started
+{"type":"started","id":"a1b2c3d4"}
+
+### status
+{"type":"status","id":"a1b2c3d4","state":"running","cmd":"sleep 10",
+ "started":1700000000,"ended":null,"stdout_size":0,"stderr_size":0}
+
+State values: "running", "exited(0)", "exited(1)", "exited(killed)", "exited(unknown)"
+
+### output
+{"type":"output","data":"SGVsbG8K","offset":0,"size":6}
+
+The "data" field is base64-encoded. Decode with standard base64.
+"offset" is the byte position this chunk starts at.
+"size" is the total file size (use as next offset for incremental reads).
+
+### written
+{"type":"written","bytes":5}
+
+### killed
+{"type":"killed","id":"a1b2c3d4"}
+
+### list
+{"type":"list","processes":[{"id":"a1b2c3d4","state":"running","cmd":"sleep 10"}]}
+
+### cleaned
+{"type":"cleaned","removed":["a1b2c3d4","e5f6g7h8"]}
+
+### version
+{"type":"version","version":"0.1.0","protocol":1}
+
+### error
+{"type":"error","message":"process not found: xyz"}
+
+## Incremental output reading
+
+Use offset to read output incrementally without re-reading:
+
+1. rx stdout host ID                    → {"data":"...","offset":0,"size":100}
+2. rx stdout host ID --offset 100       → {"data":"...","offset":100,"size":250}
+3. rx stdout host ID --offset 250       → {"data":"","offset":250,"size":250}  (no new data)
+
+When size == offset and process state is exited, all output has been read.
+
+## Common workflows
+
+### Run command and collect output
+ID=$(rx start host ls -la | jq -r .id)
+# wait for completion
+while [ "$(rx status host $ID | jq -r .state)" = "running" ]; do sleep 1; done
+rx stdout host $ID | jq -r .data | base64 -d
+
+### Interactive process
+ID=$(rx start host python3 | jq -r .id)
+rx write host $ID "print('hello')"
+sleep 1
+rx stdout host $ID              # read output
+rx close-stdin host $ID         # send EOF
+
+### Create file on remote
+printf 'file contents here' | rx start host tee /path/to/file
+
+### Run local script on remote
+cat script.sh | rx start host sh
+
+### Quick command with output (bidirectional pipe)
+echo "" | rx start --pipe host ls -la
+# stdout contains ls output directly, no base64
+
+## Error recovery
+
+- "process not found": ID doesn't exist or was cleaned. Start a new process.
+- "process already exited": Can't write/kill — process is done. Read output instead.
+- "SSH error": Network/auth issue. Check SSH connectivity to host.
+- "no binary for {arch}": Run ./install.sh to build binaries for all architectures.
+- "auto-deploy failed": Check SSH access and that binary store has the right arch.
+
+## Host requirements
+
+- SSH access (key-based auth recommended)
+- rxd binary at ~/.local/bin/rxd (use rx deploy or auto-deploy)
+- No other dependencies — rxd is a static binary
