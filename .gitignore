@@ -1,1 +1,4 @@
 /target
+rem-exec
+rem-execd
+test-confirm.sh
