@@ -17,9 +17,8 @@ Start processes on remote hosts, pipe data in, read output later. All responses 
 ## Quick start
 
 ```bash
-# Build and install
-export MUSL_PATH=/path/to/musl-cross-make/output/bin
-./install.sh
+# Build and install (see `rx skill` for full procedure)
+rx skill
 
 # Deploy to a remote host
 rx deploy host

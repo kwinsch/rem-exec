@@ -182,8 +182,38 @@ Do NOT use `su` (requires /dev/tty for password). Use `doas` or `sudo -n`.
 - "process not found": ID doesn't exist or was cleaned. Start a new process.
 - "process already exited": Can't write/kill — process is done. Read output instead.
 - "SSH error": Network/auth issue. Check SSH connectivity to host.
-- "no binary for {arch}": Run ./install.sh to build binaries for all architectures.
+- "no binary for {arch}": Build rxd for the missing architecture (see Build section).
 - "auto-deploy failed": Check SSH access and that binary store has the right arch.
+
+## Build and install
+
+Two binaries: rx (local CLI) and rxd (remote, deployed to targets).
+Requires musl-cross-make toolchain for static linking.
+
+### Targets
+
+  arch      | cargo target                     | strip prefix
+  ----------|----------------------------------|-------------------
+  x86_64    | x86_64-unknown-linux-musl        | x86_64-linux-musl
+  aarch64   | aarch64-unknown-linux-musl       | aarch64-linux-musl
+  riscv64   | riscv64gc-unknown-linux-musl     | riscv64-linux-musl
+
+### Procedure
+
+1. Set MUSL_PATH to the musl-cross-make output/bin directory.
+2. Build rxd for each target architecture:
+   PATH="$MUSL_PATH:$PATH" cargo build --release --target <cargo-target> --bin rxd
+   $MUSL_PATH/<strip-prefix>-strip target/<cargo-target>/release/rxd
+3. Copy stripped rxd binaries to ~/.local/share/rem-exec/bin/rxd-{arch}.
+4. Build rx for the local host (x86_64-unknown-linux-musl):
+   PATH="$MUSL_PATH:$PATH" cargo build --release --target x86_64-unknown-linux-musl --bin rx
+   $MUSL_PATH/x86_64-linux-musl-strip target/x86_64-unknown-linux-musl/release/rx
+5. Copy rx to ~/.local/bin/
+
+### Paths
+
+- Binary store: ~/.local/share/rem-exec/bin/ (rxd-x86_64, rxd-aarch64, rxd-riscv64)
+- Local CLI: ~/.local/bin/rx
 
 ## Host requirements
 
