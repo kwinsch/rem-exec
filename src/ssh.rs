@@ -47,7 +47,7 @@ pub fn ssh_exec_auto_deploy(host: &str, args: &[&str]) -> Result<Response> {
 
 /// The remote binary name. Uses ~/.local/bin path since it may not be in
 /// the non-login SSH PATH.
-const REMOTE_BIN: &str = ".local/bin/rem-execd";
+const REMOTE_BIN: &str = ".local/bin/rxd";
 
 /// Execute a raw SSH command, returning the Output.
 pub fn ssh_raw(host: &str, args: &[&str]) -> Result<Output> {

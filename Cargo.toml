@@ -9,12 +9,12 @@ name = "rem_exec"
 path = "src/lib.rs"
 
 [[bin]]
-name = "rem-exec"
-path = "src/bin/rem-exec.rs"
+name = "rx"
+path = "src/bin/rx.rs"
 
 [[bin]]
-name = "rem-execd"
-path = "src/bin/rem-execd.rs"
+name = "rxd"
+path = "src/bin/rxd.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

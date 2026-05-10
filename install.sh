@@ -21,27 +21,27 @@ declare -A STRIP_PREFIX=(
 
 mkdir -p "$STORE"
 
-# Build rem-execd for all architectures
+# Build rxd for all architectures
 for arch in "${!TARGETS[@]}"; do
     target="${TARGETS[$arch]}"
-    echo "Building rem-execd for $arch ($target)..."
-    PATH="$MUSL_PATH:$PATH" cargo build --release --target "$target" --bin rem-execd
-    "$MUSL_PATH/${STRIP_PREFIX[$arch]}-strip" "target/$target/release/rem-execd"
-    cp "target/$target/release/rem-execd" "$STORE/rem-execd-$arch"
+    echo "Building rxd for $arch ($target)..."
+    PATH="$MUSL_PATH:$PATH" cargo build --release --target "$target" --bin rxd
+    "$MUSL_PATH/${STRIP_PREFIX[$arch]}-strip" "target/$target/release/rxd"
+    cp "target/$target/release/rxd" "$STORE/rxd-$arch"
 done
 
-# Build rem-exec (local CLI) for host architecture
+# Build rx (local CLI) for host architecture
 HOST_TARGET="x86_64-unknown-linux-musl"
-echo "Building rem-exec for local host..."
-PATH="$MUSL_PATH:$PATH" cargo build --release --target "$HOST_TARGET" --bin rem-exec
-"$MUSL_PATH/x86_64-linux-musl-strip" "target/$HOST_TARGET/release/rem-exec"
+echo "Building rx for local host..."
+PATH="$MUSL_PATH:$PATH" cargo build --release --target "$HOST_TARGET" --bin rx
+"$MUSL_PATH/x86_64-linux-musl-strip" "target/$HOST_TARGET/release/rx"
 
 mkdir -p "$INSTALL_DIR"
-cp "target/$HOST_TARGET/release/rem-exec" "$INSTALL_DIR/"
+cp "target/$HOST_TARGET/release/rx" "$INSTALL_DIR/"
 
 echo ""
-echo "Installed rem-exec to $INSTALL_DIR/"
+echo "Installed rx to $INSTALL_DIR/"
 echo "Binary store ($STORE):"
 ls -lh "$STORE/"
 echo ""
-rem-exec --version
+rx --version

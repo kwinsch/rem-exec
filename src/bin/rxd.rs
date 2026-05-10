@@ -7,7 +7,7 @@ use rem_exec::protocol::Response;
 use rem_exec::remote::{actions, start};
 
 #[derive(Parser)]
-#[command(name = "rem-execd")]
+#[command(name = "rxd")]
 #[command(version)]
 #[command(about = "Remote process execution daemon (runs on target host)")]
 struct Cli {

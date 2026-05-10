@@ -46,10 +46,10 @@ pub fn binary_store_dir() -> PathBuf {
     PathBuf::from(home).join(".local/share/rem-exec/bin")
 }
 
-/// Return the path to the local rem-execd binary for the given architecture.
+/// Return the path to the local rxd binary for the given architecture.
 /// Errors if the binary does not exist.
 fn binary_for_arch(arch: &str) -> Result<PathBuf> {
-    let path = binary_store_dir().join(format!("rem-execd-{arch}"));
+    let path = binary_store_dir().join(format!("rxd-{arch}"));
     if !path.exists() {
         return Err(RemExecError::Other(format!(
             "no binary for {arch} at {} — build with install.sh first",
@@ -87,7 +87,7 @@ pub fn deploy_to_host(host: &str) -> Result<DeployResult> {
     // SCP binary to remote
     let scp = Command::new("scp")
         .arg(local_binary.to_str().unwrap())
-        .arg(format!("{host}:.local/bin/rem-execd"))
+        .arg(format!("{host}:.local/bin/rxd"))
         .output()
         .map_err(RemExecError::Io)?;
 

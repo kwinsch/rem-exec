@@ -8,7 +8,7 @@ use rem_exec::protocol::{DaemonRequest, DaemonResponse, Response};
 use rem_exec::ssh::{RemoteArgs, ssh_exec_auto_deploy};
 
 #[derive(Parser)]
-#[command(name = "rem-exec")]
+#[command(name = "rx")]
 #[command(version)]
 #[command(about = "Agent-friendly remote process execution")]
 struct Cli {
