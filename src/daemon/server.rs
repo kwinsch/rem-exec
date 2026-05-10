@@ -27,10 +27,9 @@ pub fn start_daemon() -> Result<()> {
         let _ = fs::remove_file(&sock_path);
     }
 
-    // Create directories
-    if let Some(parent) = sock_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    // Ensure base dir exists with correct permissions (0700)
+    let app_dir = crate::process::remote_base();
+    crate::process::ensure_base_dir(&app_dir)?;
     fs::create_dir_all(&base)?;
 
     // Fork to daemonize

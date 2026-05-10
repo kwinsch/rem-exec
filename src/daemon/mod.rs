@@ -7,31 +7,22 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use crate::error::{RemExecError, Result};
+use crate::process::remote_base;
 use crate::protocol::{DaemonRequest, DaemonResponse};
 
 /// Get the daemon socket path.
 pub fn socket_path() -> PathBuf {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-        .unwrap_or_else(|_| format!("/tmp/rem-exec-{}", unsafe { libc::getuid() }));
-    PathBuf::from(runtime_dir)
-        .join("rem-exec")
-        .join("daemon.sock")
+    remote_base().join("daemon.sock")
 }
 
 /// Get the daemon PID file path.
 pub fn pid_path() -> PathBuf {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-        .unwrap_or_else(|_| format!("/tmp/rem-exec-{}", unsafe { libc::getuid() }));
-    PathBuf::from(runtime_dir)
-        .join("rem-exec")
-        .join("daemon.pid")
+    remote_base().join("daemon.pid")
 }
 
 /// Get the local base directory for cached process output.
 pub fn local_base() -> PathBuf {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-        .unwrap_or_else(|_| format!("/tmp/rem-exec-{}", unsafe { libc::getuid() }));
-    PathBuf::from(runtime_dir).join("rem-exec").join("data")
+    remote_base().join("data")
 }
 
 /// Check if the daemon is running by attempting to connect to the socket.

@@ -61,13 +61,19 @@ pub fn ensure_base_dir(base: &std::path::Path) -> Result<()> {
         )));
     }
 
-    // Check permissions (must be 0700 or stricter)
+    // Fix permissions to 0700 if group/other bits are set.
+    // The directory is owned by us and is not a symlink, so it's safe to chmod.
     if meta.mode() & 0o077 != 0 {
-        return Err(RemExecError::Other(format!(
-            "base dir {} has insecure permissions {:o}",
-            base.display(),
-            meta.mode() & 0o777
-        )));
+        let cstr = std::ffi::CString::new(base.to_str().unwrap()).unwrap();
+        let ret = unsafe { libc::chmod(cstr.as_ptr(), 0o700) };
+        if ret != 0 {
+            return Err(RemExecError::Other(format!(
+                "base dir {} has insecure permissions {:o} and chmod to 0700 failed (errno {})",
+                base.display(),
+                meta.mode() & 0o777,
+                std::io::Error::last_os_error()
+            )));
+        }
     }
 
     Ok(())

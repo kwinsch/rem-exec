@@ -87,14 +87,14 @@ enum Action {
 }
 
 fn main() -> ExitCode {
+    let cli = Cli::parse();
+
     let base = remote_base();
     if let Err(e) = rem_exec::process::ensure_base_dir(&base) {
         let resp = Response::error(e.to_string());
         println!("{}", serde_json::to_string(&resp).unwrap());
         return ExitCode::FAILURE;
     }
-
-    let cli = Cli::parse();
 
     let response = match cli.action {
         Action::Start { command } => match start::start(&command) {
