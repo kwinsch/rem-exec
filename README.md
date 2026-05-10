@@ -1,4 +1,4 @@
-# rx
+# rem-exec
 
 Agent-friendly remote process execution over SSH.
 
