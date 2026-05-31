@@ -113,6 +113,18 @@ enum Command {
         /// Remote host (SSH destination)
         host: String,
     },
+    /// Download static rxd binaries into the local deploy cache
+    Setup {
+        /// Release tag or version (default: current rx version)
+        #[arg(long)]
+        version: Option<String>,
+        /// Architecture to cache (repeatable; default: all supported)
+        #[arg(long)]
+        arch: Vec<String>,
+        /// Re-download even if the cached binary already matches SHA256SUMS
+        #[arg(long)]
+        force: bool,
+    },
     /// Print skill file (machine-readable usage guide)
     Skill,
 }
@@ -170,6 +182,49 @@ fn main() -> ExitCode {
                         "version": result.version,
                     }))
                     .unwrap()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // Setup is always local: it populates the rxd deploy cache.
+    if let Command::Setup {
+        version,
+        arch,
+        force,
+    } = &cli.command
+    {
+        return match rem_exec::deploy::setup_release_binaries(version.as_deref(), arch, *force) {
+            Ok(result) => {
+                let binaries: Vec<_> = result
+                    .binaries
+                    .iter()
+                    .map(|binary| {
+                        let status = match binary.status {
+                            rem_exec::deploy::SetupStatus::Cached => "cached",
+                            rem_exec::deploy::SetupStatus::Installed => "installed",
+                        };
+                        serde_json::json!({
+                            "arch": binary.arch,
+                            "path": binary.path.display().to_string(),
+                            "sha256": binary.sha256,
+                            "status": status,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "type": "setup",
+                        "version": result.version,
+                        "binaries": binaries,
+                    }))
+                    .unwrap_or_default()
                 );
                 ExitCode::SUCCESS
             }
@@ -368,6 +423,7 @@ fn route_via_daemon(command: &Command) -> ExitCode {
         Command::List { host } => DaemonRequest::List { host: host.clone() },
         Command::Clean { host } => DaemonRequest::Clean { host: host.clone() },
         Command::Deploy { host } => DaemonRequest::Deploy { host: host.clone() },
+        Command::Setup { .. } => unreachable!("handled above"),
         Command::Skill => unreachable!("handled above"),
         Command::Daemon { .. } => unreachable!(),
     };
@@ -503,7 +559,9 @@ fn route_via_ssh(command: &Command) -> ExitCode {
             let args = RemoteArgs::clean();
             ssh_exec_auto_deploy(host, &args.as_str_slice())
         }
-        Command::Deploy { .. } | Command::Skill => unreachable!("handled above"),
+        Command::Deploy { .. } | Command::Setup { .. } | Command::Skill => {
+            unreachable!("handled above")
+        }
         Command::Daemon { .. } => unreachable!(),
     };
 

@@ -1,15 +1,37 @@
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::{RemExecError, Result};
 use crate::protocol::{PROTOCOL_VERSION, Response};
 use crate::ssh::{RemoteArgs, ssh_exec};
 
+const RELEASE_BASE_URL: &str = "https://github.com/kwinsch/rem-exec/releases/download";
+const SUPPORTED_ARCHES: &[&str] = &["x86_64", "aarch64", "riscv64"];
+
 /// Result of a successful deployment.
 pub struct DeployResult {
     pub host: String,
     pub arch: String,
     pub version: String,
+}
+
+/// Result of preparing the local deploy cache from GitHub release assets.
+pub struct SetupResult {
+    pub version: String,
+    pub binaries: Vec<SetupBinary>,
+}
+
+pub struct SetupBinary {
+    pub arch: String,
+    pub path: PathBuf,
+    pub sha256: String,
+    pub status: SetupStatus,
+}
+
+pub enum SetupStatus {
+    Cached,
+    Installed,
 }
 
 /// Detect the remote host's CPU architecture via `ssh host uname -m`.
@@ -29,12 +51,11 @@ pub fn detect_arch(host: &str) -> Result<String> {
     }
 
     let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    match raw.as_str() {
-        "x86_64" => Ok("x86_64".to_string()),
-        "aarch64" => Ok("aarch64".to_string()),
-        "riscv64" => Ok("riscv64".to_string()),
+    match normalize_arch(&raw) {
+        Some(arch) => Ok(arch.to_string()),
         other => Err(RemExecError::Other(format!(
-            "unsupported architecture on {host}: {other}"
+            "unsupported architecture on {host}: {}",
+            other.unwrap_or(raw.as_str())
         ))),
     }
 }
@@ -52,11 +73,186 @@ fn binary_for_arch(arch: &str) -> Result<PathBuf> {
     let path = binary_store_dir().join(format!("rxd-{arch}"));
     if !path.exists() {
         return Err(RemExecError::Other(format!(
-            "no binary for {arch} at {} — build with install.sh first",
-            path.display()
+            "no binary for {arch} at {} — run `rx setup` first",
+            path.display(),
         )));
     }
     Ok(path)
+}
+
+/// Populate the local deploy cache with static rxd binaries from GitHub Releases.
+pub fn setup_release_binaries(
+    version: Option<&str>,
+    requested_arches: &[String],
+    force: bool,
+) -> Result<SetupResult> {
+    let version = normalize_version(version);
+    let arches = normalize_requested_arches(requested_arches)?;
+    let sums = download_text(&release_url(&version, "SHA256SUMS"))?;
+    let store = binary_store_dir();
+    fs::create_dir_all(&store)?;
+
+    let mut binaries = Vec::new();
+    for arch in arches {
+        let asset = format!("rxd-{arch}");
+        let expected = checksum_for_asset(&sums, &asset).ok_or_else(|| {
+            RemExecError::Other(format!(
+                "SHA256SUMS for {version} does not contain checksum for {asset}"
+            ))
+        })?;
+        let dest = store.join(&asset);
+
+        if !force && dest.exists() {
+            let current = sha256_file(&dest)?;
+            if current == expected {
+                binaries.push(SetupBinary {
+                    arch,
+                    path: dest,
+                    sha256: expected,
+                    status: SetupStatus::Cached,
+                });
+                continue;
+            }
+        }
+
+        let tmp = store.join(format!("{asset}.download-{}", std::process::id()));
+        if tmp.exists() {
+            fs::remove_file(&tmp)?;
+        }
+        download_file(&release_url(&version, &asset), &tmp)?;
+        let actual = sha256_file(&tmp)?;
+        if actual != expected {
+            let _ = fs::remove_file(&tmp);
+            return Err(RemExecError::Other(format!(
+                "checksum mismatch for {asset}: expected {expected}, got {actual}"
+            )));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
+        }
+        fs::rename(&tmp, &dest)?;
+
+        binaries.push(SetupBinary {
+            arch,
+            path: dest,
+            sha256: expected,
+            status: SetupStatus::Installed,
+        });
+    }
+
+    Ok(SetupResult { version, binaries })
+}
+
+fn normalize_requested_arches(requested: &[String]) -> Result<Vec<String>> {
+    if requested.is_empty() {
+        return Ok(SUPPORTED_ARCHES.iter().map(|a| (*a).to_string()).collect());
+    }
+
+    let mut arches = Vec::new();
+    for raw in requested {
+        let arch = normalize_arch(raw).ok_or_else(|| {
+            RemExecError::Other(format!(
+                "unsupported architecture {raw}; supported: {}",
+                SUPPORTED_ARCHES.join(", ")
+            ))
+        })?;
+        if !arches.iter().any(|a| a == arch) {
+            arches.push(arch.to_string());
+        }
+    }
+    Ok(arches)
+}
+
+fn normalize_arch(raw: &str) -> Option<&'static str> {
+    match raw {
+        "x86_64" | "amd64" => Some("x86_64"),
+        "aarch64" | "arm64" => Some("aarch64"),
+        "riscv64" | "riscv64gc" => Some("riscv64"),
+        _ => None,
+    }
+}
+
+fn normalize_version(version: Option<&str>) -> String {
+    match version {
+        Some(v) if v.starts_with('v') => v.to_string(),
+        Some(v) => format!("v{v}"),
+        None => format!("v{}", env!("CARGO_PKG_VERSION")),
+    }
+}
+
+fn release_url(version: &str, asset: &str) -> String {
+    format!("{RELEASE_BASE_URL}/{version}/{asset}")
+}
+
+fn checksum_for_asset(sums: &str, asset: &str) -> Option<String> {
+    sums.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let checksum = parts.next()?;
+        let filename = parts.next()?;
+        (filename == asset).then(|| checksum.to_string())
+    })
+}
+
+fn download_text(url: &str) -> Result<String> {
+    let output = Command::new("curl")
+        .args(["-fsSL", url])
+        .output()
+        .map_err(RemExecError::Io)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(RemExecError::Other(format!(
+            "failed to download {url}: {stderr}"
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn download_file(url: &str, dest: &Path) -> Result<()> {
+    let dest = dest.to_str().ok_or_else(|| {
+        RemExecError::Other(format!("invalid destination path {}", dest.display()))
+    })?;
+    let output = Command::new("curl")
+        .args(["-fsSL", url, "-o", dest])
+        .output()
+        .map_err(RemExecError::Io)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(RemExecError::Other(format!(
+            "failed to download {url}: {stderr}"
+        )));
+    }
+
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let output = Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .map_err(RemExecError::Io)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(RemExecError::Other(format!(
+            "sha256sum failed for {}: {stderr}",
+            path.display()
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .split_whitespace()
+        .next()
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            RemExecError::Other(format!("sha256sum returned no hash for {}", path.display()))
+        })
 }
 
 /// Deploy rem-execd to a remote host.
@@ -145,4 +341,38 @@ pub fn auto_deploy_enabled() -> bool {
     std::env::var("REM_EXEC_AUTO_DEPLOY")
         .map(|v| v == "1")
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_release_versions() {
+        assert_eq!(normalize_version(Some("v0.1.1")), "v0.1.1");
+        assert_eq!(normalize_version(Some("0.1.1")), "v0.1.1");
+    }
+
+    #[test]
+    fn normalizes_supported_arches() {
+        assert_eq!(normalize_arch("x86_64"), Some("x86_64"));
+        assert_eq!(normalize_arch("amd64"), Some("x86_64"));
+        assert_eq!(normalize_arch("arm64"), Some("aarch64"));
+        assert_eq!(normalize_arch("riscv64gc"), Some("riscv64"));
+        assert_eq!(normalize_arch("sparc64"), None);
+    }
+
+    #[test]
+    fn parses_checksum_for_asset() {
+        let sums = "\
+aaaaaaaa  rxd-x86_64
+bbbbbbbb  rx-x86_64
+cccccccc  rxd-aarch64
+";
+        assert_eq!(
+            checksum_for_asset(sums, "rxd-aarch64"),
+            Some("cccccccc".to_string())
+        );
+        assert_eq!(checksum_for_asset(sums, "rxd-riscv64"), None);
+    }
 }

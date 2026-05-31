@@ -14,12 +14,32 @@ Start processes on remote hosts, pipe data in, read output later. All responses 
 - **JSON protocol** — every response is structured, parseable, predictable
 - **Embedded skill file** — `rx skill` prints complete machine-readable documentation
 
+## Install
+
+```bash
+# Rust source install: installs rx and rxd locally.
+cargo install rem-exec
+
+# Download static rxd binaries for remote deployment.
+rx setup
+```
+
+For remote deployment, `rx deploy` needs a static `rxd` binary cache. `rx setup`
+downloads and verifies the GitHub Release binaries for x86_64, aarch64, and
+riscv64:
+
+```bash
+rx setup                  # all supported rxd architectures
+rx setup --arch x86_64    # one architecture
+rx setup --version v0.1.0 # specific release
+```
+
+`rx` runs locally. `rxd` is the binary copied to remote hosts by `rx deploy` and
+auto-deploy.
+
 ## Quick start
 
 ```bash
-# Build and install (see `rx skill` for full procedure)
-rx skill
-
 # Deploy to a remote host
 rx deploy host
 
@@ -50,6 +70,15 @@ Two binaries:
 - **rxd** — remote binary (static, no dependencies, deployed via `rx deploy`)
 
 Communication flows over SSH. No custom ports, no daemons to manage on the remote.
+
+## Distribution
+
+- crates.io: `cargo install rem-exec`
+- GitHub Releases: static `rx` and `rxd` binaries for x86_64, aarch64, and riscv64
+- Auto-deploy cache: `~/.local/share/rem-exec/bin/rxd-{arch}` (`rx setup`)
+
+Release downloads include `SHA256SUMS`. Verify downloaded assets before use in
+production workflows.
 
 ## License
 
