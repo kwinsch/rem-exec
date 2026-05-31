@@ -3,6 +3,16 @@ name = "rem-exec"
 version = "0.1.0"
 edition = "2024"
 description = "Agent-friendly remote process execution"
+license = "MIT"
+repository = "https://github.com/kwinsch/rem-exec"
+readme = "README.md"
+keywords = ["ssh", "remote", "execution", "cli", "automation"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [
+    ".cargo/",
+    "SENSITIVE.md",
+    "test-confirm.sh",
+]
 
 [lib]
 name = "rem_exec"
