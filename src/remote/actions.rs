@@ -1,15 +1,25 @@
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::base64_encode;
-use crate::process::{ProcessDir, ProcessState, remote_base, unix_timestamp};
+use crate::process::{ProcessDir, ProcessState, is_valid_process_id, remote_base, unix_timestamp};
 use crate::protocol::{ProcessSummary, Response};
+
+const WRITE_STDIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn invalid_process_id(id: &str) -> Response {
+    Response::error(format!("invalid process ID: {id}"))
+}
 
 /// Get process status with self-healing: if status says "running" but process
 /// is dead, update to "exited(unknown)".
 pub fn status(id: &str) -> Response {
+    if !is_valid_process_id(id) {
+        return invalid_process_id(id);
+    }
+
     let base = remote_base();
     let pdir = ProcessDir::new(&base, id);
     let state = match pdir.read_status() {
@@ -60,6 +70,10 @@ const DEFAULT_READ_LIMIT: u64 = 1024 * 1024;
 
 /// Read process output (stdout or stderr) with optional byte offset and limit.
 pub fn read_output(id: &str, stream: &str, offset: Option<u64>, limit: Option<u64>) -> Response {
+    if !is_valid_process_id(id) {
+        return invalid_process_id(id);
+    }
+
     let base = remote_base();
     let pdir = ProcessDir::new(&base, id);
     let path = match stream {
@@ -99,6 +113,10 @@ pub fn read_output(id: &str, stream: &str, offset: Option<u64>, limit: Option<u6
 
 /// Get the byte size of a stream file.
 pub fn size(id: &str, stream: &str) -> Response {
+    if !is_valid_process_id(id) {
+        return invalid_process_id(id);
+    }
+
     let base = remote_base();
     let pdir = ProcessDir::new(&base, id);
     let sz = pdir.stream_size(stream);
@@ -115,6 +133,10 @@ pub fn size(id: &str, stream: &str) -> Response {
 /// input is sent as-is. Uses O_NONBLOCK to avoid hanging if the process has
 /// already exited.
 pub fn write_stdin(id: &str, input: &str, raw: bool) -> Response {
+    if !is_valid_process_id(id) {
+        return invalid_process_id(id);
+    }
+
     let base = remote_base();
     let pdir = ProcessDir::new(&base, id);
     let fifo = pdir.stdin_pipe_path();
@@ -145,17 +167,57 @@ pub fn write_stdin(id: &str, input: &str, raw: bool) -> Response {
         format!("{input}\n").into_bytes()
     };
 
-    let written = unsafe { libc::write(fd, data.as_ptr() as *const libc::c_void, data.len()) };
+    let write_result = write_all_nonblocking(fd, &data);
     unsafe { libc::close(fd) };
 
-    if written < 0 {
+    match write_result {
+        Ok(bytes) => Response::Written { bytes },
+        Err(err) => Response::error(format!("write failed: {err}")),
+    }
+}
+
+fn write_all_nonblocking(fd: libc::c_int, data: &[u8]) -> std::io::Result<usize> {
+    let started = Instant::now();
+    let mut offset = 0;
+
+    while offset < data.len() {
+        let written = unsafe {
+            libc::write(
+                fd,
+                data[offset..].as_ptr() as *const libc::c_void,
+                data.len() - offset,
+            )
+        };
+
+        if written > 0 {
+            offset += written as usize;
+            continue;
+        }
+
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "stdin pipe write returned zero bytes",
+            ));
+        }
+
         let err = std::io::Error::last_os_error();
-        Response::error(format!("write failed: {err}"))
-    } else {
-        Response::Written {
-            bytes: written as usize,
+        match err.kind() {
+            std::io::ErrorKind::Interrupted => {}
+            std::io::ErrorKind::WouldBlock => {
+                if started.elapsed() >= WRITE_STDIN_TIMEOUT {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out writing to stdin pipe",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            _ => return Err(err),
         }
     }
+
+    Ok(offset)
 }
 
 /// Kill the stdin holder process to signal EOF to the command.
@@ -176,6 +238,10 @@ fn kill_stdin_holder(pdir: &ProcessDir) -> bool {
 /// Kills the holder process, which is the last writer on the FIFO. Once the
 /// holder dies, the command sees EOF on stdin.
 pub fn close_stdin(id: &str) -> Response {
+    if !is_valid_process_id(id) {
+        return invalid_process_id(id);
+    }
+
     let base = remote_base();
     let pdir = ProcessDir::new(&base, id);
 
@@ -201,6 +267,10 @@ pub fn close_stdin(id: &str) -> Response {
 /// The reverse of `follow`: reads stdin in chunks, writes to FIFO.
 /// No JSON output — this is a raw data channel.
 pub fn pipe_stdin(id: &str, no_close: bool) {
+    if !is_valid_process_id(id) {
+        std::process::exit(1);
+    }
+
     let base = remote_base();
     let pdir = ProcessDir::new(&base, id);
 
@@ -273,6 +343,10 @@ pub fn pipe_stdin(id: &str, no_close: bool) {
 /// After setsid(), the runner is the process group leader (PGID == runner_pid).
 /// The command and holder inherit that PGID. We kill the entire group.
 pub fn kill(id: &str) -> Response {
+    if !is_valid_process_id(id) {
+        return invalid_process_id(id);
+    }
+
     let base = remote_base();
     let pdir = ProcessDir::new(&base, id);
 
@@ -394,6 +468,10 @@ pub fn clean() -> Response {
 /// Streams until the process exits and all output is flushed.
 /// If `offset` is provided, seeks to that position first (for resume).
 pub fn follow(id: &str, stream: &str, offset: Option<u64>) -> Response {
+    if !is_valid_process_id(id) {
+        return invalid_process_id(id);
+    }
+
     let base = remote_base();
     let pdir = ProcessDir::new(&base, id);
     let path = match stream {
@@ -444,4 +522,57 @@ pub fn follow(id: &str, stream: &str, offset: Option<u64>) -> Response {
     }
 
     Response::error("follow completed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_all_nonblocking_writes_payload_larger_than_pipe_capacity() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+
+        let flags = unsafe { libc::fcntl(write_fd, libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+
+        let data = vec![b'x'; 128 * 1024];
+        let expected_len = data.len();
+        let reader = thread::spawn(move || {
+            let mut out = Vec::with_capacity(expected_len);
+            let mut buf = [0u8; 4096];
+
+            while out.len() < expected_len {
+                let n = unsafe {
+                    libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                };
+                if n > 0 {
+                    out.extend_from_slice(&buf[..n as usize]);
+                } else if n == 0 {
+                    break;
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != std::io::ErrorKind::Interrupted {
+                        panic!("pipe read failed: {err}");
+                    }
+                }
+            }
+
+            unsafe { libc::close(read_fd) };
+            out
+        });
+
+        let written = write_all_nonblocking(write_fd, &data).unwrap();
+        unsafe { libc::close(write_fd) };
+
+        let out = reader.join().unwrap();
+        assert_eq!(written, data.len());
+        assert_eq!(out, data);
+    }
 }

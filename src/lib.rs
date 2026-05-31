@@ -30,3 +30,17 @@ pub fn base64_encode(data: &[u8]) -> String {
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::base64_encode;
+
+    #[test]
+    fn base64_encode_handles_empty_and_padding_cases() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"hello\n"), "aGVsbG8K");
+    }
+}

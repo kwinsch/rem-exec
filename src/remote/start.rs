@@ -1,5 +1,6 @@
 use std::ffi::CString;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::RawFd;
 
 use crate::error::{RemExecError, Result};
@@ -23,9 +24,7 @@ pub fn start(command: &[String]) -> Result<Response> {
 
     // Create process directory with restrictive permissions
     fs::create_dir_all(&pdir.dir)?;
-    // Set directory to 0700
-    let dir_cstr = CString::new(pdir.dir.to_str().unwrap()).unwrap();
-    unsafe { libc::chmod(dir_cstr.as_ptr(), 0o700) };
+    fs::set_permissions(&pdir.dir, fs::Permissions::from_mode(0o700))?;
 
     fs::write(pdir.status_path(), "running")?;
     fs::write(pdir.cmd_path(), command.join(" "))?;
@@ -34,6 +33,8 @@ pub fn start(command: &[String]) -> Result<Response> {
     // Create stdout/stderr files (empty, so reads don't fail)
     fs::write(pdir.stdout_path(), "")?;
     fs::write(pdir.stderr_path(), "")?;
+    fs::set_permissions(pdir.stdout_path(), fs::Permissions::from_mode(0o600))?;
+    fs::set_permissions(pdir.stderr_path(), fs::Permissions::from_mode(0o600))?;
 
     // Create the FIFO for stdin
     let fifo_path = pdir.stdin_pipe_path();

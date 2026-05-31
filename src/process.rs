@@ -26,8 +26,8 @@ pub fn ensure_base_dir(base: &std::path::Path) -> Result<()> {
 
     if !base.exists() {
         fs::create_dir_all(base)?;
-        let cstr = std::ffi::CString::new(base.to_str().unwrap()).unwrap();
-        unsafe { libc::chmod(cstr.as_ptr(), 0o700) };
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(base, fs::Permissions::from_mode(0o700))?;
         return Ok(());
     }
 
@@ -64,19 +64,22 @@ pub fn ensure_base_dir(base: &std::path::Path) -> Result<()> {
     // Fix permissions to 0700 if group/other bits are set.
     // The directory is owned by us and is not a symlink, so it's safe to chmod.
     if meta.mode() & 0o077 != 0 {
-        let cstr = std::ffi::CString::new(base.to_str().unwrap()).unwrap();
-        let ret = unsafe { libc::chmod(cstr.as_ptr(), 0o700) };
-        if ret != 0 {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fs::set_permissions(base, fs::Permissions::from_mode(0o700)) {
             return Err(RemExecError::Other(format!(
-                "base dir {} has insecure permissions {:o} and chmod to 0700 failed (errno {})",
+                "base dir {} has insecure permissions {:o} and chmod to 0700 failed ({e})",
                 base.display(),
-                meta.mode() & 0o777,
-                std::io::Error::last_os_error()
+                meta.mode() & 0o777
             )));
         }
     }
 
     Ok(())
+}
+
+/// Return true if a user-supplied process ID can only name a managed process.
+pub fn is_valid_process_id(id: &str) -> bool {
+    id.len() == 8 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Per-process state directory layout.
@@ -258,4 +261,127 @@ fn hex_encode(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_path(name: &str) -> PathBuf {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rem-exec-process-test-{}-{id}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        path
+    }
+
+    #[test]
+    fn process_state_parses_known_and_unknown_values() {
+        assert!(matches!(
+            ProcessState::parse("running"),
+            ProcessState::Running
+        ));
+        assert!(matches!(
+            ProcessState::parse("exited(0)"),
+            ProcessState::Exited(0)
+        ));
+        assert!(matches!(
+            ProcessState::parse("exited(137)"),
+            ProcessState::Exited(137)
+        ));
+        assert!(matches!(
+            ProcessState::parse("exited(killed)"),
+            ProcessState::ExitedKilled
+        ));
+        assert!(matches!(
+            ProcessState::parse("exited(unknown)"),
+            ProcessState::ExitedUnknown
+        ));
+        assert!(matches!(
+            ProcessState::parse("exited(not-a-code)"),
+            ProcessState::Exited(-1)
+        ));
+        assert!(matches!(
+            ProcessState::parse("nonsense"),
+            ProcessState::ExitedUnknown
+        ));
+    }
+
+    #[test]
+    fn process_id_validation_rejects_path_components() {
+        assert!(is_valid_process_id("0123abcd"));
+        assert!(is_valid_process_id("ABCDEF09"));
+
+        for id in [
+            "",
+            "abc",
+            "../abcd",
+            "/tmp/x",
+            "abc/def0",
+            "0123abcd9",
+            "gggggggg",
+        ] {
+            assert!(!is_valid_process_id(id), "{id} should be rejected");
+        }
+    }
+
+    #[test]
+    fn ensure_base_dir_creates_private_directory() {
+        let base = temp_path("create");
+
+        ensure_base_dir(&base).unwrap();
+
+        let meta = fs::symlink_metadata(&base).unwrap();
+        assert!(meta.is_dir());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn ensure_base_dir_fixes_group_and_other_permissions() {
+        let base = temp_path("perms");
+        fs::create_dir_all(&base).unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+
+        ensure_base_dir(&base).unwrap();
+
+        let mode = fs::symlink_metadata(&base).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn ensure_base_dir_rejects_symlink() {
+        let target = temp_path("target");
+        let link = temp_path("link");
+        fs::create_dir_all(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let err = ensure_base_dir(&link).unwrap_err().to_string();
+
+        assert!(err.contains("is a symlink"), "{err}");
+
+        fs::remove_file(link).unwrap();
+        fs::remove_dir_all(target).unwrap();
+    }
+
+    #[test]
+    fn ensure_base_dir_rejects_plain_file() {
+        let base = temp_path("file");
+        fs::write(&base, b"not a directory").unwrap();
+
+        let err = ensure_base_dir(&base).unwrap_err().to_string();
+
+        assert!(err.contains("is not a directory"), "{err}");
+
+        fs::remove_file(base).unwrap();
+    }
 }

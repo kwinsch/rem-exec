@@ -211,7 +211,7 @@ fn dispatch(
                 if let Some(host_state) = st.hosts.get_mut(&host) {
                     host_state.processes.retain(|_, _| false);
                 }
-                let host_dir = st.local_base.join(&host);
+                let host_dir = st.host_dir(&host);
                 let _ = fs::remove_dir_all(&host_dir);
             }
             resp
