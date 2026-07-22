@@ -68,6 +68,17 @@ pub enum Request {
     Write {
         id: String,
     },
+    /// Write the request body to a file at `path`, atomically: stream to a temp
+    /// file, apply mode/owner/group, then rename into place.
+    Put {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
+    },
     CloseStdin {
         id: String,
     },
@@ -183,6 +194,14 @@ pub enum Response {
 
     #[serde(rename = "written")]
     Written { bytes: usize },
+
+    #[serde(rename = "copied")]
+    Copied {
+        path: String,
+        bytes: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<u32>,
+    },
 
     #[serde(rename = "killed")]
     Killed { id: String },

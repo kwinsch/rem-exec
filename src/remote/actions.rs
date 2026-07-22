@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -362,6 +364,131 @@ fn read_tail(pdir: &ProcessDir, stream: &str) -> (String, Encoding, u64, bool) {
     let _ = file.read_to_end(&mut buf);
     let (data, encoding) = encode_bytes(&buf);
     (data, encoding, size, truncated)
+}
+
+/// Write the request body to `path` atomically: stream to a temp file in the
+/// target directory, apply mode then owner/group, fsync, and rename into place.
+/// The final file only ever appears with its intended permissions — there is no
+/// window where it sits at the destination path with default perms.
+pub fn put<R: Read>(
+    reader: &mut R,
+    path: &str,
+    mode: Option<u32>,
+    owner: Option<&str>,
+    group: Option<&str>,
+) -> Response {
+    let target = Path::new(path);
+    if target.file_name().is_none() {
+        return Response::error_code(ErrorCode::BadRequest, format!("invalid target path: {path}"));
+    }
+    let dir = match target.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => Path::new(".").to_path_buf(),
+    };
+
+    let suffix = crate::process::generate_id().unwrap_or_else(|_| std::process::id().to_string());
+    let tmp = dir.join(format!(".rxd-put-{suffix}.tmp"));
+
+    // Stream body → temp file (constant memory), created private (0600).
+    let bytes = {
+        let mut f = match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                return Response::error_code(
+                    ErrorCode::Internal,
+                    format!("create temp file in {}: {e}", dir.display()),
+                );
+            }
+        };
+        match std::io::copy(reader, &mut f) {
+            Ok(n) => {
+                let _ = f.sync_all();
+                n
+            }
+            Err(e) => {
+                drop(f);
+                let _ = fs::remove_file(&tmp);
+                return Response::error_code(ErrorCode::Internal, format!("write failed: {e}"));
+            }
+        }
+    };
+
+    if let Some(m) = mode
+        && let Err(e) = fs::set_permissions(&tmp, fs::Permissions::from_mode(m))
+    {
+        let _ = fs::remove_file(&tmp);
+        return Response::error_code(ErrorCode::Internal, format!("chmod failed: {e}"));
+    }
+
+    if (owner.is_some() || group.is_some())
+        && let Err(msg) = apply_chown(&tmp, owner, group)
+    {
+        let _ = fs::remove_file(&tmp);
+        return Response::error_code(ErrorCode::Unsupported, msg)
+            .with_hint("owner/group need a privileged rxd (e.g. deploy+invoke rxd via doas)");
+    }
+
+    if let Err(e) = fs::rename(&tmp, target) {
+        let _ = fs::remove_file(&tmp);
+        return Response::error_code(ErrorCode::Internal, format!("rename to {path}: {e}"));
+    }
+
+    Response::Copied {
+        path: path.to_string(),
+        bytes,
+        mode,
+    }
+}
+
+/// chown a path by user/group name-or-id. Either may be None (left unchanged).
+fn apply_chown(path: &Path, owner: Option<&str>, group: Option<&str>) -> Result<(), String> {
+    let uid = match owner {
+        Some(o) => Some(resolve_uid(o).ok_or_else(|| format!("unknown user: {o}"))?),
+        None => None,
+    };
+    let gid = match group {
+        Some(g) => Some(resolve_gid(g).ok_or_else(|| format!("unknown group: {g}"))?),
+        None => None,
+    };
+    let cpath = std::ffi::CString::new(path.to_str().unwrap_or(""))
+        .map_err(|e| format!("invalid path: {e}"))?;
+    // (uid_t)-1 / (gid_t)-1 means "do not change".
+    let rc = unsafe { libc::chown(cpath.as_ptr(), uid.unwrap_or(u32::MAX), gid.unwrap_or(u32::MAX)) };
+    if rc != 0 {
+        return Err(format!("chown failed: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+fn resolve_uid(owner: &str) -> Option<u32> {
+    if let Ok(n) = owner.parse::<u32>() {
+        return Some(n);
+    }
+    let c = std::ffi::CString::new(owner).ok()?;
+    let pw = unsafe { libc::getpwnam(c.as_ptr()) };
+    if pw.is_null() {
+        None
+    } else {
+        Some(unsafe { (*pw).pw_uid })
+    }
+}
+
+fn resolve_gid(group: &str) -> Option<u32> {
+    if let Ok(n) = group.parse::<u32>() {
+        return Some(n);
+    }
+    let c = std::ffi::CString::new(group).ok()?;
+    let gr = unsafe { libc::getgrnam(c.as_ptr()) };
+    if gr.is_null() {
+        None
+    } else {
+        Some(unsafe { (*gr).gr_gid })
+    }
 }
 
 fn write_all_nonblocking(fd: libc::c_int, data: &[u8]) -> std::io::Result<usize> {

@@ -75,6 +75,12 @@ pub fn serve() -> ExitCode {
             let body = read_to_end(&mut reader);
             actions::write_stdin(&id, &body)
         }
+        Request::Put {
+            path,
+            mode,
+            owner,
+            group,
+        } => actions::put(&mut reader, &path, mode, owner.as_deref(), group.as_deref()),
         Request::Status { id } => actions::status(&id),
         Request::Read {
             id,

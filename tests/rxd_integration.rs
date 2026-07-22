@@ -326,6 +326,42 @@ fn write_body_transports_arbitrary_bytes() {
 }
 
 #[test]
+fn put_writes_file_atomically_with_mode() {
+    let runtime = Runtime::new("put");
+    let target = runtime.dir.join("out.conf");
+    // Binary payload: NUL and high bytes no shell-argv transport could carry.
+    let payload = b"key = value\nbinary:\x00\xff\x01\n";
+
+    let resp = runtime.serve(
+        json!({"action": "put", "path": target.to_str().unwrap(), "mode": 0o640}),
+        payload,
+    );
+
+    assert_eq!(resp["type"], "copied", "{resp}");
+    assert_eq!(resp["bytes"].as_u64(), Some(payload.len() as u64));
+    assert_eq!(fs::read(&target).unwrap(), payload);
+    let mode = fs::symlink_metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o640);
+    // No temp files left behind.
+    let leftovers: Vec<_> = fs::read_dir(&runtime.dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".rxd-put-"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+}
+
+#[test]
+fn put_to_missing_directory_errors_without_partial_file() {
+    let runtime = Runtime::new("put-baddir");
+    let resp = runtime.serve(
+        json!({"action": "put", "path": "/no/such/dir/xyzzy/file"}),
+        b"data",
+    );
+    assert_eq!(resp["type"], "error", "{resp}");
+}
+
+#[test]
 fn invalid_process_id_is_rejected_with_typed_error() {
     let runtime = Runtime::new("invalid-id");
     let sentinel_dir = runtime.dir.join("sentinel");

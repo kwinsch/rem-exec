@@ -36,6 +36,7 @@ that substrate:
   kill HOST ID
   list HOST
   clean HOST
+  cp    LOCAL HOST:PATH [--mode OCTAL] [--owner USER] [--group GRP]
   deploy HOST
   setup [--version V] [--arch ARCH]... [--force]
   skill
@@ -48,6 +49,9 @@ Notes:
 - --cwd and --env set the working directory and environment directly, so you
   don't need a `sh -c 'cd DIR && K=V ...'` wrapper. --env is repeatable and its
   overrides layer on the inherited environment.
+- cp writes atomically: the file streams to a temp file, gets its mode/owner/
+  group, then is renamed into place — it never appears with default perms.
+  --mode always works; --owner/--group need a privileged rxd and error otherwise.
 - run: stdin, if piped, is fed to the process, then EOF is sent so readers
   terminate. With no piped stdin, EOF is sent immediately. --keep-stdin-open
   suppresses the EOF. Inline stdin is capped at 4 MiB; larger uses start+pipe.
@@ -73,6 +77,7 @@ stdout/stderr/data fields pair with an `encoding`:
              exit_code|null, signal|null, stdout_size, stderr_size}
   output    {data, encoding, offset, size}
   written   {bytes}          # from close-stdin, bytes:0 means EOF sent
+  copied    {path, bytes, mode?}
   killed    {id}
   list      {processes:[{id, state, cmd}]}
   cleaned   {removed:[id...]}
@@ -133,3 +138,6 @@ host reuse one connection.
 
   # large or binary input streams unbounded via the pipe path
   cat firmware.bin | rx start HOST -- doas tee /var/lib/app/firmware.bin
+
+  # copy a file into place atomically, perms set before it becomes visible
+  rx cp ./app.conf HOST:/etc/app/app.conf --mode 0640

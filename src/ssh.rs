@@ -58,7 +58,38 @@ pub fn serve_request(host: &str, request: &Request, body: &[u8]) -> Result<Respo
         // Dropping stdin closes the write side (EOF) so rxd stops reading.
     }
 
-    let output = child.wait_with_output().map_err(RemExecError::Io)?;
+    parse_serve_output(child.wait_with_output().map_err(RemExecError::Io)?)
+}
+
+/// Like [`serve_request`] but streams the body from a reader (used by `cp`),
+/// so large files never sit fully in memory on either side.
+pub fn serve_request_stream(
+    host: &str,
+    request: &Request,
+    body: &mut dyn std::io::Read,
+) -> Result<Response> {
+    let mut child = ssh_command(host)
+        .arg(REMOTE_BIN)
+        .arg("serve")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(RemExecError::Io)?;
+
+    {
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        let mut line = serde_json::to_vec(request)?;
+        line.push(b'\n');
+        stdin.write_all(&line)?;
+        std::io::copy(body, &mut stdin).map_err(RemExecError::Io)?;
+    }
+
+    parse_serve_output(child.wait_with_output().map_err(RemExecError::Io)?)
+}
+
+/// Validate an `ssh ... serve` invocation and decode its single JSON response.
+fn parse_serve_output(output: Output) -> Result<Response> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(RemExecError::Ssh(format!(

@@ -156,6 +156,22 @@ enum Command {
         /// Remote host (SSH destination)
         host: String,
     },
+    /// Copy a local file to a remote path (atomic; optional mode/owner/group)
+    Cp {
+        /// Local source file
+        local: String,
+        /// Destination as HOST:REMOTE_PATH
+        remote: String,
+        /// File mode in octal, e.g. 0644
+        #[arg(long)]
+        mode: Option<String>,
+        /// Owner user name or uid (needs a privileged rxd)
+        #[arg(long)]
+        owner: Option<String>,
+        /// Group name or gid (needs a privileged rxd)
+        #[arg(long)]
+        group: Option<String>,
+    },
     /// Download static rxd binaries into the local deploy cache
     Setup {
         /// Release tag or version (default: current rx version)
@@ -211,6 +227,18 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         };
+    }
+
+    // Copy streams a file directly over SSH (not through the daemon).
+    if let Command::Cp {
+        local,
+        remote,
+        mode,
+        owner,
+        group,
+    } = &cli.command
+    {
+        return do_cp(local, remote, mode.as_deref(), owner.clone(), group.clone());
     }
 
     // Setup is always local: it populates the rxd deploy cache.
@@ -497,6 +525,7 @@ fn route_via_ssh(command: &Command) -> ExitCode {
         Command::Clean { host } => dispatch_simple(host, &Request::Clean, &[]),
 
         Command::Deploy { .. }
+        | Command::Cp { .. }
         | Command::Setup { .. }
         | Command::Skill
         | Command::Daemon { .. } => unreachable!("handled before routing"),
@@ -545,6 +574,77 @@ fn parse_env(pairs: &[String]) -> Result<BTreeMap<String, String>, String> {
         }
     }
     Ok(map)
+}
+
+/// Parse an octal file mode like `0644`, `644`, or `0o644`.
+fn parse_mode(s: &str) -> Result<u32, String> {
+    let digits = s.strip_prefix("0o").unwrap_or(s);
+    u32::from_str_radix(digits, 8)
+        .map_err(|_| format!("invalid --mode '{s}' (expected octal like 0644)"))
+}
+
+/// Stream a local file to `HOST:PATH` via the `put` request, with one
+/// auto-deploy retry. Runs direct (not through the daemon).
+fn do_cp(
+    local: &str,
+    remote: &str,
+    mode: Option<&str>,
+    owner: Option<String>,
+    group: Option<String>,
+) -> ExitCode {
+    let (host, path) = match remote.split_once(':') {
+        Some((h, p)) if !h.is_empty() && !p.is_empty() => (h, p),
+        _ => {
+            eprintln!("error: destination must be HOST:PATH");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mode = match mode {
+        Some(s) => match parse_mode(s) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+
+    let request = Request::Put {
+        path: path.to_string(),
+        mode,
+        owner,
+        group,
+    };
+
+    // Each send re-opens the file so an auto-deploy retry starts fresh.
+    let send = || -> rem_exec::error::Result<Response> {
+        let mut f = std::fs::File::open(local)?;
+        rem_exec::ssh::serve_request_stream(host, &request, &mut f)
+    };
+
+    let result = match send() {
+        Err(e) if rem_exec::deploy::auto_deploy_enabled() && rem_exec::deploy::should_auto_deploy(&e) => {
+            match rem_exec::deploy::deploy_to_host(host) {
+                Ok(_) => send(),
+                Err(de) => Err(rem_exec::error::RemExecError::Ssh(format!(
+                    "auto-deploy to {host} failed: {de} (original: {e})"
+                ))),
+            }
+        }
+        other => other,
+    };
+
+    match result {
+        Ok(resp) => {
+            print_json_response(&resp);
+            exit_for(&resp)
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Route the command through the local daemon.
@@ -719,6 +819,7 @@ fn route_via_daemon(command: &Command) -> ExitCode {
         Command::List { host } => DaemonRequest::List { host: host.clone() },
         Command::Clean { host } => DaemonRequest::Clean { host: host.clone() },
         Command::Deploy { .. }
+        | Command::Cp { .. }
         | Command::Setup { .. }
         | Command::Skill
         | Command::Daemon { .. } => unreachable!("handled before routing"),

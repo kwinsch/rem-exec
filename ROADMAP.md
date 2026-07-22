@@ -9,25 +9,17 @@ Shipped since 0.2.0:
   chdir/setenv before exec, no shell wrapper.
 - `rx wait HOST ID [--timeout]` — block server-side until exit or timeout,
   returning the same completed/running shapes as `run` (no client polling).
+- `rx cp LOCAL HOST:PATH [--mode] [--owner] [--group]` — atomic streamed copy
+  (temp → chmod/chown → rename), perms applied before the file is visible.
+  `--mode` always works; `--owner`/`--group` need a privileged rxd.
 
 Everything below is proposed, not committed. Ordered by agent-experience value.
 
-## Near-term (high value, small)
-
-### 1. `rx cp LOCAL HOST:REMOTE [--mode MODE] [--owner USER] [--group GRP]`
-Copy a file to the remote with perms applied *before* it becomes visible.
-- Value over `cat f | rx run host -- doas tee`: atomic (temp + rename), perms
-  set on the temp file first (no world-readable window for secrets), binary-safe
-  streaming, structured result.
-- Wire: `Request::Put { path, mode, owner, group }`; file bytes ride as the
-  request body (streamed, unbounded via the pipe path for large files).
-- rxd: write to `path.tmp-<rand>` in the target dir, `fchmod(mode)`, best-effort
-  `fchown(owner,group)`, `fsync`, `rename` into place.
-- Caveat: `--mode` always works; `--owner`/`--group` need privilege (rxd runs as
-  the SSH user) — document as best-effort, or require an elevated rxd.
-- Consider a companion `rx get HOST:REMOTE LOCAL` for the reverse direction.
-
 ## Nice-to-have
+
+### 1. `rx get HOST:PATH LOCAL`
+Reverse of `cp`: stream a remote file down. Pairs with `cp` for round-tripping
+config/artifacts.
 
 ### 2. Merged stdout+stderr view
 Optional interleaved capture so causality (which line came before which) is
@@ -50,6 +42,22 @@ dropped connection reconciles to the same process instead of double-launching.
 ### 6. Batch / sequence
 `run` a list of commands, stop on first non-zero, return per-step results —
 or just document the "pipe a script to `sh`" pattern as the intended answer.
+
+### 7. Payload compression (cp + large reads)
+Compress large text payloads on the wire — real win over WireGuard between sites.
+Position, not yet decided:
+- Do NOT make a C `zstd` dependency the default: it fights the tool's core value
+  (zero-C-dep, trivially static-musl for x86_64/aarch64/riscv64) and adds a codec
+  attack surface. libzstd via `cc` complicates the riscv64/aarch64 musl builds.
+- Free ~80% of the benefit first: SSH already compresses, and rx owns the ssh
+  invocation — add `-o Compression=yes` (opt-in `--compress`, or default-on for
+  `cp`). zlib is weaker than zstd but costs nothing and works today.
+- If we want zstd specifically, put it behind a cargo feature flag with a
+  per-payload `compression: none|zstd` wire marker (mirrors the utf8/base64
+  `encoding` field), applied to both `cp` bodies and large output reads — not
+  just cp. Keep the default build dependency-free. zstd's stored-block behavior
+  means already-compressed data isn't penalized, so "always on when enabled" is
+  safe.
 
 ## Maybe / later
 
