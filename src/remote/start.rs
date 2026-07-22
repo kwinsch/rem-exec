@@ -53,6 +53,21 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
     let sync_read = sync_pipe[0];
     let sync_write = sync_pipe[1];
 
+    // Ready pipe: the grandchild signals after opening its stdin, so the parent
+    // doesn't return — and `run` doesn't feed/close stdin — before a reader is
+    // attached to the FIFO. Otherwise buffered input can be discarded when the
+    // last fd closes before the command opens the read end.
+    let mut ready_pipe = [0i32; 2];
+    if unsafe { libc::pipe(ready_pipe.as_mut_ptr()) } != 0 {
+        unsafe {
+            libc::close(sync_read);
+            libc::close(sync_write);
+        }
+        return Err(RemExecError::Io(std::io::Error::last_os_error()));
+    }
+    let ready_read = ready_pipe[0];
+    let ready_write = ready_pipe[1];
+
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => Err(RemExecError::ForkFailed(
@@ -61,6 +76,7 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
         0 => {
             // === CHILD (becomes runner) ===
             unsafe { libc::close(sync_read) };
+            unsafe { libc::close(ready_read) };
             unsafe { libc::setsid() };
 
             // Set umask for private files
@@ -115,6 +131,7 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
                     // === HOLDER ===
                     // Keep fifo_fd open (inherited O_RDWR), close everything else
                     unsafe { libc::close(sync_write) };
+                    unsafe { libc::close(ready_write) };
                     unsafe { libc::close(stdout_fd) };
                     unsafe { libc::close(stderr_fd) };
                     // Block forever until killed
@@ -141,9 +158,30 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
                     // Close the inherited O_RDWR fifo fd — it acts as both reader
                     // and writer, which prevents EOF when the holder dies.
                     // Instead, open the FIFO O_RDONLY so we're only a reader.
+                    //
+                    // Open non-blocking: a blocking O_RDONLY open waits for a
+                    // writer, which deadlocks if stdin was closed (holder killed)
+                    // before we get here — e.g. `run` closing stdin right after
+                    // start. O_RDONLY|O_NONBLOCK always returns immediately; we
+                    // then clear O_NONBLOCK so reads block for data / see EOF
+                    // normally.
                     unsafe { libc::close(fifo_fd) };
-                    let stdin_fd = unsafe { libc::open(fifo_cstr.as_ptr(), libc::O_RDONLY) };
+                    let stdin_fd = unsafe {
+                        libc::open(fifo_cstr.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK)
+                    };
                     assert!(stdin_fd >= 0, "failed to open FIFO O_RDONLY for stdin");
+                    let flags = unsafe { libc::fcntl(stdin_fd, libc::F_GETFL) };
+                    if flags >= 0 {
+                        unsafe { libc::fcntl(stdin_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+                    }
+
+                    // Signal the parent that stdin is attached — safe now to feed
+                    // input / close stdin without losing buffered data.
+                    let ready_byte = [1u8];
+                    unsafe {
+                        libc::write(ready_write, ready_byte.as_ptr() as *const libc::c_void, 1);
+                        libc::close(ready_write);
+                    }
 
                     // Wire up: FIFO(read-only)→stdin, files→stdout/stderr
                     unsafe {
@@ -205,6 +243,9 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
                     // This is critical: when holder is killed, no writers remain
                     // and the grandchild sees EOF.
                     unsafe { libc::close(fifo_fd) };
+                    // Only the grandchild should hold ready_write, so the parent
+                    // sees EOF if the grandchild dies before signaling.
+                    unsafe { libc::close(ready_write) };
 
                     // Report PIDs
                     write_pid_to_pipe(sync_write, gc_pid);
@@ -239,15 +280,23 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
             }
         }
         _parent_pid => {
-            // === PARENT — read grandchild PID, print JSON, exit ===
+            // === PARENT — read grandchild PID, wait for stdin-ready, exit ===
             unsafe { libc::close(sync_write) };
+            unsafe { libc::close(ready_write) };
 
             let gc_pid = read_pid_from_pipe(sync_read);
             unsafe { libc::close(sync_read) };
 
             if gc_pid > 0 {
                 let _ = fs::write(pdir.pid_path(), gc_pid.to_string());
+                // Block until the grandchild has opened stdin (1 byte) or died
+                // (EOF) — after this it is safe to feed or close stdin.
+                let mut ready = [0u8; 1];
+                unsafe {
+                    libc::read(ready_read, ready.as_mut_ptr() as *mut libc::c_void, 1);
+                }
             }
+            unsafe { libc::close(ready_read) };
 
             Ok(Response::Started { id: id.to_string() })
         }
