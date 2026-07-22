@@ -115,7 +115,7 @@ pub fn read_output(id: &str, stream: &str, offset: Option<u64>, limit: Option<u6
     let path = match stream {
         "stdout" => pdir.stdout_path(),
         "stderr" => pdir.stderr_path(),
-        _ => return Response::error(format!("invalid stream: {stream}")),
+        _ => return Response::error_code(ErrorCode::BadRequest, format!("invalid stream: {stream}")),
     };
 
     let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -134,14 +134,14 @@ pub fn read_output(id: &str, stream: &str, offset: Option<u64>, limit: Option<u6
     if offset > 0
         && let Err(e) = file.seek(SeekFrom::Start(offset))
     {
-        return Response::error(format!("seek failed: {e}"));
+        return Response::error_code(ErrorCode::Internal, format!("seek failed: {e}"));
     }
 
     let limit = limit.unwrap_or(DEFAULT_READ_LIMIT);
     let mut data = vec![0u8; limit.min(file_size.saturating_sub(offset)) as usize];
     let bytes_read = match file.read(&mut data) {
         Ok(n) => n,
-        Err(e) => return Response::error(format!("read failed: {e}")),
+        Err(e) => return Response::error_code(ErrorCode::Internal, format!("read failed: {e}")),
     };
     data.truncate(bytes_read);
 
@@ -196,7 +196,7 @@ pub fn write_stdin(id: &str, data: &[u8]) -> Response {
 
     match feed_fifo(&pdir, data) {
         Ok(bytes) => Response::Written { bytes },
-        Err(err) => Response::error(format!("write failed: {err}")),
+        Err(err) => Response::error_code(ErrorCode::Internal, format!("write failed: {err}")),
     }
 }
 
@@ -739,10 +739,9 @@ pub fn list() -> Response {
             if !pdir.status_path().exists() {
                 continue;
             }
-            let state = pdir
-                .read_status()
+            let state = resolve_state(&pdir)
                 .map(|s| s.to_string())
-                .unwrap_or_else(|_| "unknown".to_string());
+                .unwrap_or_else(|| "unknown".to_string());
             let cmd = pdir.read_cmd().unwrap_or_default();
             processes.push(ProcessSummary { id, state, cmd });
         }
@@ -767,7 +766,7 @@ pub fn clean() -> Response {
                 continue;
             }
 
-            if let Ok(state) = pdir.read_status()
+            if let Some(state) = resolve_state(&pdir)
                 && !matches!(state, ProcessState::Running)
             {
                 if let Ok(Some(rpid)) = pdir.read_runner_pid() {
@@ -798,12 +797,17 @@ pub fn follow(id: &str, stream: &str, offset: Option<u64>) -> Response {
     let path = match stream {
         "stdout" => pdir.stdout_path(),
         "stderr" => pdir.stderr_path(),
-        _ => return Response::error(format!("invalid stream: {stream}")),
+        _ => return Response::error_code(ErrorCode::BadRequest, format!("invalid stream: {stream}")),
     };
 
     let mut file = match fs::File::open(&path) {
         Ok(f) => f,
-        Err(_) => return Response::error(format!("process not found: {id}")),
+        Err(_) => {
+            return Response::error_code(
+                ErrorCode::ProcessNotFound,
+                format!("process not found: {id}"),
+            );
+        }
     };
 
     if let Some(off) = offset

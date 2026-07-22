@@ -6,7 +6,7 @@ use std::os::unix::io::RawFd;
 
 use crate::error::{RemExecError, Result};
 use crate::process::{ProcessDir, generate_id, remote_base, unix_timestamp};
-use crate::protocol::Response;
+use crate::protocol::{ErrorCode, Response};
 
 /// Start a new process, detaching it from the current session.
 ///
@@ -18,6 +18,23 @@ use crate::protocol::Response;
 /// so the command sees EOF on stdin.
 pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, String>) -> Result<Response> {
     assert!(!command.is_empty(), "command must not be empty");
+
+    // Reject NUL bytes up front: an argv NUL would make CString::new().unwrap()
+    // panic the grandchild, and a NUL in cwd would silently skip chdir.
+    if command.iter().any(|a| a.as_bytes().contains(&0)) {
+        return Ok(Response::error_code(
+            ErrorCode::BadRequest,
+            "command argument contains a NUL byte",
+        ));
+    }
+    if let Some(dir) = cwd
+        && dir.as_bytes().contains(&0)
+    {
+        return Ok(Response::error_code(
+            ErrorCode::BadRequest,
+            "cwd contains a NUL byte",
+        ));
+    }
 
     let id = generate_id()?;
     let base = remote_base();

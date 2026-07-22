@@ -10,6 +10,9 @@ Invariants:
 - Command arguments and stdin bytes are transported verbatim over the SSH
   channel — no remote shell parses them. There is nothing to escape/quote.
 - Process IDs are 8 lowercase hex characters.
+- Trust model: rxd runs as the SSH user and is a transport, not a sandbox or
+  privilege boundary. It can do anything that user can (write any path via cp,
+  elevate via `doas` in a command). Your SSH access is the whole trust boundary.
 
 ## Model
 

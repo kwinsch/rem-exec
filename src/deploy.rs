@@ -4,7 +4,7 @@ use std::process::Command;
 
 use crate::error::{RemExecError, Result};
 use crate::protocol::{PROTOCOL_VERSION, Response};
-use crate::ssh::{RemoteArgs, ssh_exec};
+use crate::ssh::{RemoteArgs, ssh_command, ssh_exec};
 
 const RELEASE_BASE_URL: &str = "https://github.com/kwinsch/rem-exec/releases/download";
 const SUPPORTED_ARCHES: &[&str] = &["x86_64", "aarch64", "riscv64"];
@@ -37,8 +37,7 @@ pub enum SetupStatus {
 /// Detect the remote host's CPU architecture via `ssh host uname -m`.
 /// Maps to our supported arch names: x86_64, aarch64, riscv64.
 pub fn detect_arch(host: &str) -> Result<String> {
-    let output = Command::new("ssh")
-        .arg(host)
+    let output = ssh_command(host)
         .args(["uname", "-m"])
         .output()
         .map_err(RemExecError::Io)?;
@@ -267,8 +266,7 @@ pub fn deploy_to_host(host: &str) -> Result<DeployResult> {
     let local_binary = binary_for_arch(&arch)?;
 
     // Ensure remote directory exists
-    let mkdir = Command::new("ssh")
-        .arg(host)
+    let mkdir = ssh_command(host)
         .args(["mkdir", "-p", ".local/bin"])
         .output()
         .map_err(RemExecError::Io)?;
@@ -325,16 +323,16 @@ fn verify_remote_version(host: &str) -> Result<String> {
 
 /// Check if auto-deploy should be attempted based on the error.
 ///
-/// Covers a missing rxd ("not found"), an unreadable one ("Permission denied"),
-/// and an rxd too old to understand `serve` (clap emits "unrecognized
-/// subcommand"/"unexpected argument"). A protocol error (unparseable JSON) also
-/// implies a version mismatch.
+/// Covers a missing rxd ("not found"/"No such file") and an rxd too old to
+/// understand `serve` (clap emits "unrecognized subcommand"/"unexpected
+/// argument"); a protocol error (unparseable JSON) also implies a version
+/// mismatch. Deliberately does NOT match "Permission denied" — that fires on
+/// SSH auth failure, where a redeploy would fail the same way.
 pub fn should_auto_deploy(err: &RemExecError) -> bool {
     match err {
         RemExecError::Ssh(msg) => {
             msg.contains("not found")
                 || msg.contains("No such file")
-                || msg.contains("Permission denied")
                 || msg.contains("unrecognized subcommand")
                 || msg.contains("unexpected argument")
         }

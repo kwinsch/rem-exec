@@ -379,6 +379,27 @@ fn invalid_process_id_is_rejected_with_typed_error() {
 }
 
 #[test]
+fn command_with_nul_byte_is_rejected() {
+    let runtime = Runtime::new("nul-arg");
+    let resp = runtime.serve(
+        json!({"action": "run", "command": ["ec\u{0}ho", "hi"]}),
+        &[],
+    );
+    assert_eq!(resp["type"], "error", "{resp}");
+    assert_eq!(resp["code"], "bad_request");
+}
+
+#[test]
+fn invalid_stream_is_bad_request() {
+    let runtime = Runtime::new("bad-stream");
+    let start = runtime.serve(json!({"action": "start", "command": ["true"]}), &[]);
+    let id = started_id(&start);
+    let resp = runtime.serve(json!({"action": "read", "id": id, "stream": "bogus"}), &[]);
+    assert_eq!(resp["type"], "error", "{resp}");
+    assert_eq!(resp["code"], "bad_request");
+}
+
+#[test]
 fn missing_process_reports_process_not_found_code() {
     let runtime = Runtime::new("not-found");
     let status = runtime.status("0123abcd");
