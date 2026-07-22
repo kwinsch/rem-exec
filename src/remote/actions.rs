@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::thread;
@@ -220,6 +221,8 @@ fn feed_fifo(pdir: &ProcessDir, data: &[u8]) -> std::io::Result<usize> {
 /// is closed afterward so commands that read to EOF (cat, sort, sh) terminate.
 pub fn run(
     command: &[String],
+    cwd: Option<&str>,
+    env: &BTreeMap<String, String>,
     timeout_ms: Option<u64>,
     body: &[u8],
     keep_stdin_open: bool,
@@ -229,7 +232,7 @@ pub fn run(
     }
 
     let run_started = Instant::now();
-    let id = match start::start(command) {
+    let id = match start::start(command, cwd, env) {
         Ok(Response::Started { id }) => id,
         Ok(other) => return other, // start already returned an error response
         Err(e) => return Response::error_code(ErrorCode::Internal, e.to_string()),
@@ -247,34 +250,74 @@ pub fn run(
     }
 
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(RUN_DEFAULT_TIMEOUT_MS));
+    match await_exit_or_timeout(&pdir, timeout) {
+        Some(state) => completed_response(&id, &pdir, &state, run_started.elapsed().as_millis() as u64),
+        None => running_response(&id, &pdir, timeout),
+    }
+}
+
+/// Block until an already-started process exits or `timeout_ms` elapses.
+/// Returns `Completed` on exit, `Running` on timeout — same shapes as `run`,
+/// so the async (`start`) path never needs client-side polling.
+pub fn wait(id: &str, timeout_ms: Option<u64>) -> Response {
+    if !is_valid_process_id(id) {
+        return invalid_process_id(id);
+    }
+    let base = remote_base();
+    let pdir = ProcessDir::new(&base, id);
+    if resolve_state(&pdir).is_none() {
+        return Response::error_code(ErrorCode::ProcessNotFound, format!("process not found: {id}"));
+    }
+
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(RUN_DEFAULT_TIMEOUT_MS));
+    match await_exit_or_timeout(&pdir, timeout) {
+        Some(state) => completed_response(id, &pdir, &state, process_duration_ms(&pdir)),
+        None => running_response(id, &pdir, timeout),
+    }
+}
+
+/// Poll until the process leaves the running state, or the timeout elapses.
+/// Returns the terminal state, or None on timeout.
+fn await_exit_or_timeout(pdir: &ProcessDir, timeout: Duration) -> Option<ProcessState> {
     let deadline = Instant::now() + timeout;
     let poll = Duration::from_millis(20);
-
     loop {
-        match resolve_state(&pdir) {
-            Some(ProcessState::Running) | None => {}
-            Some(state) => return completed_response(&id, &pdir, &state, run_started.elapsed()),
+        if let Some(state) = resolve_state(pdir)
+            && !matches!(state, ProcessState::Running)
+        {
+            return Some(state);
         }
         if Instant::now() >= deadline {
-            return Response::Running {
-                id: id.clone(),
-                reason: format!("still running after {}ms", timeout.as_millis()),
-                stdout_size: pdir.stream_size("stdout"),
-                stderr_size: pdir.stream_size("stderr"),
-                hint: format!(
-                    "backgrounded; poll: rx status HOST {id} · read: rx stdout HOST {id} · stop: rx kill HOST {id}"
-                ),
-            };
+            return None;
         }
         thread::sleep(poll);
     }
+}
+
+fn running_response(id: &str, pdir: &ProcessDir, timeout: Duration) -> Response {
+    Response::Running {
+        id: id.to_string(),
+        reason: format!("still running after {}ms", timeout.as_millis()),
+        stdout_size: pdir.stream_size("stdout"),
+        stderr_size: pdir.stream_size("stderr"),
+        hint: format!(
+            "backgrounded; wait: rx wait HOST {id} · read: rx stdout HOST {id} · stop: rx kill HOST {id}"
+        ),
+    }
+}
+
+/// Process wall time from its recorded start/end (second resolution).
+fn process_duration_ms(pdir: &ProcessDir) -> u64 {
+    let started = pdir.read_started().unwrap_or(0);
+    let ended = pdir.read_ended().unwrap_or(None).unwrap_or(started);
+    ended.saturating_sub(started).saturating_mul(1000)
 }
 
 fn completed_response(
     id: &str,
     pdir: &ProcessDir,
     state: &ProcessState,
-    elapsed: Duration,
+    duration_ms: u64,
 ) -> Response {
     let (exit_code, signal) = exit_fields(state);
     let (stdout, stdout_encoding, stdout_size, stdout_truncated) = read_tail(pdir, "stdout");
@@ -283,7 +326,7 @@ fn completed_response(
         id: id.to_string(),
         exit_code,
         signal,
-        duration_ms: elapsed.as_millis() as u64,
+        duration_ms,
         stdout,
         stdout_encoding,
         stderr,

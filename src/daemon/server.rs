@@ -184,6 +184,8 @@ fn dispatch(
         DaemonRequest::Run {
             host,
             command,
+            cwd,
+            env,
             timeout_ms,
             stdin_b64,
             keep_stdin_open,
@@ -196,13 +198,25 @@ fn dispatch(
                 &host,
                 &Request::Run {
                     command,
+                    cwd,
+                    env,
                     timeout_ms,
                     keep_stdin_open,
                 },
                 &body,
             )
         }
-        DaemonRequest::Start { host, command } => handle_start(&host, &command, state),
+        DaemonRequest::Start {
+            host,
+            command,
+            cwd,
+            env,
+        } => handle_start(&host, &command, cwd, env, state),
+        DaemonRequest::Wait {
+            host,
+            id,
+            timeout_ms,
+        } => forward(&host, &Request::Wait { id, timeout_ms }, &[]),
         DaemonRequest::Status { host, id } => forward(&host, &Request::Status { id }, &[]),
         DaemonRequest::Stdout {
             host,
@@ -279,9 +293,17 @@ fn dispatch(
 }
 
 /// Start a process remotely and begin streaming its output locally.
-fn handle_start(host: &str, command: &[String], state: &Arc<Mutex<DaemonState>>) -> DaemonResponse {
+fn handle_start(
+    host: &str,
+    command: &[String],
+    cwd: Option<String>,
+    env: std::collections::BTreeMap<String, String>,
+    state: &Arc<Mutex<DaemonState>>,
+) -> DaemonResponse {
     let request = Request::Start {
         command: command.to_vec(),
+        cwd,
+        env,
     };
     let response = match serve_request_auto_deploy(host, &request, &[]) {
         Ok(r) => r,

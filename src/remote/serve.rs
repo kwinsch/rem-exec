@@ -53,21 +53,24 @@ pub fn serve() -> ExitCode {
     let response = match request {
         Request::Run {
             command,
+            cwd,
+            env,
             timeout_ms,
             keep_stdin_open,
         } => {
             let body = read_to_end(&mut reader);
-            actions::run(&command, timeout_ms, &body, keep_stdin_open)
+            actions::run(&command, cwd.as_deref(), &env, timeout_ms, &body, keep_stdin_open)
         }
-        Request::Start { command } => {
+        Request::Start { command, cwd, env } => {
             // Start does not consume a body here; large stdin uses the dedicated
             // pipe-stdin channel. Drain so the writer never sees a broken pipe.
             drain(&mut reader);
-            match start::start(&command) {
+            match start::start(&command, cwd.as_deref(), &env) {
                 Ok(r) => r,
                 Err(e) => Response::error_code(ErrorCode::Internal, e.to_string()),
             }
         }
+        Request::Wait { id, timeout_ms } => actions::wait(&id, timeout_ms),
         Request::Write { id } => {
             let body = read_to_end(&mut reader);
             actions::write_stdin(&id, &body)

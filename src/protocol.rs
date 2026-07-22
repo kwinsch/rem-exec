@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 pub use crate::Encoding;
@@ -24,6 +26,12 @@ pub enum Request {
     /// keeps running detached and a `Running` handle is returned instead.
     Run {
         command: Vec<String>,
+        /// Working directory for the command (default: the SSH login dir).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        /// Environment overrides layered on the inherited environment.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        env: BTreeMap<String, String>,
         #[serde(default)]
         timeout_ms: Option<u64>,
         /// Keep stdin open after the body is consumed (default: send EOF, so
@@ -32,7 +40,19 @@ pub enum Request {
         keep_stdin_open: bool,
     },
     /// Start a detached process and return its handle immediately.
-    Start { command: Vec<String> },
+    Start {
+        command: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        env: BTreeMap<String, String>,
+    },
+    /// Block until a process exits or `timeout_ms` elapses.
+    Wait {
+        id: String,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
     Status {
         id: String,
     },
@@ -209,6 +229,10 @@ pub enum DaemonRequest {
     Run {
         host: String,
         command: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
         timeout_ms: Option<u64>,
         #[serde(default)]
         stdin_b64: Option<String>,
@@ -216,7 +240,20 @@ pub enum DaemonRequest {
         keep_stdin_open: bool,
     },
     #[serde(rename = "start")]
-    Start { host: String, command: Vec<String> },
+    Start {
+        host: String,
+        command: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+    },
+    #[serde(rename = "wait")]
+    Wait {
+        host: String,
+        id: String,
+        timeout_ms: Option<u64>,
+    },
     #[serde(rename = "status")]
     Status { host: String, id: String },
     #[serde(rename = "stdout")]

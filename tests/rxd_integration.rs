@@ -160,6 +160,81 @@ fn run_transports_shell_metacharacters_as_exact_argv() {
 }
 
 #[test]
+fn run_applies_cwd() {
+    let runtime = Runtime::new("run-cwd");
+    let workdir = runtime.dir.join("workdir");
+    fs::create_dir_all(&workdir).unwrap();
+    let expected = fs::canonicalize(&workdir).unwrap();
+
+    let resp = runtime.serve(
+        json!({"action": "run", "command": ["pwd", "-P"], "cwd": workdir.to_str().unwrap()}),
+        &[],
+    );
+
+    assert_eq!(resp["type"], "completed", "{resp}");
+    assert_eq!(resp["exit_code"], 0);
+    assert_eq!(resp["stdout"].as_str().unwrap().trim_end(), expected.to_str().unwrap());
+}
+
+#[test]
+fn run_bad_cwd_fails_with_diagnostic() {
+    let runtime = Runtime::new("run-cwd-bad");
+    let resp = runtime.serve(
+        json!({"action": "run", "command": ["true"], "cwd": "/no/such/dir/xyzzy"}),
+        &[],
+    );
+    assert_eq!(resp["type"], "completed", "{resp}");
+    assert_eq!(resp["exit_code"], 127);
+    assert!(resp["stderr"].as_str().unwrap().contains("chdir"), "{resp}");
+}
+
+#[test]
+fn run_applies_env_overrides() {
+    let runtime = Runtime::new("run-env");
+    let resp = runtime.serve(
+        json!({"action": "run", "command": ["printenv", "RX_MYVAR"], "env": {"RX_MYVAR": "hello"}}),
+        &[],
+    );
+    assert_eq!(resp["type"], "completed", "{resp}");
+    assert_eq!(resp["stdout"], "hello\n");
+}
+
+#[test]
+fn wait_blocks_until_exit() {
+    let runtime = Runtime::new("wait-exit");
+    let start = runtime.serve(
+        json!({"action": "start", "command": ["sh", "-c", "sleep 0.2; exit 5"]}),
+        &[],
+    );
+    let id = started_id(&start);
+
+    let resp = runtime.serve(json!({"action": "wait", "id": id}), &[]);
+    assert_eq!(resp["type"], "completed", "{resp}");
+    assert_eq!(resp["exit_code"], 5);
+}
+
+#[test]
+fn wait_times_out_to_running_handle() {
+    let runtime = Runtime::new("wait-timeout");
+    let start = runtime.serve(json!({"action": "start", "command": ["sleep", "10"]}), &[]);
+    let id = started_id(&start);
+
+    let resp = runtime.serve(json!({"action": "wait", "id": id, "timeout_ms": 150}), &[]);
+    assert_eq!(resp["type"], "running", "{resp}");
+
+    runtime.serve(json!({"action": "kill", "id": id}), &[]);
+    wait_for_exit(&runtime, &id);
+}
+
+#[test]
+fn wait_on_missing_process_is_typed_error() {
+    let runtime = Runtime::new("wait-missing");
+    let resp = runtime.serve(json!({"action": "wait", "id": "0123abcd"}), &[]);
+    assert_eq!(resp["type"], "error");
+    assert_eq!(resp["code"], "process_not_found");
+}
+
+#[test]
 fn run_feeds_stdin_body_and_sends_eof() {
     let runtime = Runtime::new("run-stdin");
     let resp = runtime.serve(json!({"action": "run", "command": ["cat"]}), b"hello stdin");

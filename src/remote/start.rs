@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -15,7 +16,7 @@ use crate::protocol::Response;
 ///
 /// EOF support: killing the Holder closes the last writer on the FIFO,
 /// so the command sees EOF on stdin.
-pub fn start(command: &[String]) -> Result<Response> {
+pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, String>) -> Result<Response> {
     assert!(!command.is_empty(), "command must not be empty");
 
     let id = generate_id()?;
@@ -154,6 +155,31 @@ pub fn start(command: &[String]) -> Result<Response> {
                                 libc::close(fd);
                             }
                         }
+                    }
+
+                    // Environment overrides, layered on the inherited env.
+                    for (k, v) in env {
+                        if let (Ok(ck), Ok(cv)) =
+                            (CString::new(k.as_str()), CString::new(v.as_str()))
+                        {
+                            unsafe { libc::setenv(ck.as_ptr(), cv.as_ptr(), 1) };
+                        }
+                    }
+
+                    // Working directory (after dup2 so failures reach stderr).
+                    if let Some(dir) = cwd
+                        && let Ok(cdir) = CString::new(dir)
+                        && unsafe { libc::chdir(cdir.as_ptr()) } != 0
+                    {
+                        let msg = format!(
+                            "rxd: chdir({dir}) failed: {}\n",
+                            std::io::Error::last_os_error()
+                        );
+                        unsafe {
+                            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+                        }
+                        let _ = fs::write(pdir.status_path(), "exited(127)");
+                        unsafe { libc::_exit(127) };
                     }
 
                     let prog = CString::new(command[0].as_str()).unwrap();

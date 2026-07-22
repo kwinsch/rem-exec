@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read};
 use std::process::{ExitCode, Stdio};
 use std::thread;
@@ -38,6 +39,12 @@ enum Command {
         /// Command to execute
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
+        /// Working directory for the command
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Environment override (repeatable): --env KEY=VALUE
+        #[arg(long = "env", value_name = "K=V")]
+        env: Vec<String>,
         /// Seconds to wait before backgrounding the process (default 30)
         #[arg(long)]
         timeout: Option<u64>,
@@ -52,12 +59,28 @@ enum Command {
         /// Command to execute
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
+        /// Working directory for the command
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Environment override (repeatable): --env KEY=VALUE
+        #[arg(long = "env", value_name = "K=V")]
+        env: Vec<String>,
         /// Don't close remote stdin after local stdin EOF
         #[arg(long)]
         no_close_stdin: bool,
         /// Bidirectional pipe: stdin→remote stdin, remote stdout→local stdout
         #[arg(long)]
         pipe: bool,
+    },
+    /// Wait for a process to exit (blocks up to --timeout, then returns a handle)
+    Wait {
+        /// Remote host
+        host: String,
+        /// Process ID
+        id: String,
+        /// Seconds to wait before returning a running handle (default 30)
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// Get process status
     Status {
@@ -329,6 +352,8 @@ fn route_via_ssh(command: &Command) -> ExitCode {
         Command::Run {
             host,
             command: cmd,
+            cwd,
+            env,
             timeout,
             keep_stdin_open,
         } => {
@@ -339,32 +364,52 @@ fn route_via_ssh(command: &Command) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            let env = match parse_env(env) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let request = Request::Run {
                 command: cmd.clone(),
+                cwd: cwd.clone(),
+                env,
                 timeout_ms: timeout.map(|s| s.saturating_mul(1000)),
                 keep_stdin_open: *keep_stdin_open,
             };
-            match serve_request_auto_deploy(host, &request, &body) {
-                Ok(resp) => {
-                    print_json_response(&resp);
-                    run_exit(&resp)
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
-            }
+            dispatch_run(host, &request, &body)
         }
+
+        Command::Wait { host, id, timeout } => dispatch_run(
+            host,
+            &Request::Wait {
+                id: id.clone(),
+                timeout_ms: timeout.map(|s| s.saturating_mul(1000)),
+            },
+            &[],
+        ),
 
         Command::Start {
             host,
             command: cmd,
+            cwd,
+            env,
             no_close_stdin,
             pipe,
         } => {
+            let env = match parse_env(env) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let needs_pipe = *pipe || !std::io::stdin().is_terminal();
             let request = Request::Start {
                 command: cmd.clone(),
+                cwd: cwd.clone(),
+                env,
             };
             let response = match serve_request_auto_deploy(host, &request, &[]) {
                 Ok(r) => r,
@@ -473,21 +518,61 @@ fn dispatch_simple(host: &str, request: &Request, body: &[u8]) -> ExitCode {
     }
 }
 
+/// Like [`dispatch_simple`] but propagates a completed command's exit status
+/// (for `run` / `wait`).
+fn dispatch_run(host: &str, request: &Request, body: &[u8]) -> ExitCode {
+    match serve_request_auto_deploy(host, request, body) {
+        Ok(resp) => {
+            print_json_response(&resp);
+            run_exit(&resp)
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Parse repeated `--env K=V` into a map (later duplicates win).
+fn parse_env(pairs: &[String]) -> Result<BTreeMap<String, String>, String> {
+    let mut map = BTreeMap::new();
+    for p in pairs {
+        match p.split_once('=') {
+            Some((k, v)) if !k.is_empty() => {
+                map.insert(k.to_string(), v.to_string());
+            }
+            _ => return Err(format!("invalid --env '{p}' (expected K=V)")),
+        }
+    }
+    Ok(map)
+}
+
 /// Route the command through the local daemon.
 fn route_via_daemon(command: &Command) -> ExitCode {
     // Start with piped stdin or --pipe: send Start to daemon, then pipe directly
     if let Command::Start {
         host,
         command: cmd,
+        cwd,
+        env,
         no_close_stdin,
         pipe,
     } = command
     {
         let needs_pipe = *pipe || !std::io::stdin().is_terminal();
         if needs_pipe {
+            let env = match parse_env(env) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let request = DaemonRequest::Start {
                 host: host.clone(),
                 command: cmd.clone(),
+                cwd: cwd.clone(),
+                env,
             };
             return match daemon::send_request(&request) {
                 Ok(DaemonResponse::Ok { data }) => {
@@ -519,6 +604,8 @@ fn route_via_daemon(command: &Command) -> ExitCode {
         Command::Run {
             host,
             command: cmd,
+            cwd,
+            env,
             timeout,
             keep_stdin_open,
         } => {
@@ -530,18 +617,49 @@ fn route_via_daemon(command: &Command) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            let env = match parse_env(env) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             DaemonRequest::Run {
                 host: host.clone(),
                 command: cmd.clone(),
+                cwd: cwd.clone(),
+                env,
                 timeout_ms: timeout.map(|s| s.saturating_mul(1000)),
                 stdin_b64,
                 keep_stdin_open: *keep_stdin_open,
             }
         }
-        Command::Start { host, command, .. } => DaemonRequest::Start {
+        Command::Wait { host, id, timeout } => DaemonRequest::Wait {
             host: host.clone(),
-            command: command.clone(),
+            id: id.clone(),
+            timeout_ms: timeout.map(|s| s.saturating_mul(1000)),
         },
+        Command::Start {
+            host,
+            command,
+            cwd,
+            env,
+            ..
+        } => {
+            let env = match parse_env(env) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            DaemonRequest::Start {
+                host: host.clone(),
+                command: command.clone(),
+                cwd: cwd.clone(),
+                env,
+            }
+        }
         Command::Status { host, id } => DaemonRequest::Status {
             host: host.clone(),
             id: id.clone(),
@@ -606,7 +724,7 @@ fn route_via_daemon(command: &Command) -> ExitCode {
         | Command::Daemon { .. } => unreachable!("handled before routing"),
     };
 
-    let is_run = matches!(command, Command::Run { .. });
+    let is_run = matches!(command, Command::Run { .. } | Command::Wait { .. });
     match daemon::send_request(&request) {
         Ok(DaemonResponse::Ok { data }) => {
             print_json(&data);
