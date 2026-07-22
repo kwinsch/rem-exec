@@ -390,6 +390,17 @@ fn command_with_nul_byte_is_rejected() {
 }
 
 #[test]
+fn env_with_nul_byte_is_rejected() {
+    let runtime = Runtime::new("nul-env");
+    let resp = runtime.serve(
+        json!({"action": "run", "command": ["true"], "env": {"FOO": "ba\u{0}r"}}),
+        &[],
+    );
+    assert_eq!(resp["type"], "error", "{resp}");
+    assert_eq!(resp["code"], "bad_request");
+}
+
+#[test]
 fn invalid_stream_is_bad_request() {
     let runtime = Runtime::new("bad-stream");
     let start = runtime.serve(json!({"action": "start", "command": ["true"]}), &[]);

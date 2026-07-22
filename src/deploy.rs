@@ -368,6 +368,31 @@ mod tests {
     }
 
     #[test]
+    fn auto_deploy_triggers_only_on_missing_or_old_rxd() {
+        // Missing / old rxd → deploy and retry.
+        assert!(should_auto_deploy(&RemExecError::Ssh(
+            "bash: line 1: .local/bin/rxd: not found".into()
+        )));
+        assert!(should_auto_deploy(&RemExecError::Ssh(
+            "No such file or directory".into()
+        )));
+        assert!(should_auto_deploy(&RemExecError::Ssh(
+            "error: unrecognized subcommand 'serve'".into()
+        )));
+        assert!(should_auto_deploy(&RemExecError::Protocol(
+            "invalid JSON".into()
+        )));
+
+        // Auth failure / other errors → do NOT redeploy (would fail the same).
+        assert!(!should_auto_deploy(&RemExecError::Ssh(
+            "Permission denied (publickey).".into()
+        )));
+        assert!(!should_auto_deploy(&RemExecError::Io(
+            std::io::Error::other("boom")
+        )));
+    }
+
+    #[test]
     fn parses_checksum_for_asset() {
         let sums = "\
 aaaaaaaa  rxd-x86_64

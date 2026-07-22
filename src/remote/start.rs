@@ -35,6 +35,15 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
             "cwd contains a NUL byte",
         ));
     }
+    if env
+        .iter()
+        .any(|(k, v)| k.as_bytes().contains(&0) || v.as_bytes().contains(&0))
+    {
+        return Ok(Response::error_code(
+            ErrorCode::BadRequest,
+            "env key or value contains a NUL byte",
+        ));
+    }
 
     let id = generate_id()?;
     let base = remote_base();

@@ -43,23 +43,25 @@ fn resolve_state(pdir: &ProcessDir) -> Option<ProcessState> {
         return Some(state);
     }
 
+    let pid = pdir.read_pid().ok().flatten();
+    let runner = pdir.read_runner_pid().ok().flatten();
+
+    // No PID recorded yet: the status file is written before the fork, so the
+    // process may still be starting. Treat as running so a concurrent
+    // list/clean can't mark and remove a newborn process dir.
+    if pid.is_none() && runner.is_none() {
+        return Some(ProcessState::Running);
+    }
+
     // Status says running — verify the command is actually alive.
-    let cmd_alive = pdir
-        .read_pid()
-        .ok()
-        .flatten()
-        .is_some_and(|pid| unsafe { libc::kill(pid as i32, 0) } == 0);
+    let cmd_alive = pid.is_some_and(|p| unsafe { libc::kill(p as i32, 0) } == 0);
     if cmd_alive {
         return Some(ProcessState::Running);
     }
 
     // Command is gone. If the runner is still around it is mid-teardown
     // (writing the real exit status), so leave the state as running.
-    let runner_alive = pdir
-        .read_runner_pid()
-        .ok()
-        .flatten()
-        .is_some_and(|rp| unsafe { libc::kill(rp as i32, 0) } == 0);
+    let runner_alive = runner.is_some_and(|rp| unsafe { libc::kill(rp as i32, 0) } == 0);
     if runner_alive {
         Some(ProcessState::Running)
     } else {
@@ -196,6 +198,9 @@ pub fn write_stdin(id: &str, data: &[u8]) -> Response {
 
     match feed_fifo(&pdir, data) {
         Ok(bytes) => Response::Written { bytes },
+        Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+            Response::error_code(ErrorCode::Timeout, format!("write to stdin timed out: {err}"))
+        }
         Err(err) => Response::error_code(ErrorCode::Internal, format!("write failed: {err}")),
     }
 }
@@ -576,8 +581,18 @@ pub fn close_stdin(id: &str) -> Response {
 
     if kill_stdin_holder(&pdir) {
         Response::Written { bytes: 0 } // 0 bytes = EOF marker
+    } else if resolve_state(&pdir).is_some_and(|s| !matches!(s, ProcessState::Running)) {
+        // Lost the race with the process exiting between the status check
+        // above and killing the holder.
+        Response::error_code(
+            ErrorCode::ProcessExited,
+            format!("process already exited: {id}"),
+        )
     } else {
-        Response::error("stdin already closed or no holder found")
+        Response::error_code(
+            ErrorCode::Internal,
+            "stdin already closed or no holder found",
+        )
     }
 }
 
