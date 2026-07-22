@@ -1,0 +1,124 @@
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::ExitCode;
+
+use crate::process::{ensure_base_dir, remote_base};
+use crate::protocol::{ErrorCode, PROTOCOL_VERSION, Request, Response};
+use crate::remote::{actions, start};
+
+/// Handle one framed request from stdin and write one JSON response to stdout.
+///
+/// Wire framing: the request is a single JSON line; any bytes after the newline
+/// are the request body (process stdin for run/start, bytes to write for
+/// write). Because the entire request travels through the SSH channel's stdin,
+/// the remote login shell never parses a single field — command arguments and
+/// input data are transported exactly, with no escaping.
+pub fn serve() -> ExitCode {
+    let stdin = std::io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
+
+    let mut line = Vec::new();
+    if let Err(e) = read_request_line(&mut reader, &mut line) {
+        return emit(Response::error_code(
+            ErrorCode::BadRequest,
+            format!("failed to read request: {e}"),
+        ));
+    }
+    if line.is_empty() {
+        return emit(Response::error_code(ErrorCode::BadRequest, "empty request"));
+    }
+
+    let request: Request = match serde_json::from_slice(&line) {
+        Ok(r) => r,
+        Err(e) => {
+            return emit(Response::error_code(
+                ErrorCode::BadRequest,
+                format!("invalid request JSON: {e}"),
+            ));
+        }
+    };
+
+    // Version must answer on a fresh host, before any state dir exists.
+    if matches!(request, Request::Version) {
+        return emit(Response::Version {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol: PROTOCOL_VERSION,
+        });
+    }
+
+    let base = remote_base();
+    if let Err(e) = ensure_base_dir(&base) {
+        return emit(Response::error_code(ErrorCode::Internal, e.to_string()));
+    }
+
+    let response = match request {
+        Request::Run {
+            command,
+            timeout_ms,
+            keep_stdin_open,
+        } => {
+            let body = read_to_end(&mut reader);
+            actions::run(&command, timeout_ms, &body, keep_stdin_open)
+        }
+        Request::Start { command } => {
+            // Start does not consume a body here; large stdin uses the dedicated
+            // pipe-stdin channel. Drain so the writer never sees a broken pipe.
+            drain(&mut reader);
+            match start::start(&command) {
+                Ok(r) => r,
+                Err(e) => Response::error_code(ErrorCode::Internal, e.to_string()),
+            }
+        }
+        Request::Write { id } => {
+            let body = read_to_end(&mut reader);
+            actions::write_stdin(&id, &body)
+        }
+        Request::Status { id } => actions::status(&id),
+        Request::Read {
+            id,
+            stream,
+            offset,
+            limit,
+        } => actions::read_output(&id, &stream, offset, limit),
+        Request::CloseStdin { id } => actions::close_stdin(&id),
+        Request::Kill { id } => actions::kill(&id),
+        Request::List => actions::list(),
+        Request::Clean => actions::clean(),
+        Request::Version => unreachable!("handled above"),
+    };
+
+    emit(response)
+}
+
+/// Read the JSON request line (up to the first newline), stripping the newline.
+/// Bytes buffered past the newline stay available for the body read.
+fn read_request_line<R: BufRead>(reader: &mut R, out: &mut Vec<u8>) -> std::io::Result<()> {
+    reader.read_until(b'\n', out)?;
+    if out.last() == Some(&b'\n') {
+        out.pop();
+    }
+    Ok(())
+}
+
+fn read_to_end<R: Read>(reader: &mut R) -> Vec<u8> {
+    let mut body = Vec::new();
+    let _ = reader.read_to_end(&mut body);
+    body
+}
+
+fn drain<R: Read>(reader: &mut R) {
+    let mut sink = Vec::new();
+    let _ = reader.read_to_end(&mut sink);
+}
+
+fn emit(response: Response) -> ExitCode {
+    let json = serde_json::to_string(&response).unwrap_or_else(|e| {
+        format!("{{\"type\":\"error\",\"message\":\"serialize failed: {e}\"}}")
+    });
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let _ = lock.write_all(json.as_bytes());
+    let _ = lock.write_all(b"\n");
+    let _ = lock.flush();
+    // Transport success is exit 0; success/failure is carried in the JSON.
+    ExitCode::SUCCESS
+}

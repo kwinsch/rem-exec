@@ -1,4 +1,4 @@
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::process::{ExitCode, Stdio};
 use std::thread;
 
@@ -6,8 +6,14 @@ use clap::{Parser, Subcommand};
 
 use rem_exec::daemon;
 use rem_exec::daemon::server;
-use rem_exec::protocol::{DaemonRequest, DaemonResponse, Response};
-use rem_exec::ssh::{RemoteArgs, ssh_exec_auto_deploy, ssh_spawn_piped_stdin};
+use rem_exec::protocol::{DaemonRequest, DaemonResponse, Request, Response};
+use rem_exec::ssh::{
+    REMOTE_BIN, RemoteArgs, serve_request_auto_deploy, ssh_command, ssh_spawn_piped_stdin,
+};
+
+/// Cap on stdin inlined into a `run`/`write` request. Larger inputs should use
+/// the streaming path (`rx start --pipe`), which has no size limit.
+const INLINE_STDIN_CAP: usize = 4 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(name = "rx")]
@@ -25,7 +31,21 @@ enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
-    /// Start a process on a remote host
+    /// Run a command to completion (blocks up to --timeout, then backgrounds)
+    Run {
+        /// Remote host (SSH destination)
+        host: String,
+        /// Command to execute
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+        /// Seconds to wait before backgrounding the process (default 30)
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Keep stdin open instead of sending EOF after any piped input
+        #[arg(long)]
+        keep_stdin_open: bool,
+    },
+    /// Start a detached process on a remote host
     Start {
         /// Remote host (SSH destination)
         host: String,
@@ -145,27 +165,9 @@ fn main() -> ExitCode {
     // Handle daemon subcommands directly
     if let Command::Daemon { action } = &cli.command {
         return match action {
-            DaemonAction::Start => match server::start_daemon() {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
-            },
-            DaemonAction::Stop => match server::stop_daemon() {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
-            },
-            DaemonAction::Status => match server::daemon_status() {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
-            },
+            DaemonAction::Start => report(server::start_daemon()),
+            DaemonAction::Stop => report(server::stop_daemon()),
+            DaemonAction::Status => report(server::daemon_status()),
         };
     }
 
@@ -173,16 +175,12 @@ fn main() -> ExitCode {
     if let Command::Deploy { host } = &cli.command {
         return match rem_exec::deploy::deploy_to_host(host) {
             Ok(result) => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "type": "deployed",
-                        "host": result.host,
-                        "arch": result.arch,
-                        "version": result.version,
-                    }))
-                    .unwrap()
-                );
+                print_json(&serde_json::json!({
+                    "type": "deployed",
+                    "host": result.host,
+                    "arch": result.arch,
+                    "version": result.version,
+                }));
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -217,15 +215,11 @@ fn main() -> ExitCode {
                         })
                     })
                     .collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "type": "setup",
-                        "version": result.version,
-                        "binaries": binaries,
-                    }))
-                    .unwrap_or_default()
-                );
+                print_json(&serde_json::json!({
+                    "type": "setup",
+                    "version": result.version,
+                    "binaries": binaries,
+                }));
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -241,12 +235,36 @@ fn main() -> ExitCode {
     }
 
     // For all other commands: try daemon first, fall back to direct SSH
-    let use_daemon = daemon::is_running();
-
-    if use_daemon {
+    if daemon::is_running() {
         route_via_daemon(&cli.command)
     } else {
         route_via_ssh(&cli.command)
+    }
+}
+
+/// Read piped local stdin up to `INLINE_STDIN_CAP`. Returns None if stdin is a
+/// terminal (no piped input). Errors if input exceeds the cap.
+fn read_inline_stdin() -> Result<Option<Vec<u8>>, String> {
+    if std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    let mut buf = Vec::new();
+    let mut handle = std::io::stdin().lock().take((INLINE_STDIN_CAP + 1) as u64);
+    handle.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    if buf.len() > INLINE_STDIN_CAP {
+        return Err(format!(
+            "stdin exceeds inline cap ({INLINE_STDIN_CAP} bytes); use `rx start --pipe` for large input"
+        ));
+    }
+    Ok(Some(buf))
+}
+
+/// Bytes to write for an inline `write` (newline appended unless raw).
+fn write_bytes(input: &str, raw: bool) -> Vec<u8> {
+    if raw {
+        input.as_bytes().to_vec()
+    } else {
+        format!("{input}\n").into_bytes()
     }
 }
 
@@ -268,17 +286,14 @@ fn pipe_local_stdin_to_remote(host: &str, id: &str, no_close: bool) -> ExitCode 
 
     match child.wait() {
         Ok(s) if s.success() => ExitCode::SUCCESS,
-        _ => ExitCode::SUCCESS, // pipe-stdin exits 1 on EPIPE, which is normal for short-lived commands
+        _ => ExitCode::SUCCESS, // pipe-stdin exits 1 on EPIPE, normal for short-lived commands
     }
 }
 
 /// Bidirectional pipe mode: stdin→remote stdin, remote stdout→local stdout.
 /// JSON response goes to stderr so stdout carries only data.
 fn run_pipe_mode(host: &str, id: &str, response_data: &serde_json::Value) -> ExitCode {
-    eprintln!(
-        "{}",
-        serde_json::to_string(response_data).unwrap_or_default()
-    );
+    eprintln!("{}", serde_json::to_string(response_data).unwrap_or_default());
 
     let host_stdin = host.to_string();
     let id_stdin = id.to_string();
@@ -290,9 +305,8 @@ fn run_pipe_mode(host: &str, id: &str, response_data: &serde_json::Value) -> Exi
 
     // Main thread: remote stdout → local stdout
     let follow_args = RemoteArgs::follow(id);
-    let follow = std::process::Command::new("ssh")
-        .arg(host)
-        .arg(".local/bin/rxd")
+    let follow = ssh_command(host)
+        .arg(REMOTE_BIN)
         .args(follow_args.as_str_slice())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -309,9 +323,159 @@ fn run_pipe_mode(host: &str, id: &str, response_data: &serde_json::Value) -> Exi
     ExitCode::SUCCESS
 }
 
-/// Route the command through the daemon.
+/// Route the command directly via SSH (no daemon).
+fn route_via_ssh(command: &Command) -> ExitCode {
+    match command {
+        Command::Run {
+            host,
+            command: cmd,
+            timeout,
+            keep_stdin_open,
+        } => {
+            let body = match read_inline_stdin() {
+                Ok(b) => b.unwrap_or_default(),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let request = Request::Run {
+                command: cmd.clone(),
+                timeout_ms: timeout.map(|s| s.saturating_mul(1000)),
+                keep_stdin_open: *keep_stdin_open,
+            };
+            match serve_request_auto_deploy(host, &request, &body) {
+                Ok(resp) => {
+                    print_json_response(&resp);
+                    run_exit(&resp)
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+
+        Command::Start {
+            host,
+            command: cmd,
+            no_close_stdin,
+            pipe,
+        } => {
+            let needs_pipe = *pipe || !std::io::stdin().is_terminal();
+            let request = Request::Start {
+                command: cmd.clone(),
+            };
+            let response = match serve_request_auto_deploy(host, &request, &[]) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match &response {
+                Response::Started { id } if needs_pipe => {
+                    if *pipe {
+                        let data = serde_json::to_value(&response).unwrap_or_default();
+                        run_pipe_mode(host, id, &data)
+                    } else {
+                        print_json_response(&response);
+                        pipe_local_stdin_to_remote(host, id, *no_close_stdin)
+                    }
+                }
+                _ => {
+                    print_json_response(&response);
+                    exit_for(&response)
+                }
+            }
+        }
+
+        Command::Write {
+            host,
+            id,
+            input,
+            raw,
+        } => {
+            if input.is_none() && !std::io::stdin().is_terminal() {
+                return pipe_local_stdin_to_remote(host, id, true);
+            }
+            let input = match input {
+                Some(s) => s,
+                None => {
+                    eprintln!("error: no input provided and stdin is not piped");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let body = write_bytes(input, *raw);
+            let request = Request::Write { id: id.clone() };
+            dispatch_simple(host, &request, &body)
+        }
+
+        Command::Status { host, id } => {
+            dispatch_simple(host, &Request::Status { id: id.clone() }, &[])
+        }
+        Command::Stdout {
+            host,
+            id,
+            offset,
+            limit,
+        } => dispatch_simple(
+            host,
+            &Request::Read {
+                id: id.clone(),
+                stream: "stdout".to_string(),
+                offset: *offset,
+                limit: *limit,
+            },
+            &[],
+        ),
+        Command::Stderr {
+            host,
+            id,
+            offset,
+            limit,
+        } => dispatch_simple(
+            host,
+            &Request::Read {
+                id: id.clone(),
+                stream: "stderr".to_string(),
+                offset: *offset,
+                limit: *limit,
+            },
+            &[],
+        ),
+        Command::CloseStdin { host, id } => {
+            dispatch_simple(host, &Request::CloseStdin { id: id.clone() }, &[])
+        }
+        Command::Kill { host, id } => dispatch_simple(host, &Request::Kill { id: id.clone() }, &[]),
+        Command::List { host } => dispatch_simple(host, &Request::List, &[]),
+        Command::Clean { host } => dispatch_simple(host, &Request::Clean, &[]),
+
+        Command::Deploy { .. }
+        | Command::Setup { .. }
+        | Command::Skill
+        | Command::Daemon { .. } => unreachable!("handled before routing"),
+    }
+}
+
+/// Send a request over SSH, print the JSON response, and map its type to an exit
+/// code.
+fn dispatch_simple(host: &str, request: &Request, body: &[u8]) -> ExitCode {
+    match serve_request_auto_deploy(host, request, body) {
+        Ok(resp) => {
+            print_json_response(&resp);
+            exit_for(&resp)
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Route the command through the local daemon.
 fn route_via_daemon(command: &Command) -> ExitCode {
-    // Start with piped stdin or --pipe: send Start to daemon, then pipe stdin directly via SSH
+    // Start with piped stdin or --pipe: send Start to daemon, then pipe directly
     if let Command::Start {
         host,
         command: cmd,
@@ -329,24 +493,17 @@ fn route_via_daemon(command: &Command) -> ExitCode {
                 Ok(DaemonResponse::Ok { data }) => {
                     let id = data.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     if id.is_empty() {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&data).unwrap_or_default()
-                        );
+                        print_json(&data);
                         return ExitCode::FAILURE;
                     }
                     if *pipe {
                         return run_pipe_mode(host, id, &data);
                     }
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&data).unwrap_or_default()
-                    );
+                    print_json(&data);
                     pipe_local_stdin_to_remote(host, id, *no_close_stdin)
                 }
                 Ok(DaemonResponse::Error { message }) => {
-                    let err = Response::error(message);
-                    println!("{}", serde_json::to_string_pretty(&err).unwrap_or_default());
+                    print_json_response(&Response::error(message));
                     ExitCode::FAILURE
                 }
                 Err(e) => {
@@ -357,7 +514,30 @@ fn route_via_daemon(command: &Command) -> ExitCode {
         }
     }
 
+    // Run with piped stdin bypasses nothing — the body rides in the request.
     let request = match command {
+        Command::Run {
+            host,
+            command: cmd,
+            timeout,
+            keep_stdin_open,
+        } => {
+            let stdin_b64 = match read_inline_stdin() {
+                Ok(Some(b)) if !b.is_empty() => Some(rem_exec::base64_encode(&b)),
+                Ok(_) => None,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            DaemonRequest::Run {
+                host: host.clone(),
+                command: cmd.clone(),
+                timeout_ms: timeout.map(|s| s.saturating_mul(1000)),
+                stdin_b64,
+                keep_stdin_open: *keep_stdin_open,
+            }
+        }
         Command::Start { host, command, .. } => DaemonRequest::Start {
             host: host.clone(),
             command: command.clone(),
@@ -394,12 +574,11 @@ fn route_via_daemon(command: &Command) -> ExitCode {
             input,
             raw,
         } => {
-            // Piped stdin bypasses daemon — streaming is incompatible with request/response
             if input.is_none() && !std::io::stdin().is_terminal() {
                 return pipe_local_stdin_to_remote(host, id, true);
             }
             let input = match input {
-                Some(s) => s.clone(),
+                Some(s) => s,
                 None => {
                     eprintln!("error: no input provided and stdin is not piped");
                     return ExitCode::FAILURE;
@@ -408,8 +587,7 @@ fn route_via_daemon(command: &Command) -> ExitCode {
             DaemonRequest::Write {
                 host: host.clone(),
                 id: id.clone(),
-                input,
-                raw: *raw,
+                data_b64: rem_exec::base64_encode(&write_bytes(input, *raw)),
             }
         }
         Command::CloseStdin { host, id } => DaemonRequest::CloseStdin {
@@ -422,34 +600,28 @@ fn route_via_daemon(command: &Command) -> ExitCode {
         },
         Command::List { host } => DaemonRequest::List { host: host.clone() },
         Command::Clean { host } => DaemonRequest::Clean { host: host.clone() },
-        Command::Deploy { host } => DaemonRequest::Deploy { host: host.clone() },
-        Command::Setup { .. } => unreachable!("handled above"),
-        Command::Skill => unreachable!("handled above"),
-        Command::Daemon { .. } => unreachable!(),
+        Command::Deploy { .. }
+        | Command::Setup { .. }
+        | Command::Skill
+        | Command::Daemon { .. } => unreachable!("handled before routing"),
     };
 
+    let is_run = matches!(command, Command::Run { .. });
     match daemon::send_request(&request) {
-        Ok(resp) => match resp {
-            // Unwrap the DaemonResponse envelope so the CLI output matches
-            // direct SSH mode (agent sees identical JSON regardless of daemon state)
-            DaemonResponse::Ok { data } => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&data).unwrap_or_default()
-                );
-                // Check if the inner response is an error
-                if data.get("type").and_then(|v| v.as_str()) == Some("error") {
-                    ExitCode::FAILURE
-                } else {
-                    ExitCode::SUCCESS
-                }
-            }
-            DaemonResponse::Error { message } => {
-                let err = Response::error(message);
-                println!("{}", serde_json::to_string_pretty(&err).unwrap_or_default());
+        Ok(DaemonResponse::Ok { data }) => {
+            print_json(&data);
+            if data.get("type").and_then(|v| v.as_str()) == Some("error") {
                 ExitCode::FAILURE
+            } else if is_run {
+                run_exit_from_value(&data)
+            } else {
+                ExitCode::SUCCESS
             }
-        },
+        }
+        Ok(DaemonResponse::Error { message }) => {
+            print_json_response(&Response::error(message));
+            ExitCode::FAILURE
+        }
         Err(e) => {
             eprintln!("daemon error: {e}");
             ExitCode::FAILURE
@@ -457,126 +629,62 @@ fn route_via_daemon(command: &Command) -> ExitCode {
     }
 }
 
-/// Route the command directly via SSH (no daemon).
-fn route_via_ssh(command: &Command) -> ExitCode {
-    // Start with piped stdin or --pipe: start process, then pipe
-    if let Command::Start {
-        host,
-        command: cmd,
-        no_close_stdin,
-        pipe,
-    } = command
-    {
-        let needs_pipe = *pipe || !std::io::stdin().is_terminal();
-        if needs_pipe {
-            let args = RemoteArgs::start(cmd);
-            let response = match ssh_exec_auto_deploy(host, &args.as_str_slice()) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            if let Response::Started { ref id } = response {
-                if *pipe {
-                    let data = serde_json::to_value(&response).unwrap_or_default();
-                    return run_pipe_mode(host, id, &data);
-                }
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&response).unwrap_or_default()
-                );
-                return pipe_local_stdin_to_remote(host, id, *no_close_stdin);
-            }
-            // Not a Started response (error)
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&response).unwrap_or_default()
-            );
-            return ExitCode::FAILURE;
-        }
+/// Exit code for a non-run response: FAILURE only for an error response.
+fn exit_for(response: &Response) -> ExitCode {
+    if matches!(response, Response::Error { .. }) {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
+}
 
-    let result = match command {
-        Command::Start { host, command, .. } => {
-            let args = RemoteArgs::start(command);
-            ssh_exec_auto_deploy(host, &args.as_str_slice())
-        }
-        Command::Status { host, id } => {
-            let args = RemoteArgs::status(id);
-            ssh_exec_auto_deploy(host, &args.as_str_slice())
-        }
-        Command::Stdout {
-            host,
-            id,
-            offset,
-            limit,
+/// Exit code for a `run`: propagate the remote command's exit status so
+/// `rx run host false` behaves like a normal command runner. Agents still read
+/// the structured result from the JSON.
+fn run_exit(response: &Response) -> ExitCode {
+    match response {
+        Response::Completed {
+            exit_code, signal, ..
         } => {
-            let args = RemoteArgs::read(id, "stdout", *offset, *limit);
-            ssh_exec_auto_deploy(host, &args.as_str_slice())
-        }
-        Command::Stderr {
-            host,
-            id,
-            offset,
-            limit,
-        } => {
-            let args = RemoteArgs::read(id, "stderr", *offset, *limit);
-            ssh_exec_auto_deploy(host, &args.as_str_slice())
-        }
-        Command::Write {
-            host,
-            id,
-            input,
-            raw,
-        } => {
-            if input.is_none() && !std::io::stdin().is_terminal() {
-                return pipe_local_stdin_to_remote(host, id, true);
-            }
-            let input = match input {
-                Some(s) => s,
-                None => {
-                    eprintln!("error: no input provided and stdin is not piped");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let args = RemoteArgs::write(id, input, *raw);
-            ssh_exec_auto_deploy(host, &args.as_str_slice())
-        }
-        Command::CloseStdin { host, id } => {
-            let args = RemoteArgs::close_stdin(id);
-            ssh_exec_auto_deploy(host, &args.as_str_slice())
-        }
-        Command::Kill { host, id } => {
-            let args = RemoteArgs::kill(id);
-            ssh_exec_auto_deploy(host, &args.as_str_slice())
-        }
-        Command::List { host } => {
-            let args = RemoteArgs::list();
-            ssh_exec_auto_deploy(host, &args.as_str_slice())
-        }
-        Command::Clean { host } => {
-            let args = RemoteArgs::clean();
-            ssh_exec_auto_deploy(host, &args.as_str_slice())
-        }
-        Command::Deploy { .. } | Command::Setup { .. } | Command::Skill => {
-            unreachable!("handled above")
-        }
-        Command::Daemon { .. } => unreachable!(),
-    };
-
-    match result {
-        Ok(response) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&response).unwrap_or_default(),
-            );
-            if matches!(response, Response::Error { .. }) {
-                ExitCode::FAILURE
+            if let Some(code) = exit_code {
+                ExitCode::from((*code).clamp(0, 255) as u8)
+            } else if let Some(sig) = signal {
+                ExitCode::from((128 + *sig).clamp(0, 255) as u8)
             } else {
                 ExitCode::SUCCESS
             }
         }
+        Response::Error { .. } => ExitCode::FAILURE,
+        _ => ExitCode::SUCCESS,
+    }
+}
+
+fn run_exit_from_value(data: &serde_json::Value) -> ExitCode {
+    if data.get("type").and_then(|v| v.as_str()) == Some("completed") {
+        if let Some(code) = data.get("exit_code").and_then(|v| v.as_i64()) {
+            return ExitCode::from(code.clamp(0, 255) as u8);
+        }
+        if let Some(sig) = data.get("signal").and_then(|v| v.as_i64()) {
+            return ExitCode::from((128 + sig).clamp(0, 255) as u8);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_json_response(response: &Response) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(response).unwrap_or_default()
+    );
+}
+
+fn print_json(value: &serde_json::Value) {
+    println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+}
+
+fn report(result: rem_exec::error::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE

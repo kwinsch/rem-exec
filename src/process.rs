@@ -204,8 +204,13 @@ impl ProcessDir {
 #[derive(Debug, Clone)]
 pub enum ProcessState {
     Running,
+    /// Exited normally with this code.
     Exited(i32),
+    /// Terminated by this signal number.
+    Signaled(i32),
+    /// Terminated by our own `kill`.
     ExitedKilled,
+    /// Died without a recorded exit status (detected by self-healing).
     ExitedUnknown,
 }
 
@@ -215,6 +220,10 @@ impl ProcessState {
             "running" => ProcessState::Running,
             "exited(killed)" => ProcessState::ExitedKilled,
             "exited(unknown)" => ProcessState::ExitedUnknown,
+            _ if s.starts_with("signaled(") && s.ends_with(')') => {
+                let sig = s["signaled(".len()..s.len() - 1].parse::<i32>().unwrap_or(-1);
+                ProcessState::Signaled(sig)
+            }
             _ if s.starts_with("exited(") && s.ends_with(')') => {
                 let code = s[7..s.len() - 1].parse::<i32>().unwrap_or(-1);
                 ProcessState::Exited(code)
@@ -229,6 +238,7 @@ impl fmt::Display for ProcessState {
         match self {
             ProcessState::Running => write!(f, "running"),
             ProcessState::Exited(code) => write!(f, "exited({code})"),
+            ProcessState::Signaled(sig) => write!(f, "signaled({sig})"),
             ProcessState::ExitedKilled => write!(f, "exited(killed)"),
             ProcessState::ExitedUnknown => write!(f, "exited(unknown)"),
         }

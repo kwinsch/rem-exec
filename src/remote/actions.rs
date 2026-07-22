@@ -3,18 +3,70 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::base64_encode;
 use crate::process::{ProcessDir, ProcessState, is_valid_process_id, remote_base, unix_timestamp};
-use crate::protocol::{ProcessSummary, Response};
+use crate::protocol::{ErrorCode, ProcessSummary, Response};
+use crate::remote::start;
+use crate::{Encoding, encode_bytes};
 
 const WRITE_STDIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Per-stream cap on output inlined into a `run` response. Larger output is
+/// tail-truncated here and remains fully readable via `read`.
+pub const RUN_INLINE_CAP: u64 = 256 * 1024;
+
+/// Default timeout for `run` when the caller doesn't specify one.
+pub const RUN_DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
 fn invalid_process_id(id: &str) -> Response {
-    Response::error(format!("invalid process ID: {id}"))
+    Response::error_code(ErrorCode::InvalidProcessId, format!("invalid process ID: {id}"))
 }
 
-/// Get process status with self-healing: if status says "running" but process
-/// is dead, update to "exited(unknown)".
+/// Structured (exit_code, signal) from a terminal process state.
+fn exit_fields(state: &ProcessState) -> (Option<i32>, Option<i32>) {
+    match state {
+        ProcessState::Exited(code) => (Some(*code), None),
+        ProcessState::Signaled(sig) => (None, Some(*sig)),
+        ProcessState::Running | ProcessState::ExitedKilled | ProcessState::ExitedUnknown => {
+            (None, None)
+        }
+    }
+}
+
+/// Read the process state, self-healing a stale "running" status when the
+/// process is actually dead. Returns None if the process has no status file.
+fn resolve_state(pdir: &ProcessDir) -> Option<ProcessState> {
+    let state = pdir.read_status().ok()?;
+    if !matches!(state, ProcessState::Running) {
+        return Some(state);
+    }
+
+    // Status says running — verify the command is actually alive.
+    let cmd_alive = pdir
+        .read_pid()
+        .ok()
+        .flatten()
+        .is_some_and(|pid| unsafe { libc::kill(pid as i32, 0) } == 0);
+    if cmd_alive {
+        return Some(ProcessState::Running);
+    }
+
+    // Command is gone. If the runner is still around it is mid-teardown
+    // (writing the real exit status), so leave the state as running.
+    let runner_alive = pdir
+        .read_runner_pid()
+        .ok()
+        .flatten()
+        .is_some_and(|rp| unsafe { libc::kill(rp as i32, 0) } == 0);
+    if runner_alive {
+        Some(ProcessState::Running)
+    } else {
+        let _ = fs::write(pdir.status_path(), "exited(unknown)");
+        let _ = fs::write(pdir.ended_path(), unix_timestamp().to_string());
+        Some(ProcessState::ExitedUnknown)
+    }
+}
+
+/// Get process status with self-healing (see [`resolve_state`]).
 pub fn status(id: &str) -> Response {
     if !is_valid_process_id(id) {
         return invalid_process_id(id);
@@ -22,44 +74,25 @@ pub fn status(id: &str) -> Response {
 
     let base = remote_base();
     let pdir = ProcessDir::new(&base, id);
-    let state = match pdir.read_status() {
-        Ok(s) => s,
-        Err(_) => return Response::error(format!("process not found: {id}")),
-    };
-
-    // Self-healing: check if process is actually alive
-    let state = if matches!(state, ProcessState::Running) {
-        if let Ok(Some(pid)) = pdir.read_pid() {
-            let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
-            if !alive {
-                let runner_alive = pdir
-                    .read_runner_pid()
-                    .ok()
-                    .flatten()
-                    .is_some_and(|rp| unsafe { libc::kill(rp as i32, 0) } == 0);
-                if !runner_alive {
-                    let _ = fs::write(pdir.status_path(), "exited(unknown)");
-                    let _ = fs::write(pdir.ended_path(), unix_timestamp().to_string());
-                    ProcessState::ExitedUnknown
-                } else {
-                    state
-                }
-            } else {
-                state
-            }
-        } else {
-            state
+    let state = match resolve_state(&pdir) {
+        Some(s) => s,
+        None => {
+            return Response::error_code(
+                ErrorCode::ProcessNotFound,
+                format!("process not found: {id}"),
+            );
         }
-    } else {
-        state
     };
 
+    let (exit_code, signal) = exit_fields(&state);
     Response::Status {
         id: id.to_string(),
         state: state.to_string(),
         cmd: pdir.read_cmd().unwrap_or_default(),
         started: pdir.read_started().unwrap_or(0),
         ended: pdir.read_ended().unwrap_or(None),
+        exit_code,
+        signal,
         stdout_size: pdir.stream_size("stdout"),
         stderr_size: pdir.stream_size("stderr"),
     }
@@ -86,7 +119,12 @@ pub fn read_output(id: &str, stream: &str, offset: Option<u64>, limit: Option<u6
 
     let mut file = match fs::File::open(&path) {
         Ok(f) => f,
-        Err(_) => return Response::error(format!("process not found: {id}")),
+        Err(_) => {
+            return Response::error_code(
+                ErrorCode::ProcessNotFound,
+                format!("process not found: {id}"),
+            );
+        }
     };
 
     let offset = offset.unwrap_or(0);
@@ -104,8 +142,10 @@ pub fn read_output(id: &str, stream: &str, offset: Option<u64>, limit: Option<u6
     };
     data.truncate(bytes_read);
 
+    let (data, encoding) = encode_bytes(&data);
     Response::Output {
-        data: base64_encode(&data),
+        data,
+        encoding,
         offset,
         size: file_size,
     }
@@ -122,58 +162,163 @@ pub fn size(id: &str, stream: &str) -> Response {
     let sz = pdir.stream_size(stream);
     Response::Output {
         data: String::new(),
+        encoding: Encoding::Utf8,
         offset: 0,
         size: sz,
     }
 }
 
-/// Write input to the process's stdin FIFO.
-///
-/// If `raw` is false (default), a newline is appended. If `raw` is true, the
-/// input is sent as-is. Uses O_NONBLOCK to avoid hanging if the process has
-/// already exited.
-pub fn write_stdin(id: &str, input: &str, raw: bool) -> Response {
+/// Write exact bytes to the process's stdin FIFO. Newline handling, if any, is
+/// applied by the caller. Uses O_NONBLOCK so a dead process fails fast.
+pub fn write_stdin(id: &str, data: &[u8]) -> Response {
     if !is_valid_process_id(id) {
         return invalid_process_id(id);
     }
 
     let base = remote_base();
     let pdir = ProcessDir::new(&base, id);
-    let fifo = pdir.stdin_pipe_path();
 
     if !pdir.dir.exists() {
-        return Response::error(format!("process not found: {id}"));
+        return Response::error_code(ErrorCode::ProcessNotFound, format!("process not found: {id}"));
     }
 
     if let Ok(state) = pdir.read_status()
         && !matches!(state, ProcessState::Running)
     {
-        return Response::error(format!("process already exited: {id}"));
+        return Response::error_code(
+            ErrorCode::ProcessExited,
+            format!("process already exited: {id}"),
+        );
     }
 
-    let fifo_cstr = match std::ffi::CString::new(fifo.to_str().unwrap_or("")) {
-        Ok(c) => c,
-        Err(e) => return Response::error(format!("invalid path: {e}")),
-    };
-    let fd = unsafe { libc::open(fifo_cstr.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
-    if fd < 0 {
-        let err = std::io::Error::last_os_error();
-        return Response::error(format!("failed to open stdin pipe: {err}"));
-    }
-
-    let data = if raw {
-        input.as_bytes().to_vec()
-    } else {
-        format!("{input}\n").into_bytes()
-    };
-
-    let write_result = write_all_nonblocking(fd, &data);
-    unsafe { libc::close(fd) };
-
-    match write_result {
+    match feed_fifo(&pdir, data) {
         Ok(bytes) => Response::Written { bytes },
         Err(err) => Response::error(format!("write failed: {err}")),
     }
+}
+
+/// Open the process's stdin FIFO and write `data`, applying backpressure with a
+/// timeout. Non-blocking open so a process with no reader fails fast.
+fn feed_fifo(pdir: &ProcessDir, data: &[u8]) -> std::io::Result<usize> {
+    let fifo = pdir.stdin_pipe_path();
+    let fifo_cstr = std::ffi::CString::new(fifo.to_str().unwrap_or(""))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let fd = unsafe { libc::open(fifo_cstr.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let result = write_all_nonblocking(fd, data);
+    unsafe { libc::close(fd) };
+    result
+}
+
+/// Run a command to completion, blocking up to `timeout_ms` (default
+/// [`RUN_DEFAULT_TIMEOUT_MS`]). If it outlives the timeout it stays running
+/// detached and a `Running` handle is returned instead of blocking forever.
+///
+/// `body` is fed to the process's stdin. Unless `keep_stdin_open` is set, stdin
+/// is closed afterward so commands that read to EOF (cat, sort, sh) terminate.
+pub fn run(
+    command: &[String],
+    timeout_ms: Option<u64>,
+    body: &[u8],
+    keep_stdin_open: bool,
+) -> Response {
+    if command.is_empty() {
+        return Response::error_code(ErrorCode::BadRequest, "run: empty command");
+    }
+
+    let run_started = Instant::now();
+    let id = match start::start(command) {
+        Ok(Response::Started { id }) => id,
+        Ok(other) => return other, // start already returned an error response
+        Err(e) => return Response::error_code(ErrorCode::Internal, e.to_string()),
+    };
+
+    let base = remote_base();
+    let pdir = ProcessDir::new(&base, &id);
+
+    // Feed stdin. Ignore feed errors — the command may not read stdin at all.
+    if !body.is_empty() {
+        let _ = feed_fifo(&pdir, body);
+    }
+    if !keep_stdin_open {
+        let _ = close_stdin(&id); // send EOF so readers terminate
+    }
+
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(RUN_DEFAULT_TIMEOUT_MS));
+    let deadline = Instant::now() + timeout;
+    let poll = Duration::from_millis(20);
+
+    loop {
+        match resolve_state(&pdir) {
+            Some(ProcessState::Running) | None => {}
+            Some(state) => return completed_response(&id, &pdir, &state, run_started.elapsed()),
+        }
+        if Instant::now() >= deadline {
+            return Response::Running {
+                id: id.clone(),
+                reason: format!("still running after {}ms", timeout.as_millis()),
+                stdout_size: pdir.stream_size("stdout"),
+                stderr_size: pdir.stream_size("stderr"),
+                hint: format!(
+                    "backgrounded; poll: rx status HOST {id} · read: rx stdout HOST {id} · stop: rx kill HOST {id}"
+                ),
+            };
+        }
+        thread::sleep(poll);
+    }
+}
+
+fn completed_response(
+    id: &str,
+    pdir: &ProcessDir,
+    state: &ProcessState,
+    elapsed: Duration,
+) -> Response {
+    let (exit_code, signal) = exit_fields(state);
+    let (stdout, stdout_encoding, stdout_size, stdout_truncated) = read_tail(pdir, "stdout");
+    let (stderr, stderr_encoding, stderr_size, stderr_truncated) = read_tail(pdir, "stderr");
+    Response::Completed {
+        id: id.to_string(),
+        exit_code,
+        signal,
+        duration_ms: elapsed.as_millis() as u64,
+        stdout,
+        stdout_encoding,
+        stderr,
+        stderr_encoding,
+        stdout_size,
+        stderr_size,
+        stdout_truncated,
+        stderr_truncated,
+    }
+}
+
+/// Read up to the last [`RUN_INLINE_CAP`] bytes of a stream — the tail, where
+/// errors and results land. Returns (data, encoding, total_size, truncated).
+fn read_tail(pdir: &ProcessDir, stream: &str) -> (String, Encoding, u64, bool) {
+    let path = match stream {
+        "stdout" => pdir.stdout_path(),
+        _ => pdir.stderr_path(),
+    };
+    let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let (start_at, truncated) = if size > RUN_INLINE_CAP {
+        (size - RUN_INLINE_CAP, true)
+    } else {
+        (0, false)
+    };
+    let mut file = match fs::File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return (String::new(), Encoding::Utf8, size, false),
+    };
+    if start_at > 0 {
+        let _ = file.seek(SeekFrom::Start(start_at));
+    }
+    let mut buf = Vec::new();
+    let _ = file.read_to_end(&mut buf);
+    let (data, encoding) = encode_bytes(&buf);
+    (data, encoding, size, truncated)
 }
 
 fn write_all_nonblocking(fd: libc::c_int, data: &[u8]) -> std::io::Result<usize> {
@@ -246,14 +391,17 @@ pub fn close_stdin(id: &str) -> Response {
     let pdir = ProcessDir::new(&base, id);
 
     if !pdir.dir.exists() {
-        return Response::error(format!("process not found: {id}"));
+        return Response::error_code(ErrorCode::ProcessNotFound, format!("process not found: {id}"));
     }
 
     // Don't touch exited processes
     if let Ok(state) = pdir.read_status()
         && !matches!(state, ProcessState::Running)
     {
-        return Response::error(format!("process already exited: {id}"));
+        return Response::error_code(
+            ErrorCode::ProcessExited,
+            format!("process already exited: {id}"),
+        );
     }
 
     if kill_stdin_holder(&pdir) {
@@ -351,14 +499,17 @@ pub fn kill(id: &str) -> Response {
     let pdir = ProcessDir::new(&base, id);
 
     if !pdir.dir.exists() {
-        return Response::error(format!("process not found: {id}"));
+        return Response::error_code(ErrorCode::ProcessNotFound, format!("process not found: {id}"));
     }
 
     // Don't overwrite a real exit code with "exited(killed)"
     if let Ok(state) = pdir.read_status()
         && !matches!(state, ProcessState::Running)
     {
-        return Response::error(format!("process already exited: {id}"));
+        return Response::error_code(
+            ErrorCode::ProcessExited,
+            format!("process already exited: {id}"),
+        );
     }
 
     let rpid = pdir.read_runner_pid().ok().flatten();

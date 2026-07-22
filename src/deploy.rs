@@ -324,12 +324,19 @@ fn verify_remote_version(host: &str) -> Result<String> {
 }
 
 /// Check if auto-deploy should be attempted based on the error.
+///
+/// Covers a missing rxd ("not found"), an unreadable one ("Permission denied"),
+/// and an rxd too old to understand `serve` (clap emits "unrecognized
+/// subcommand"/"unexpected argument"). A protocol error (unparseable JSON) also
+/// implies a version mismatch.
 pub fn should_auto_deploy(err: &RemExecError) -> bool {
     match err {
         RemExecError::Ssh(msg) => {
             msg.contains("not found")
                 || msg.contains("No such file")
                 || msg.contains("Permission denied")
+                || msg.contains("unrecognized subcommand")
+                || msg.contains("unexpected argument")
         }
         RemExecError::Protocol(_) => true,
         _ => false,

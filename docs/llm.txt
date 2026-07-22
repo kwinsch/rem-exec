@@ -1,224 +1,122 @@
-# rx — remote process execution for AI agents
+# rx — remote process execution over SSH (agent transport)
 
-rx runs commands on remote hosts via SSH. Processes persist independently —
-start a process, disconnect, read output later. All responses are JSON.
+Read this whole file once; it is short and complete. It describes capabilities,
+not a mandatory workflow — compose the commands as the task needs.
 
-## Quick start
+Invariants:
+- Every command prints exactly one JSON object on stdout (type field). The only
+  exceptions are `start --pipe` (data on stdout, JSON handle on stderr) and the
+  raw streaming used internally.
+- Command arguments and stdin bytes are transported verbatim over the SSH
+  channel — no remote shell parses them. There is nothing to escape/quote.
+- Process IDs are 8 lowercase hex characters.
 
-rx start HOST COMMAND...          # start a process, returns {"type":"started","id":"..."}
-rx status HOST ID                 # check state: running, exited(0), exited(1), etc.
-rx stdout HOST ID                 # read stdout (base64-encoded in JSON)
-rx kill HOST ID                   # terminate a process
-rx clean HOST                     # remove all exited process state
-rx setup                          # download static rxd binaries for auto-deploy
+## Model
+
+Commands run detached on the remote under a private per-user state dir; stdout
+and stderr are captured to files that survive disconnect. Two entry points over
+that substrate:
+- run   — synchronous. Blocks up to a timeout; if the command outlives it, the
+          process keeps running and a `running` handle is returned instead.
+- start — returns a handle immediately. For long-lived, streaming, or
+          interactive processes you read/write later.
 
 ## Commands
 
-### rx start HOST COMMAND...
-Start a process on HOST. Returns process ID immediately.
-Flags:
-  --no-close-stdin    Keep remote stdin open after local stdin EOF
-  --pipe              Bidirectional: stdin→remote, remote stdout→local stdout (JSON on stderr)
-Stdin: If stdin is piped, data is forwarded to the remote process automatically.
+  run   HOST [--timeout SECS] [--keep-stdin-open] -- CMD...
+  start HOST [--pipe] [--no-close-stdin] -- CMD...
+  status HOST ID
+  stdout HOST ID [--offset N] [--limit N]
+  stderr HOST ID [--offset N] [--limit N]
+  write HOST ID [TEXT] [--raw]
+  close-stdin HOST ID
+  kill HOST ID
+  list HOST
+  clean HOST
+  deploy HOST
+  setup [--version V] [--arch ARCH]... [--force]
+  skill
+  daemon start|stop|status
 
-### rx status HOST ID
-Returns process state, timing, and output sizes.
+Notes:
+- Everything after `--` is the remote argv. `--` is optional but disambiguates a
+  command whose own flags could collide with rx options; put rx options before
+  it. execvp runs the argv directly — no shell, so no globbing/redirection/`;`.
+- run: stdin, if piped, is fed to the process, then EOF is sent so readers
+  terminate. With no piped stdin, EOF is sent immediately. --keep-stdin-open
+  suppresses the EOF. Inline stdin is capped at 4 MiB; larger uses start+pipe.
+- write TEXT appends a newline unless --raw. With TEXT omitted and stdin piped,
+  the stream is forwarded raw and unbounded (binary-safe). close-stdin sends EOF.
+- start --pipe: local stdin → remote stdin and remote stdout → local stdout as
+  raw bytes; the JSON handle is written to stderr.
 
-### rx stdout HOST ID [--offset N] [--limit N]
-Read stdout. Output is base64-encoded in the "data" field.
-Default limit: 1 MiB. Use --offset for incremental reads.
+## Text encoding
 
-### rx stderr HOST ID [--offset N] [--limit N]
-Same as stdout but for stderr.
+stdout/stderr/data fields pair with an `encoding`:
+- utf8   — the JSON string is the literal output; use it directly.
+- base64 — output was not clean UTF-8 (binary or embedded NUL); base64-decode it.
 
-### rx write HOST ID [INPUT] [--raw]
-Send data to process stdin. If INPUT is omitted and stdin is piped, reads from pipe.
-Default: appends newline. Use --raw to send exactly as-is.
+## Response shapes (by type)
 
-### rx close-stdin HOST ID
-Send EOF to the process (closes stdin).
+  completed {id, exit_code|null, signal|null, duration_ms,
+             stdout, stdout_encoding, stderr, stderr_encoding,
+             stdout_size, stderr_size, stdout_truncated, stderr_truncated}
+  running   {id, reason, stdout_size, stderr_size, hint}
+  started   {id}
+  status    {id, state, cmd, started, ended|null,
+             exit_code|null, signal|null, stdout_size, stderr_size}
+  output    {data, encoding, offset, size}
+  written   {bytes}          # from close-stdin, bytes:0 means EOF sent
+  killed    {id}
+  list      {processes:[{id, state, cmd}]}
+  cleaned   {removed:[id...]}
+  version   {version, protocol}
+  error     {message, code?, retryable?, hint?}
 
-### rx kill HOST ID
-SIGTERM → wait 200ms → SIGKILL if still alive.
+- run yields completed or running. exit_code is null when signal is set.
+- state: running | exited(N) | signaled(N) | exited(killed) | exited(unknown).
+- completed inlines up to the last 256 KiB per stream; when *_truncated is true
+  the full output remains readable via stdout/stderr with --offset.
+- output.size is the total file size — pass it back as the next --offset to read
+  incrementally; size == offset with an exited state means fully drained.
 
-### rx list HOST
-List all processes with their state and command.
+## Error codes (error.code)
 
-### rx clean HOST
-Remove all exited process state from the remote host.
+  bad_request · invalid_process_id · process_not_found · process_exited ·
+  timeout · not_deployed · unsupported · ssh_unreachable · ssh_auth · internal
 
-### rx deploy HOST
-Deploy rxd binary to HOST. Auto-detects architecture (x86_64/aarch64/riscv64).
-Copies binary to ~/.local/bin/rxd on the remote.
+Branch on code, not message text. `retryable:true` means the same call may
+succeed on retry (e.g. after an auto-deploy, or a transient ssh_unreachable).
 
-### rx setup [--version V] [--arch ARCH] [--force]
-Download static rxd binaries from GitHub Releases into the local deploy cache.
-Default: current rx version and all supported architectures.
-Supported arch names: x86_64, aarch64, riscv64.
-Use repeated --arch flags to cache only selected architectures.
+## Deploy and connections
 
-### rx daemon start|stop|status
-Manage the local caching daemon. Optional — rx works without it.
-The daemon caches remote output locally for faster reads.
+rxd is the remote binary; rx deploys the arch-matched build to ~/.local/bin/rxd
+(`rx deploy HOST`, needs a local cache from `rx setup`). Set
+REM_EXEC_AUTO_DEPLOY=1 to deploy-and-retry automatically against a missing or
+outdated remote. rx multiplexes SSH connections, so repeated operations to a
+host reuse one connection.
 
-## Stdin piping
+## Examples
 
-Piped stdin is the preferred way to send complex data. It avoids SSH argument
-escaping issues entirely — data flows through a binary-safe channel.
+  # one call → exit code + output
+  rx run HOST -- systemctl is-active nginx
 
-# Create a file on remote (special chars, newlines preserved exactly):
-printf '#!/bin/sh\necho "hello $USER"\n' | rx start host tee /path/to/file
+  # feed stdin and get the result together
+  printf 'c\na\nb\n' | rx run HOST -- sort
 
-# Run a script from local disk on remote:
-cat script.sh | rx start host sh
+  # elevate: passwordless doas, no TTY (do NOT use su — it needs /dev/tty)
+  rx run HOST -- doas apt-get -y update
+  printf 'key=value\n' | rx run HOST -- doas tee /etc/app.conf
 
-# Send input to a running process:
-echo "yes" | rx write host ID
+  # long-lived: take a handle now, read incrementally later
+  ID=$(rx start HOST -- journalctl -fu nginx | jq -r .id)
+  rx stdout HOST $ID --offset 0
 
-# Bidirectional pipe (JSON response on stderr, data on stdout):
-echo "input" | rx start --pipe host ./script.sh
+  # interactive REPL over persistent stdin
+  ID=$(rx start HOST -- python3 | jq -r .id)
+  rx write HOST $ID "print(6*7)"
+  rx stdout HOST $ID
+  rx close-stdin HOST $ID
 
-## Auto-deploy
-
-Set REM_EXEC_AUTO_DEPLOY=1 to automatically deploy rxd when a host doesn't
-have it or has an incompatible version. Detects architecture and copies the
-correct binary. One retry on failure.
-
-export REM_EXEC_AUTO_DEPLOY=1
-rx start new-host uname -a    # auto-deploys if rxd is missing
-
-Binaries are stored in ~/.local/share/rem-exec/bin/rxd-{arch}.
-
-The auto-deploy cache stores remote-side rxd binaries only. rx runs locally.
-Current arch names:
-  x86_64   → ~/.local/share/rem-exec/bin/rxd-x86_64
-  aarch64  → ~/.local/share/rem-exec/bin/rxd-aarch64
-  riscv64  → ~/.local/share/rem-exec/bin/rxd-riscv64
-
-GitHub Releases provide static rxd binaries. Run `rx setup` to populate the
-cache before using deploy or auto-deploy.
-
-## JSON response types
-
-Every command returns one JSON object on stdout (except --pipe mode which
-uses stderr for JSON). The "type" field identifies the response.
-
-### started
-{"type":"started","id":"a1b2c3d4"}
-
-### status
-{"type":"status","id":"a1b2c3d4","state":"running","cmd":"sleep 10",
- "started":1700000000,"ended":null,"stdout_size":0,"stderr_size":0}
-
-State values: "running", "exited(0)", "exited(1)", "exited(killed)", "exited(unknown)"
-
-### output
-{"type":"output","data":"SGVsbG8K","offset":0,"size":6}
-
-The "data" field is base64-encoded. Decode with standard base64.
-"offset" is the byte position this chunk starts at.
-"size" is the total file size (use as next offset for incremental reads).
-
-### written
-{"type":"written","bytes":5}
-
-### killed
-{"type":"killed","id":"a1b2c3d4"}
-
-### list
-{"type":"list","processes":[{"id":"a1b2c3d4","state":"running","cmd":"sleep 10"}]}
-
-### cleaned
-{"type":"cleaned","removed":["a1b2c3d4","e5f6g7h8"]}
-
-### version
-{"type":"version","version":"0.1.0","protocol":1}
-
-### error
-{"type":"error","message":"process not found: xyz"}
-
-## Incremental output reading
-
-Use offset to read output incrementally without re-reading:
-
-1. rx stdout host ID                    → {"data":"...","offset":0,"size":100}
-2. rx stdout host ID --offset 100       → {"data":"...","offset":100,"size":250}
-3. rx stdout host ID --offset 250       → {"data":"","offset":250,"size":250}  (no new data)
-
-When size == offset and process state is exited, all output has been read.
-
-## Common workflows
-
-### Run command and collect output
-ID=$(rx start host ls -la | jq -r .id)
-# wait for completion
-while [ "$(rx status host $ID | jq -r .state)" = "running" ]; do sleep 1; done
-rx stdout host $ID | jq -r .data | base64 -d
-
-### Interactive process
-ID=$(rx start host python3 | jq -r .id)
-rx write host $ID "print('hello')"
-sleep 1
-rx stdout host $ID              # read output
-rx close-stdin host $ID         # send EOF
-
-### Create file on remote
-printf 'file contents here' | rx start host tee /path/to/file
-
-### Run local script on remote
-cat script.sh | rx start host sh
-
-### Quick command with output (bidirectional pipe)
-echo "" | rx start --pipe host ls -la
-# stdout contains ls output directly, no base64
-
-## Privilege elevation
-
-Use `doas` for root or other-user commands. Hosts are configured with
-passwordless doas rules. No TTY needed.
-
-### Run as root
-rx start host doas apt update
-printf 'config line\n' | rx start host doas tee /etc/some.conf
-
-### Run as another user
-rx start host doas -u postgres pg_dump mydb
-
-### Piped script as root
-cat install.sh | rx start host doas sh
-
-### Bidirectional as root
-echo "input" | rx start --pipe host doas sh script.sh
-
-All pipe modes work through doas — stdin flows through transparently.
-Do NOT use `su` (requires /dev/tty for password). Use `doas` or `sudo -n`.
-
-## Error recovery
-
-- "process not found": ID doesn't exist or was cleaned. Start a new process.
-- "process already exited": Can't write/kill — process is done. Read output instead.
-- "SSH error": Network/auth issue. Check SSH connectivity to host.
-- "no binary for {arch}": Run `rx setup`, then retry.
-- "auto-deploy failed": Check SSH access and that binary store has the right arch.
-
-## Install and setup
-
-Two binaries: rx (local CLI) and rxd (remote, deployed to targets).
-
-cargo install rem-exec
-rx setup
-
-This installs rx and rxd locally. For auto-deploy, place static rxd binaries in
-~/.local/share/rem-exec/bin/rxd-{arch}. `rx setup` downloads and verifies these
-remote-side binaries from GitHub Releases.
-
-### Paths
-
-- Binary store: ~/.local/share/rem-exec/bin/ (rxd-x86_64, rxd-aarch64, rxd-riscv64)
-- Local CLI: ~/.local/bin/rx
-
-## Host requirements
-
-- SSH access (key-based auth recommended)
-- rxd binary at ~/.local/bin/rxd (use rx deploy or auto-deploy)
-- No other dependencies — rxd is a static binary
+  # large or binary input streams unbounded via the pipe path
+  cat firmware.bin | rx start HOST -- doas tee /var/lib/app/firmware.bin

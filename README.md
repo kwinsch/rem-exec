@@ -2,17 +2,28 @@
 
 Agent-friendly remote process execution over SSH.
 
-Start processes on remote hosts, pipe data in, read output later. All responses are JSON. Designed as a transport layer for AI agents that need to run commands on remote machines without fighting SSH argument escaping.
+Run a command and get its exit code and output in one call, or start a process,
+disconnect, and read output later. All responses are JSON. Designed as a
+transport layer for AI agents: the request travels through the SSH channel's
+stdin as framed JSON, so command arguments and input bytes reach the remote
+verbatim — there is no remote shell to escape or inject into.
 
 ## Features
 
-- **Persistent processes** — start a command, disconnect, read output later
-- **Stdin piping** — pipe complex data (scripts, configs) without shell escaping issues
+- **Run-to-completion** — `rx run` blocks up to a timeout, returns exit code +
+  stdout + stderr in one response; long commands auto-background into a handle
+- **Persistent processes** — `rx start` a command, disconnect, read output later
+- **Exact transport** — argv and stdin are carried as framed JSON, never parsed
+  by a remote shell; no quoting, no metacharacter injection, binary-safe
+- **Text-native output** — UTF-8 output is returned as text; only real binary is
+  base64-encoded (`encoding` field says which)
+- **Structured results** — integer exit codes, signal numbers, typed error codes
+- **Stdin piping** — stream scripts, configs, or binary blobs unbounded
 - **Bidirectional pipe mode** — `stdin→remote`, `remote stdout→local stdout`
-- **Auto-deploy** — detects remote architecture, deploys the correct binary automatically
+- **Auto-deploy** — detects remote architecture, deploys the correct binary
+- **Connection reuse** — SSH multiplexing across operations to a host
 - **Multi-arch** — static musl binaries for x86_64, aarch64, riscv64
-- **JSON protocol** — every response is structured, parseable, predictable
-- **Embedded skill file** — `rx skill` prints complete machine-readable documentation
+- **Embedded skill file** — `rx skill` prints complete machine-readable docs
 
 ## Install
 
@@ -43,15 +54,19 @@ auto-deploy.
 # Deploy to a remote host
 rx deploy host
 
-# Run a command
-rx start host uname -a
-rx stdout host <id>
+# Run a command to completion — exit code + output in one JSON response
+rx run host -- uname -a
 
-# Pipe a script (no escaping needed)
-cat script.sh | rx start host sh
+# Feed stdin and collect the result together
+printf 'c\na\nb\n' | rx run host -- sort
 
-# Bidirectional pipe
-echo "input" | rx start --pipe host ./process.sh
+# Start a long-lived process, read output later
+id=$(rx start host -- journalctl -fu nginx | jq -r .id)
+rx stdout host "$id" --offset 0
+
+# Pipe a script (no escaping needed); bidirectional pipe
+cat script.sh | rx start host -- sh
+echo "input" | rx start --pipe host -- ./process.sh
 ```
 
 ## Agent usage
@@ -60,7 +75,7 @@ Set `REM_EXEC_AUTO_DEPLOY=1` and point the agent at the target host. The agent r
 
 ```bash
 export REM_EXEC_AUTO_DEPLOY=1
-rx start host doas apt update    # auto-deploys if needed, elevates via doas
+rx run host -- doas apt-get -y update    # auto-deploys if needed, elevates via doas
 ```
 
 ## Architecture

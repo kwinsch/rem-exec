@@ -8,8 +8,9 @@ use std::thread;
 use crate::daemon::state::{DaemonState, TrackedProcess};
 use crate::daemon::stream::spawn_stream_thread;
 use crate::error::Result;
-use crate::protocol::{DaemonRequest, DaemonResponse, Response};
-use crate::ssh::{RemoteArgs, ssh_exec_auto_deploy};
+use crate::protocol::{DaemonRequest, DaemonResponse, Request, Response};
+use crate::ssh::serve_request_auto_deploy;
+use crate::{base64_decode, encode_bytes};
 
 /// Start the daemon: fork, set up Unix socket, serve requests.
 pub fn start_daemon() -> Result<()> {
@@ -180,8 +181,29 @@ fn dispatch(
     stop: &Arc<std::sync::atomic::AtomicBool>,
 ) -> DaemonResponse {
     match request {
+        DaemonRequest::Run {
+            host,
+            command,
+            timeout_ms,
+            stdin_b64,
+            keep_stdin_open,
+        } => {
+            let body = stdin_b64
+                .as_deref()
+                .and_then(|s| base64_decode(s).ok())
+                .unwrap_or_default();
+            forward(
+                &host,
+                &Request::Run {
+                    command,
+                    timeout_ms,
+                    keep_stdin_open,
+                },
+                &body,
+            )
+        }
         DaemonRequest::Start { host, command } => handle_start(&host, &command, state),
-        DaemonRequest::Status { host, id } => forward_ssh(&host, RemoteArgs::status(&id)),
+        DaemonRequest::Status { host, id } => forward(&host, &Request::Status { id }, &[]),
         DaemonRequest::Stdout {
             host,
             id,
@@ -197,15 +219,19 @@ fn dispatch(
         DaemonRequest::Write {
             host,
             id,
-            input,
-            raw,
-        } => forward_ssh(&host, RemoteArgs::write(&id, &input, raw)),
-        DaemonRequest::CloseStdin { host, id } => forward_ssh(&host, RemoteArgs::close_stdin(&id)),
-        DaemonRequest::Kill { host, id } => forward_ssh(&host, RemoteArgs::kill(&id)),
-        DaemonRequest::List { host } => forward_ssh(&host, RemoteArgs::list()),
+            data_b64,
+        } => {
+            let body = base64_decode(&data_b64).unwrap_or_default();
+            forward(&host, &Request::Write { id }, &body)
+        }
+        DaemonRequest::CloseStdin { host, id } => {
+            forward(&host, &Request::CloseStdin { id }, &[])
+        }
+        DaemonRequest::Kill { host, id } => forward(&host, &Request::Kill { id }, &[]),
+        DaemonRequest::List { host } => forward(&host, &Request::List, &[]),
         DaemonRequest::Clean { host } => {
             // Clean remote and local
-            let resp = forward_ssh(&host, RemoteArgs::clean());
+            let resp = forward(&host, &Request::Clean, &[]);
             // Also clean local cached files for this host
             if let Ok(mut st) = state.lock() {
                 if let Some(host_state) = st.hosts.get_mut(&host) {
@@ -254,8 +280,10 @@ fn dispatch(
 
 /// Start a process remotely and begin streaming its output locally.
 fn handle_start(host: &str, command: &[String], state: &Arc<Mutex<DaemonState>>) -> DaemonResponse {
-    let args = RemoteArgs::start(command);
-    let response = match ssh_exec_auto_deploy(host, &args.as_str_slice()) {
+    let request = Request::Start {
+        command: command.to_vec(),
+    };
+    let response = match serve_request_auto_deploy(host, &request, &[]) {
         Ok(r) => r,
         Err(e) => {
             return DaemonResponse::Error {
@@ -333,8 +361,10 @@ fn handle_read(
                 let mut data = vec![0u8; to_read];
                 let n = file.read(&mut data).unwrap_or(0);
                 data.truncate(n);
+                let (data, encoding) = encode_bytes(&data);
                 let response = Response::Output {
-                    data: base64_encode(&data),
+                    data,
+                    encoding,
                     offset,
                     size: file_size,
                 };
@@ -345,14 +375,23 @@ fn handle_read(
             },
         }
     } else {
-        // Not cached — forward to SSH
-        forward_ssh(host, RemoteArgs::read(id, stream_name, offset, limit))
+        // Not cached — forward to the remote over the serve transport.
+        forward(
+            host,
+            &Request::Read {
+                id: id.to_string(),
+                stream: stream_name.to_string(),
+                offset,
+                limit,
+            },
+            &[],
+        )
     }
 }
 
-/// Forward a request to the remote host via SSH.
-fn forward_ssh(host: &str, args: RemoteArgs) -> DaemonResponse {
-    match ssh_exec_auto_deploy(host, &args.as_str_slice()) {
+/// Forward a request to the remote host over the serve transport.
+fn forward(host: &str, request: &Request, body: &[u8]) -> DaemonResponse {
+    match serve_request_auto_deploy(host, request, body) {
         Ok(r) => wrap_response(r),
         Err(e) => DaemonResponse::Error {
             message: e.to_string(),
@@ -368,5 +407,3 @@ fn wrap_response(response: Response) -> DaemonResponse {
         },
     }
 }
-
-use crate::base64_encode;

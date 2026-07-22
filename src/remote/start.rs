@@ -192,15 +192,15 @@ pub fn start(command: &[String]) -> Result<Response> {
                     let mut wstatus: i32 = 0;
                     unsafe { libc::waitpid(gc_pid, &mut wstatus, 0) };
 
-                    let exit_code = if libc::WIFEXITED(wstatus) {
-                        libc::WEXITSTATUS(wstatus)
+                    let status_line = if libc::WIFEXITED(wstatus) {
+                        format!("exited({})", libc::WEXITSTATUS(wstatus))
                     } else if libc::WIFSIGNALED(wstatus) {
-                        128 + libc::WTERMSIG(wstatus)
+                        format!("signaled({})", libc::WTERMSIG(wstatus))
                     } else {
-                        -1
+                        "exited(unknown)".to_string()
                     };
 
-                    let _ = fs::write(pdir.status_path(), format!("exited({exit_code})"));
+                    let _ = fs::write(pdir.status_path(), status_line);
                     let _ = fs::write(pdir.ended_path(), unix_timestamp().to_string());
 
                     // Clean up holder

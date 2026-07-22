@@ -1,8 +1,10 @@
 use std::fs;
 use std::io::{self, Read, Write};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::thread;
 use std::time::Duration;
+
+use crate::ssh::{REMOTE_BIN, ssh_command};
 
 /// Spawn a background thread that streams remote output to a local file.
 ///
@@ -53,12 +55,8 @@ fn run_follow(
         fs::create_dir_all(parent)?;
     }
 
-    let mut cmd = Command::new("ssh");
-    cmd.arg(host)
-        .arg(".local/bin/rxd")
-        .arg("follow")
-        .arg(id)
-        .arg(stream_name);
+    let mut cmd = ssh_command(host);
+    cmd.arg(REMOTE_BIN).arg("follow").arg(id).arg(stream_name);
 
     if resume_offset > 0 {
         cmd.arg("--offset").arg(resume_offset.to_string());
