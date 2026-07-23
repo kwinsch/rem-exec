@@ -328,6 +328,24 @@ fn start_reports_missing_command_via_status() {
 }
 
 #[test]
+fn ping_reports_identity_without_creating_state() {
+    let runtime = Runtime::new("ping");
+    let resp = runtime.serve(json!({"action": "ping"}), &[]);
+
+    assert_eq!(resp["type"], "ping", "{resp}");
+    assert!(!resp["version"].as_str().unwrap().is_empty(), "{resp}");
+    assert_eq!(resp["protocol"], 2, "{resp}");
+    // uname-derived fields are always present and non-empty on Linux.
+    assert!(!resp["os"].as_str().unwrap().is_empty(), "{resp}");
+    assert!(!resp["kernel"].as_str().unwrap().is_empty(), "{resp}");
+    assert!(!resp["arch"].as_str().unwrap().is_empty(), "{resp}");
+    assert!(resp.get("hostname").is_some(), "{resp}");
+
+    // Ping is a pure probe: it answers before any state dir is created.
+    assert!(!runtime.remote_base().exists(), "ping must not create state dir");
+}
+
+#[test]
 fn run_applies_env_overrides() {
     let runtime = Runtime::new("run-env");
     let resp = runtime.serve(

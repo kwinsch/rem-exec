@@ -28,21 +28,25 @@ Everything below is proposed, not committed. Ordered by agent-experience value.
 Reverse of `cp`: stream a remote file down. Pairs with `cp` for round-tripping
 config/artifacts.
 
+### `rx which HOST name...`  (companion to ping)
+Stateless per-call tool-availability probe: rxd walks `$PATH` in Rust (no remote
+shell) and returns `{name: path|null}`. Agent passes the tools it needs for the
+task; no persistent "preferred tools" config (that drifts toward desired-state).
+Kept separate from ping (ping is a fixed cheap round trip; which takes a list).
+
 ### 2. Merged stdout+stderr view
 Optional interleaved capture so causality (which line came before which) is
 preserved for debugging. `run --merge`, or a combined field / a third capture
 file written with a tee.
 
-### 3. `rx ping HOST`
-Fast typed reachability + host identity in one round trip, so an agent can check
-connectivity, whether a (re)deploy is needed, and orient itself before a batch.
-Returns `{version, protocol, arch, os, kernel, hostname, distro_id?,
-distro_version?}`. Gather it natively in rxd — `uname(2)` for os/kernel/machine
-and a direct read of `/etc/os-release` for distro (both absent → null) — no
-remote shell, consistent with the no-shell thesis. The distro fields are the
-actually-useful bit (apk vs apt, bash-vs-ash: Alpine ships busybox ash, no bash).
-Keep the tool-availability probe (`rx which`) a *separate* verb: ping stays a
-fixed cheap round trip, `which` takes a variable name list.
+### 3. `rx ping HOST` — SHIPPED
+Reachability + host identity in one round trip: `{version, protocol, arch, os,
+kernel, hostname, distro_id?, distro_version?}`, gathered natively in rxd
+(`uname(2)` + `/etc/os-release`, no remote shell). Pure probe, no state dir;
+honors auto-deploy like other commands (unset → `not_deployed` is the "deploy
+needed" signal). The distro fields are the useful bit (apk vs apt; Alpine ships
+busybox ash, no bash). The tool-availability probe (`rx which`) stays a separate
+verb (see above).
 
 ### 4. Idempotency keys
 Optional client-supplied key on `run`/`start` so a retried request after a

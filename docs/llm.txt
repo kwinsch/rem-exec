@@ -46,6 +46,7 @@ that substrate:
   list HOST
   clean HOST
   cp    LOCAL HOST:PATH [--mode OCTAL] [--owner USER] [--group GRP]
+  ping  HOST
   deploy HOST
   setup [--version V] [--arch ARCH]... [--force]
   skill
@@ -97,6 +98,8 @@ stdout/stderr/data fields pair with an `encoding`:
   list      {processes:[{id, state, cmd}]}
   cleaned   {removed:[id...]}
   version   {version, protocol}
+  ping      {version, protocol, arch, os, kernel, hostname,
+             distro_id?, distro_version?}
   error     {message, code?, retryable?, hint?}
 
 - run and wait yield completed or running. exit_code is null when signal is set.
@@ -131,7 +134,17 @@ REM_EXEC_AUTO_DEPLOY=1 to deploy-and-retry automatically against a missing or
 outdated remote. rx multiplexes SSH connections, so repeated operations to a
 host reuse one connection.
 
+`ping` is the preflight: one round trip tells you the host is reachable, what
+rxd version/protocol it runs, and what it is (os/kernel/arch/distro) — enough to
+choose a package manager or shell before a batch. It is a pure probe with no
+side effects (it creates no state dir). With REM_EXEC_AUTO_DEPLOY=1 a ping to a
+missing/outdated remote deploys first; without it, a `not_deployed` error is the
+signal that a deploy is needed.
+
 ## Examples
+
+  # preflight: reachable? which rxd? which OS/distro? (pick apk vs apt, sh vs bash)
+  rx ping HOST
 
   # one call → exit code + output
   rx run HOST -- systemctl is-active nginx

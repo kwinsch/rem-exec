@@ -94,6 +94,9 @@ pub enum Request {
     List,
     Clean,
     Version,
+    /// Reachability + host identity in one round trip. Like `Version`, it
+    /// answers before any state dir exists, so an agent can probe a fresh host.
+    Ping,
 }
 
 /// Machine-branchable error categories. Agents switch on `code` instead of
@@ -226,6 +229,23 @@ pub enum Response {
 
     #[serde(rename = "version")]
     Version { version: String, protocol: u32 },
+
+    /// Reachability + host identity. `arch`/`os`/`kernel`/`hostname` come from
+    /// `uname(2)`; the distro fields from `/etc/os-release` (absent → null, e.g.
+    /// a rolling distro has no `distro_version`).
+    #[serde(rename = "ping")]
+    Ping {
+        version: String,
+        protocol: u32,
+        arch: String,
+        os: String,
+        kernel: String,
+        hostname: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        distro_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        distro_version: Option<String>,
+    },
 
     #[serde(rename = "error")]
     Error {

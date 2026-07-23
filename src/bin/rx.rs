@@ -160,6 +160,11 @@ enum Command {
         /// Remote host (SSH destination)
         host: String,
     },
+    /// Probe reachability + host identity (rxd version, OS, kernel, arch, distro)
+    Ping {
+        /// Remote host (SSH destination)
+        host: String,
+    },
     /// Copy a local file to a remote path (atomic; optional mode/owner/group)
     Cp {
         /// Local source file
@@ -243,6 +248,12 @@ fn main() -> ExitCode {
     } = &cli.command
     {
         return do_cp(local, remote, mode.as_deref(), owner.clone(), group.clone());
+    }
+
+    // Ping is a stateless probe: go direct over SSH (no daemon), honoring
+    // auto-deploy like other remote commands.
+    if let Command::Ping { host } = &cli.command {
+        return dispatch_simple(host, &Request::Ping, &[]);
     }
 
     // Setup is always local: it populates the rxd deploy cache.
@@ -531,6 +542,7 @@ fn route_via_ssh(command: &Command) -> ExitCode {
         Command::Clean { host } => dispatch_simple(host, &Request::Clean, &[]),
 
         Command::Deploy { .. }
+        | Command::Ping { .. }
         | Command::Cp { .. }
         | Command::Setup { .. }
         | Command::Skill
@@ -827,6 +839,7 @@ fn route_via_daemon(command: &Command) -> ExitCode {
         Command::List { host } => DaemonRequest::List { host: host.clone() },
         Command::Clean { host } => DaemonRequest::Clean { host: host.clone() },
         Command::Deploy { .. }
+        | Command::Ping { .. }
         | Command::Cp { .. }
         | Command::Setup { .. }
         | Command::Skill

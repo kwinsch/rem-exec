@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use crate::process::{ensure_base_dir, remote_base};
 use crate::protocol::{ErrorCode, PROTOCOL_VERSION, Request, Response};
-use crate::remote::{actions, start};
+use crate::remote::{actions, hostinfo, start};
 
 /// Handle one framed request from stdin and write one JSON response to stdout.
 ///
@@ -37,11 +37,24 @@ pub fn serve() -> ExitCode {
         }
     };
 
-    // Version must answer on a fresh host, before any state dir exists.
+    // Version and Ping must answer on a fresh host, before any state dir exists.
     if matches!(request, Request::Version) {
         return emit(Response::Version {
             version: env!("CARGO_PKG_VERSION").to_string(),
             protocol: PROTOCOL_VERSION,
+        });
+    }
+    if matches!(request, Request::Ping) {
+        let id = hostinfo::identity();
+        return emit(Response::Ping {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol: PROTOCOL_VERSION,
+            arch: id.arch,
+            os: id.os,
+            kernel: id.kernel,
+            hostname: id.hostname,
+            distro_id: id.distro_id,
+            distro_version: id.distro_version,
         });
     }
 
@@ -101,7 +114,7 @@ pub fn serve() -> ExitCode {
         Request::Kill { id } => actions::kill(&id),
         Request::List => actions::list(),
         Request::Clean => actions::clean(),
-        Request::Version => unreachable!("handled above"),
+        Request::Version | Request::Ping => unreachable!("handled above"),
     };
 
     emit(response)
