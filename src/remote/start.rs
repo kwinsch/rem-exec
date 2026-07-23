@@ -53,7 +53,7 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
     fs::create_dir_all(&pdir.dir)?;
     fs::set_permissions(&pdir.dir, fs::Permissions::from_mode(0o700))?;
 
-    fs::write(pdir.status_path(), "running")?;
+    pdir.write_status("running")?;
     fs::write(pdir.cmd_path(), command.join(" "))?;
     fs::write(pdir.started_path(), unix_timestamp().to_string())?;
 
@@ -149,7 +149,7 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
             let holder_pid = unsafe { libc::fork() };
             match holder_pid {
                 -1 => {
-                    let _ = fs::write(pdir.status_path(), "exited(127)");
+                    let _ = pdir.write_status("exited(127)");
                     write_pid_to_pipe(sync_write, 0);
                     unsafe { libc::_exit(1) };
                 }
@@ -172,7 +172,7 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
             let grandchild = unsafe { libc::fork() };
             match grandchild {
                 -1 => {
-                    let _ = fs::write(pdir.status_path(), "exited(127)");
+                    let _ = pdir.write_status("exited(127)");
                     write_pid_to_pipe(sync_write, 0);
                     unsafe { libc::kill(holder_pid, libc::SIGTERM) };
                     unsafe { libc::_exit(1) };
@@ -242,7 +242,7 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
                         unsafe {
                             libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
                         }
-                        let _ = fs::write(pdir.status_path(), "exited(127)");
+                        let _ = pdir.write_status("exited(127)");
                         unsafe { libc::_exit(127) };
                     }
 
@@ -272,7 +272,7 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
                         libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
                     }
                     let _ = fs::write(pdir.exec_error_path(), errno.to_string());
-                    let _ = fs::write(pdir.status_path(), "exited(127)");
+                    let _ = pdir.write_status("exited(127)");
                     unsafe { libc::_exit(127) };
                 }
                 gc_pid => {
@@ -285,13 +285,20 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
                     // sees EOF if the grandchild dies before signaling.
                     unsafe { libc::close(ready_write) };
 
-                    // Report PIDs
-                    write_pid_to_pipe(sync_write, gc_pid);
-                    unsafe { libc::close(sync_write) };
-
+                    // Record the runner/holder PIDs BEFORE signaling the parent.
+                    // The parent writes the command's pid file only after reading
+                    // this signal, and `run` polls only after that — so recording
+                    // runner_pid first guarantees resolve_state sees a runner
+                    // whenever it sees the command. Otherwise a command that exits
+                    // in the gap between the signal and this write is seen as dead
+                    // with no runner recorded, and self-heals to exited(unknown).
                     let runner_pid = unsafe { libc::getpid() };
                     let _ = fs::write(pdir.runner_pid_path(), runner_pid.to_string());
                     let _ = fs::write(pdir.stdin_holder_path(), holder_pid.to_string());
+
+                    // Report PIDs
+                    write_pid_to_pipe(sync_write, gc_pid);
+                    unsafe { libc::close(sync_write) };
 
                     // Wait for the grandchild to exit
                     let mut wstatus: i32 = 0;
@@ -305,7 +312,7 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
                         "exited(unknown)".to_string()
                     };
 
-                    let _ = fs::write(pdir.status_path(), status_line);
+                    let _ = pdir.write_status(&status_line);
                     let _ = fs::write(pdir.ended_path(), unix_timestamp().to_string());
 
                     // Clean up holder

@@ -421,6 +421,30 @@ fn run_backgrounds_when_it_outlives_the_timeout() {
 }
 
 #[test]
+fn concurrent_fast_runs_never_self_heal_to_unknown() {
+    // Regression for a status-file race: a torn read (empty file mid-write) or a
+    // self-heal during the runner-pid write window could report a cleanly-exited
+    // process as exited(unknown)/null. Hammer many fast runs concurrently; every
+    // one must return its true exit code, never null.
+    let runtime = Runtime::new("concurrent-exit");
+    thread::scope(|scope| {
+        for _ in 0..16 {
+            scope.spawn(|| {
+                for _ in 0..20 {
+                    let resp = runtime.serve(
+                        json!({"action": "run", "command": ["sh", "-c", "exit 7"]}),
+                        &[],
+                    );
+                    assert_eq!(resp["type"], "completed", "{resp}");
+                    assert_eq!(resp["exit_code"], 7, "{resp}");
+                    assert!(resp["signal"].is_null(), "{resp}");
+                }
+            });
+        }
+    });
+}
+
+#[test]
 fn run_reports_signal_termination_structurally() {
     let runtime = Runtime::new("run-signal");
     let resp = runtime.serve(

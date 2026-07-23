@@ -129,6 +129,18 @@ impl ProcessDir {
         self.dir.join("exec_error")
     }
 
+    /// Atomically replace the status file: write a pid-unique temp, then rename
+    /// it over `status`. rename(2) is atomic on POSIX, so a concurrent reader
+    /// always sees a complete old or new value — never the empty window a plain
+    /// truncating write exposes (an empty read parses as `ExitedUnknown` and
+    /// would mask a clean exit code).
+    pub fn write_status(&self, status: &str) -> std::io::Result<()> {
+        let pid = unsafe { libc::getpid() };
+        let tmp = self.dir.join(format!("status.{pid}.tmp"));
+        fs::write(&tmp, status)?;
+        fs::rename(&tmp, self.status_path())
+    }
+
     /// Read the status string from the status file.
     pub fn read_status(&self) -> Result<ProcessState> {
         let s =
@@ -420,5 +432,52 @@ mod tests {
         assert!(err.contains("is not a directory"), "{err}");
 
         fs::remove_file(base).unwrap();
+    }
+
+    #[test]
+    fn write_status_is_atomic_under_concurrent_reads() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        // A plain truncate+write status update lets a concurrent reader observe
+        // an empty file, which ProcessState::parse decodes as ExitedUnknown —
+        // masking a real exit code. write_status renames into place, so a reader
+        // only ever sees a value that was actually written. This test fails if
+        // write_status is made non-atomic.
+        let base = temp_path("atomic-status");
+        let pdir = ProcessDir::new(&base, "0badf00d");
+        fs::create_dir_all(&pdir.dir).unwrap();
+        pdir.write_status("running").unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer_stop = Arc::clone(&stop);
+        let writer_dir = base.clone();
+        let writer = std::thread::spawn(move || {
+            let wp = ProcessDir::new(&writer_dir, "0badf00d");
+            let mut i = 0u64;
+            while !writer_stop.load(Ordering::Relaxed) {
+                let s = if i % 2 == 0 { "running" } else { "exited(7)" };
+                wp.write_status(s).unwrap();
+                i += 1;
+            }
+        });
+
+        // Every observed state must be one we actually wrote — never
+        // ExitedUnknown, which is what a torn/empty read decodes to.
+        for n in 0..100_000u64 {
+            match pdir.read_status().unwrap() {
+                ProcessState::Running | ProcessState::Exited(7) => {}
+                other => {
+                    stop.store(true, Ordering::Relaxed);
+                    let _ = writer.join();
+                    let _ = fs::remove_dir_all(&base);
+                    panic!("torn read observed unwritten state {other:?} after {n} reads");
+                }
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        fs::remove_dir_all(base).unwrap();
     }
 }

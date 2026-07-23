@@ -83,7 +83,7 @@ fn resolve_state(pdir: &ProcessDir) -> Option<ProcessState> {
     if runner_alive {
         Some(ProcessState::Running)
     } else {
-        let _ = fs::write(pdir.status_path(), "exited(unknown)");
+        let _ = pdir.write_status("exited(unknown)");
         let _ = fs::write(pdir.ended_path(), unix_timestamp().to_string());
         Some(ProcessState::ExitedUnknown)
     }
@@ -789,7 +789,7 @@ pub fn kill(id: &str) -> Response {
 
     if !sent {
         // Process already dead — just update state
-        let _ = fs::write(pdir.status_path(), "exited(killed)");
+        let _ = pdir.write_status("exited(killed)");
         let _ = fs::write(pdir.ended_path(), unix_timestamp().to_string());
         return Response::Killed { id: id.to_string() };
     }
@@ -811,7 +811,7 @@ pub fn kill(id: &str) -> Response {
         thread::sleep(Duration::from_millis(50));
     }
 
-    let _ = fs::write(pdir.status_path(), "exited(killed)");
+    let _ = pdir.write_status("exited(killed)");
     let _ = fs::write(pdir.ended_path(), unix_timestamp().to_string());
 
     Response::Killed { id: id.to_string() }
