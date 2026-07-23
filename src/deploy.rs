@@ -7,7 +7,7 @@ use crate::protocol::{ErrorCode, PROTOCOL_VERSION, Response};
 use crate::ssh::{RemoteArgs, ssh_command, ssh_exec};
 
 const RELEASE_BASE_URL: &str = "https://github.com/kwinsch/rem-exec/releases/download";
-const SUPPORTED_ARCHES: &[&str] = &["x86_64", "aarch64", "riscv64"];
+const SUPPORTED_ARCHES: &[&str] = &["x86_64", "aarch64", "riscv64", "armv7"];
 
 /// Result of a successful deployment.
 pub struct DeployResult {
@@ -170,6 +170,9 @@ fn normalize_arch(raw: &str) -> Option<&'static str> {
         "x86_64" | "amd64" => Some("x86_64"),
         "aarch64" | "arm64" => Some("aarch64"),
         "riscv64" | "riscv64gc" => Some("riscv64"),
+        // 32-bit ARMv7 hard-float. `uname -m` reports armv7l; armv6 is NOT
+        // mapped (an armv7 binary won't run there) so it fails as unsupported.
+        "armv7" | "armv7l" | "arm" | "armhf" => Some("armv7"),
         _ => None,
     }
 }
@@ -420,6 +423,9 @@ mod tests {
         assert_eq!(normalize_arch("amd64"), Some("x86_64"));
         assert_eq!(normalize_arch("arm64"), Some("aarch64"));
         assert_eq!(normalize_arch("riscv64gc"), Some("riscv64"));
+        assert_eq!(normalize_arch("armv7l"), Some("armv7"));
+        assert_eq!(normalize_arch("arm"), Some("armv7"));
+        assert_eq!(normalize_arch("armv6l"), None); // armv6 can't run armv7 builds
         assert_eq!(normalize_arch("sparc64"), None);
     }
 

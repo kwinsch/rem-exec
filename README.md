@@ -26,7 +26,7 @@ verbatim — there is no remote shell to escape or inject into.
 - **Bidirectional pipe mode** — `stdin→remote`, `remote stdout→local stdout`
 - **Auto-deploy** — detects remote architecture, deploys the correct binary
 - **Connection reuse** — SSH multiplexing across operations to a host
-- **Multi-arch** — static musl binaries for x86_64, aarch64, riscv64
+- **Multi-arch** — static musl binaries for x86_64, aarch64, riscv64, armv7
 - **Embedded skill file** — `rx skill` prints complete machine-readable docs
 
 ## Install
@@ -102,7 +102,7 @@ Communication flows over SSH. No custom ports, no daemons to manage on the remot
 ## Distribution
 
 - crates.io: `cargo install rem-exec`
-- GitHub Releases: static `rx` and `rxd` binaries for x86_64, aarch64, and riscv64
+- GitHub Releases: static `rx` and `rxd` binaries for x86_64, aarch64, riscv64, and armv7
 - Auto-deploy cache: `~/.local/share/rem-exec/bin/rxd-{arch}` (`rx setup`)
 
 Release downloads include `SHA256SUMS`. Verify downloaded assets before use in

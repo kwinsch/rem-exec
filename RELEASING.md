@@ -9,7 +9,7 @@ carry assets whose hashes match — build and checksum *before* publishing.
 
 - musl cross toolchain on PATH (see `MUSL_PATH` in `.cargo/config.toml`):
   `export PATH="$MUSL_PATH:$PATH"`
-- rustup targets: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `riscv64gc-unknown-linux-musl`
+- rustup targets: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `riscv64gc-unknown-linux-musl`, `armv7-unknown-linux-musleabihf`
 - `.cargo/config.toml` sets the per-target musl linkers.
 
 ## Build (all arches, fully static)
@@ -21,13 +21,15 @@ static-portability guarantee and auto-deploy onto hosts without musl.
 ```bash
 export PATH="$MUSL_PATH:$PATH"
 export RUSTFLAGS="-C target-feature=+crt-static"
-for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl riscv64gc-unknown-linux-musl; do
+for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl riscv64gc-unknown-linux-musl armv7-unknown-linux-musleabihf; do
   cargo build --release --target "$t"
 done
 ```
 
 Stage + strip with the arch-specific `strip`, using the release asset names
-(`rx-<arch>`, `rxd-<arch>` where `<arch>` ∈ x86_64/aarch64/riscv64):
+(`rx-<arch>`, `rxd-<arch>` where `<arch>` ∈ x86_64/aarch64/riscv64/armv7; note
+the armv7 asset comes from the `armv7-unknown-linux-musleabihf` target and its
+`arm-linux-musleabihf-strip`):
 
 ```bash
 # e.g. aarch64-linux-musl-strip on target/aarch64-unknown-linux-musl/release/{rx,rxd}
