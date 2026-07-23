@@ -57,6 +57,11 @@ pub fn serve() -> ExitCode {
             distro_version: id.distro_version,
         });
     }
+    // Get streams raw file bytes on stdout (after a JSON header), so it can't go
+    // through emit(); it also needs no state dir. Handle it here like version.
+    if let Request::Get { path } = &request {
+        return serve_get(path);
+    }
 
     let base = remote_base();
     if let Err(e) = ensure_base_dir(&base) {
@@ -115,7 +120,9 @@ pub fn serve() -> ExitCode {
         Request::Kill { id } => actions::kill(&id),
         Request::List => actions::list(),
         Request::Clean => actions::clean(),
-        Request::Version | Request::Ping => unreachable!("handled above"),
+        Request::Version | Request::Ping | Request::Get { .. } => {
+            unreachable!("handled above")
+        }
     };
 
     emit(response)
@@ -143,14 +150,81 @@ fn drain<R: Read>(reader: &mut R) {
 }
 
 fn emit(response: Response) -> ExitCode {
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    write_line(&mut lock, response)
+}
+
+/// Write one JSON response line to `out`. Transport success is exit 0; the
+/// success/failure of the operation is carried in the JSON itself.
+fn write_line<W: Write>(out: &mut W, response: Response) -> ExitCode {
     let json = serde_json::to_string(&response).unwrap_or_else(|e| {
         format!("{{\"type\":\"error\",\"message\":\"serialize failed: {e}\"}}")
     });
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    let _ = lock.write_all(json.as_bytes());
-    let _ = lock.write_all(b"\n");
-    let _ = lock.flush();
-    // Transport success is exit 0; success/failure is carried in the JSON.
+    let _ = out.write_all(json.as_bytes());
+    let _ = out.write_all(b"\n");
+    let _ = out.flush();
     ExitCode::SUCCESS
+}
+
+/// Stream a remote file to stdout: a `GetStream` header line (size + mode), then
+/// exactly `size` raw bytes. On open/stat failure, a single `Error` line and no
+/// body. A read error mid-stream simply ends the body short — the client's
+/// received-vs-declared check rejects the partial file.
+fn serve_get(path: &str) -> ExitCode {
+    use std::os::unix::fs::PermissionsExt;
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => return write_line(&mut out, get_open_error(path, &e)),
+    };
+    let meta = match f.metadata() {
+        Ok(m) if m.is_file() => m,
+        Ok(_) => {
+            return write_line(
+                &mut out,
+                Response::error_code(ErrorCode::BadRequest, format!("not a regular file: {path}")),
+            );
+        }
+        Err(e) => {
+            return write_line(
+                &mut out,
+                Response::error_code(ErrorCode::Internal, format!("stat {path}: {e}")),
+            );
+        }
+    };
+
+    let header = Response::GetStream {
+        size: meta.len(),
+        mode: meta.permissions().mode() & 0o777,
+    };
+    let json = serde_json::to_string(&header).unwrap_or_default();
+    if out.write_all(json.as_bytes()).is_err() || out.write_all(b"\n").is_err() {
+        return ExitCode::FAILURE;
+    }
+    match std::io::copy(&mut f, &mut out) {
+        Ok(_) => {
+            let _ = out.flush();
+            ExitCode::SUCCESS
+        }
+        Err(_) => ExitCode::FAILURE,
+    }
+}
+
+/// Map a file-open error to a typed response for the `get` header.
+fn get_open_error(path: &str, e: &std::io::Error) -> Response {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::NotFound => {
+            Response::error_code(ErrorCode::NotFound, format!("no such file: {path}"))
+        }
+        ErrorKind::PermissionDenied => Response::error_code(
+            ErrorCode::BadRequest,
+            format!("cannot read {path}: permission denied"),
+        ),
+        _ => Response::error_code(ErrorCode::Internal, format!("open {path}: {e}")),
+    }
 }

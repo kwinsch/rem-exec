@@ -88,6 +88,32 @@ pub fn serve_request_stream(
     parse_serve_output(child.wait_with_output().map_err(RemExecError::Io)?)
 }
 
+/// Spawn `rxd serve` for a streaming *download*: write the request line, then
+/// hand back the child so the caller reads the response (a JSON header line,
+/// then raw bytes) from its stdout. The download mirror of
+/// [`serve_request_stream`], where the payload comes back on stdout instead of
+/// going up on stdin.
+pub fn serve_stream_download(host: &str, request: &Request) -> Result<Child> {
+    let mut child = ssh_command(host)
+        .arg(REMOTE_BIN)
+        .arg("serve")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(RemExecError::Io)?;
+
+    {
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        let mut line = serde_json::to_vec(request)?;
+        line.push(b'\n');
+        stdin.write_all(&line)?;
+        // Drop stdin (EOF) so rxd serve stops reading and starts responding.
+    }
+
+    Ok(child)
+}
+
 /// Validate an `ssh ... serve` invocation and decode its single JSON response.
 fn parse_serve_output(output: Output) -> Result<Response> {
     if !output.status.success() {

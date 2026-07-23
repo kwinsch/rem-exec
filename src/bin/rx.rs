@@ -181,6 +181,16 @@ enum Command {
         #[arg(long)]
         group: Option<String>,
     },
+    /// Download a remote file to a local path (atomic; verifies full size)
+    Get {
+        /// Source as HOST:REMOTE_PATH
+        remote: String,
+        /// Local destination file path
+        local: String,
+        /// Mode in octal for the local file, e.g. 0644 (default: source's mode)
+        #[arg(long)]
+        mode: Option<String>,
+    },
     /// Download static rxd binaries into the local deploy cache
     Setup {
         /// Release tag or version (default: current rx version)
@@ -254,6 +264,16 @@ fn main() -> ExitCode {
     // auto-deploy like other remote commands.
     if let Command::Ping { host } = &cli.command {
         return dispatch_simple(host, &Request::Ping, &[]);
+    }
+
+    // Get streams a remote file down directly over SSH (not through the daemon).
+    if let Command::Get {
+        remote,
+        local,
+        mode,
+    } = &cli.command
+    {
+        return do_get(remote, local, mode.as_deref());
     }
 
     // Setup is always local: it populates the rxd deploy cache.
@@ -543,6 +563,7 @@ fn route_via_ssh(command: &Command) -> ExitCode {
 
         Command::Deploy { .. }
         | Command::Ping { .. }
+        | Command::Get { .. }
         | Command::Cp { .. }
         | Command::Setup { .. }
         | Command::Skill
@@ -647,6 +668,175 @@ fn do_cp(
         Err(e) if rem_exec::deploy::auto_deploy_enabled() && rem_exec::deploy::should_auto_deploy(&e) => {
             match rem_exec::deploy::deploy_to_host(host) {
                 Ok(_) => send(),
+                Err(de) => Err(rem_exec::error::RemExecError::Ssh(format!(
+                    "auto-deploy to {host} failed: {de} (original: {e})"
+                ))),
+            }
+        }
+        other => other,
+    };
+
+    match result {
+        Ok(resp) => {
+            print_json_response(&resp);
+            exit_for(&resp)
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Outcome of streaming a download body into a local file.
+#[derive(Debug)]
+enum ReceiveError {
+    /// Fewer bytes arrived than declared — the partial file was discarded.
+    Incomplete { expected: u64, got: u64 },
+    /// Local I/O failure (temp create, write, fsync, rename).
+    Io(std::io::Error),
+}
+
+/// Stream exactly `size` bytes from `src` into `dest`, atomically: a private
+/// temp in the destination directory, verify the full size arrived, fsync, set
+/// `mode`, then rename into place. A short stream leaves no file behind — the
+/// mirror of the remote-side guarantee in `cp`.
+fn receive_file<R: std::io::Read>(
+    src: &mut R,
+    dest: &std::path::Path,
+    size: u64,
+    mode: u32,
+) -> Result<u64, ReceiveError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let dir = match dest.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let tmp = dir.join(format!(".rxd-get-{}.tmp", std::process::id()));
+
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(ReceiveError::Io)?;
+
+    let copied = match std::io::copy(&mut (&mut *src).take(size), &mut f) {
+        Ok(n) => n,
+        Err(e) => {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(ReceiveError::Io(e));
+        }
+    };
+    if copied != size {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ReceiveError::Incomplete {
+            expected: size,
+            got: copied,
+        });
+    }
+
+    let finish = || -> std::io::Result<()> {
+        f.sync_all()?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        drop(f);
+        std::fs::rename(&tmp, dest)
+    };
+    if let Err(e) = finish() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ReceiveError::Io(e));
+    }
+    Ok(copied)
+}
+
+/// Download HOST:PATH to a local file, streaming and atomic, with the same
+/// completeness guarantee as `cp`. Honors auto-deploy like other commands.
+fn do_get(remote: &str, local: &str, mode: Option<&str>) -> ExitCode {
+    use rem_exec::protocol::ErrorCode;
+    use std::io::{BufRead, Read};
+
+    let (host, path) = match remote.split_once(':') {
+        Some((h, p)) if !h.is_empty() && !p.is_empty() => (h, p),
+        _ => {
+            eprintln!("error: source must be HOST:PATH");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mode_override = match mode {
+        Some(s) => match parse_mode(s) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    let request = Request::Get {
+        path: path.to_string(),
+    };
+
+    let fetch = || -> rem_exec::error::Result<Response> {
+        let mut child = rem_exec::ssh::serve_stream_download(host, &request)?;
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let mut stderr = child.stderr.take().expect("stderr was piped");
+        let mut reader = std::io::BufReader::new(stdout);
+
+        let mut line = Vec::new();
+        reader.read_until(b'\n', &mut line).map_err(rem_exec::error::RemExecError::Io)?;
+        if line.is_empty() {
+            // No response — likely a missing/old rxd; surface ssh stderr so the
+            // auto-deploy classifier can see "No such file".
+            let mut err = String::new();
+            let _ = stderr.read_to_string(&mut err);
+            let _ = child.wait();
+            return Err(rem_exec::error::RemExecError::Ssh(format!(
+                "no response from remote: {}",
+                err.trim()
+            )));
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        let header: Response = serde_json::from_slice(&line)
+            .map_err(|e| rem_exec::error::RemExecError::Protocol(format!("invalid header from remote: {e}")))?;
+
+        match header {
+            Response::Error { .. } => {
+                let _ = child.wait();
+                Ok(header) // typed error (not_found, etc.) — print as-is
+            }
+            Response::GetStream { size, mode: src_mode } => {
+                let applied = mode_override.unwrap_or(src_mode);
+                let outcome = receive_file(&mut reader, std::path::Path::new(local), size, applied);
+                let _ = child.wait();
+                match outcome {
+                    Ok(bytes) => Ok(Response::Got {
+                        path: local.to_string(),
+                        bytes,
+                        mode: Some(applied),
+                    }),
+                    Err(ReceiveError::Incomplete { expected, got }) => Ok(Response::error_code(
+                        ErrorCode::IncompleteTransfer,
+                        format!("incomplete transfer from {path}: expected {expected} bytes, received {got}"),
+                    )),
+                    Err(ReceiveError::Io(e)) => Err(rem_exec::error::RemExecError::Io(e)),
+                }
+            }
+            _ => Err(rem_exec::error::RemExecError::Protocol(
+                "unexpected header type from remote".to_string(),
+            )),
+        }
+    };
+
+    let result = match fetch() {
+        Err(e) if rem_exec::deploy::auto_deploy_enabled() && rem_exec::deploy::should_auto_deploy(&e) => {
+            match rem_exec::deploy::deploy_to_host(host) {
+                Ok(_) => fetch(),
                 Err(de) => Err(rem_exec::error::RemExecError::Ssh(format!(
                     "auto-deploy to {host} failed: {de} (original: {e})"
                 ))),
@@ -842,6 +1032,7 @@ fn route_via_daemon(command: &Command) -> ExitCode {
         Command::Clean { host } => DaemonRequest::Clean { host: host.clone() },
         Command::Deploy { .. }
         | Command::Ping { .. }
+        | Command::Get { .. }
         | Command::Cp { .. }
         | Command::Setup { .. }
         | Command::Skill
@@ -931,5 +1122,71 @@ fn report(result: rem_exec::error::Result<()>) -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rx-receive-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn receive_file_writes_full_stream_atomically_with_mode() {
+        let dir = test_dir("full");
+        let dest = dir.join("out.bin");
+        let data = b"complete payload\x00\xff\x01";
+        let mut src = Cursor::new(data.to_vec());
+
+        let n = receive_file(&mut src, &dest, data.len() as u64, 0o640).unwrap();
+
+        assert_eq!(n, data.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+        let mode = std::fs::symlink_metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn receive_file_rejects_short_stream_and_leaves_no_file() {
+        let dir = test_dir("short");
+        let dest = dir.join("out.bin");
+        let data = b"only a few bytes";
+        let mut src = Cursor::new(data.to_vec());
+
+        // Declare more than the source provides — a dropped-connection stand-in.
+        let err = receive_file(&mut src, &dest, (data.len() + 100) as u64, 0o644).unwrap_err();
+
+        match err {
+            ReceiveError::Incomplete { expected, got } => {
+                assert_eq!(expected, (data.len() + 100) as u64);
+                assert_eq!(got, data.len() as u64);
+            }
+            ReceiveError::Io(e) => panic!("expected Incomplete, got Io({e})"),
+        }
+        assert!(!dest.exists(), "no file must be installed after a short stream");
+        let tmp = dir.join(format!(".rxd-get-{}.tmp", std::process::id()));
+        assert!(!tmp.exists(), "temp must be cleaned up");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn receive_file_handles_empty_stream() {
+        let dir = test_dir("empty");
+        let dest = dir.join("out.bin");
+        let mut src = Cursor::new(Vec::new());
+
+        let n = receive_file(&mut src, &dest, 0, 0o644).unwrap();
+
+        assert_eq!(n, 0);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

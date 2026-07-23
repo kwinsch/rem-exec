@@ -18,6 +18,10 @@ verbatim — there is no remote shell to escape or inject into.
 - **Text-native output** — UTF-8 output is returned as text; only real binary is
   base64-encoded (`encoding` field says which)
 - **Structured results** — integer exit codes, signal numbers, typed error codes
+- **Safe file transfer** — `rx cp`/`rx get` stream whole files both ways with
+  constant memory and no size cap; the receiver verifies the full byte count
+  before an atomic rename, so a dropped connection never installs a truncated
+  file (safe for large SQL/DB copies)
 - **Stdin piping** — stream scripts, configs, or binary blobs unbounded
 - **Bidirectional pipe mode** — `stdin→remote`, `remote stdout→local stdout`
 - **Auto-deploy** — detects remote architecture, deploys the correct binary
@@ -69,6 +73,10 @@ rx stdout host "$id" --offset 0
 # Pipe a script (no escaping needed); bidirectional pipe
 cat script.sh | rx start host -- sh
 echo "input" | rx start --pipe host -- ./process.sh
+
+# Transfer whole files both ways (size-verified atomic write; safe for big files)
+rx cp ./app.conf host:/etc/app/app.conf --mode 0640
+rx get host:/var/backups/appdb.dump ./appdb.dump
 ```
 
 ## Agent usage

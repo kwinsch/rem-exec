@@ -19,14 +19,28 @@ Shipped since 0.2.0:
   (`command_not_found`/`permission_denied`/`exec_format_error`/`errno_<n>`) with
   exit_code+signal null and a `rx: exec …` stderr line; `status` shows
   `exec_failed(reason)`. Distinguishes "tool isn't there" from a real 127.
+- `rx ping HOST` — reachability + host identity `{version, protocol, arch, os,
+  kernel, hostname, distro_id?, distro_version?}`, gathered natively in rxd
+  (`uname(2)` + `/etc/os-release`, no remote shell). Pure probe, no state dir;
+  honors auto-deploy (unset → `not_deployed` is the "deploy needed" signal). The
+  distro fields are the useful bit (apk vs apt; Alpine ships busybox ash).
+- Status-file race fix — status writes are atomic (temp→rename), so a concurrent
+  poll never reads a truncated status and mis-reports a clean exit as
+  `exited(unknown)`/null.
+- Transfer completeness (cp + get) — the sender declares the byte count; the
+  receiver installs the file (atomic temp→rename) only if exactly that many
+  bytes arrive, else `incomplete_transfer`. Closes cp's old truncation gap (a
+  dropped connection could atomically install a short file) and makes big SQL/DB
+  copies safe both directions over flaky links. Constant memory, no size cap.
+  Boundary: rx moves bytes faithfully, it does not snapshot a live DB — dump
+  first (`sqlite3 .backup`, `pg_dump`).
+- `rx get HOST:PATH LOCAL [--mode]` — streaming download, atomic local
+  temp→rename, size-verified, source mode preserved unless overridden. rxd sends
+  a one-line JSON header (size/mode or a typed error) then raw bytes; no base64.
 
 Everything below is proposed, not committed. Ordered by agent-experience value.
 
 ## Nice-to-have
-
-### 1. `rx get HOST:PATH LOCAL`
-Reverse of `cp`: stream a remote file down. Pairs with `cp` for round-tripping
-config/artifacts.
 
 ### `rx which HOST name...`  (companion to ping)
 Stateless per-call tool-availability probe: rxd walks `$PATH` in Rust (no remote
@@ -34,43 +48,19 @@ shell) and returns `{name: path|null}`. Agent passes the tools it needs for the
 task; no persistent "preferred tools" config (that drifts toward desired-state).
 Kept separate from ping (ping is a fixed cheap round trip; which takes a list).
 
-### 2. Merged stdout+stderr view
-Optional interleaved capture so causality (which line came before which) is
-preserved for debugging. `run --merge`, or a combined field / a third capture
-file written with a tee.
-
-### 3. `rx ping HOST` — SHIPPED
-Reachability + host identity in one round trip: `{version, protocol, arch, os,
-kernel, hostname, distro_id?, distro_version?}`, gathered natively in rxd
-(`uname(2)` + `/etc/os-release`, no remote shell). Pure probe, no state dir;
-honors auto-deploy like other commands (unset → `not_deployed` is the "deploy
-needed" signal). The distro fields are the useful bit (apk vs apt; Alpine ships
-busybox ash, no bash). The tool-availability probe (`rx which`) stays a separate
-verb (see above).
-
-### 4. Idempotency keys
+### Idempotency keys
 Optional client-supplied key on `run`/`start` so a retried request after a
 dropped connection reconciles to the same process instead of double-launching.
 
-### 5. Batch / sequence
-`run` a list of commands, stop on first non-zero, return per-step results —
-or just document the "pipe a script to `sh`" pattern as the intended answer.
+## Ruled out (anti-creep)
 
-### 6. Payload compression (cp + large reads)
-Compress large text payloads on the wire — real win over WireGuard between sites.
-Position, not yet decided:
-- Do NOT make a C `zstd` dependency the default: it fights the tool's core value
-  (zero-C-dep, trivially static-musl for x86_64/aarch64/riscv64) and adds a codec
-  attack surface. libzstd via `cc` complicates the riscv64/aarch64 musl builds.
-- Free ~80% of the benefit first: SSH already compresses, and rx owns the ssh
-  invocation — add `-o Compression=yes` (opt-in `--compress`, or default-on for
-  `cp`). zlib is weaker than zstd but costs nothing and works today.
-- If we want zstd specifically, put it behind a cargo feature flag with a
-  per-payload `compression: none|zstd` wire marker (mirrors the utf8/base64
-  `encoding` field), applied to both `cp` bodies and large output reads — not
-  just cp. Keep the default build dependency-free. zstd's stored-block behavior
-  means already-compressed data isn't penalized, so "always on when enabled" is
-  safe.
+- Batch / sequence orchestration — document the pipe-a-script-to-`sh` pattern
+  instead; building it re-invents a shell.
+- Merged stdout+stderr view — split streams are fine for agents.
+- Payload compression by default — keep the zero-C-dep static-musl story; SSH
+  already compresses the channel, and rx owns the ssh invocation if we ever want
+  to turn `-o Compression=yes` on. No C `zstd` dependency in the default build.
+- Config-management / desired-state DSL — rx stays an imperative primitive.
 
 ## Maybe / later
 

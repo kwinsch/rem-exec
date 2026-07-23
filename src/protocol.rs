@@ -96,6 +96,12 @@ pub enum Request {
     Kill {
         id: String,
     },
+    /// Stream a remote file down. The response is a one-line `GetStream` header
+    /// (or an `Error`), followed on success by exactly `size` raw bytes on
+    /// stdout — the reverse of `Put`, whose payload rides up on stdin.
+    Get {
+        path: String,
+    },
     List,
     Clean,
     Version,
@@ -225,6 +231,21 @@ pub enum Response {
 
     #[serde(rename = "copied")]
     Copied {
+        path: String,
+        bytes: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<u32>,
+    },
+
+    /// `get` header line, written before the raw file bytes: the client reads
+    /// exactly `size` bytes next. `mode` is the source file's permission bits.
+    #[serde(rename = "get_stream")]
+    GetStream { size: u64, mode: u32 },
+
+    /// `get` final result, synthesized by the client after the local file is
+    /// verified (`bytes == size`) and atomically renamed into place.
+    #[serde(rename = "got")]
+    Got {
         path: String,
         bytes: u64,
         #[serde(skip_serializing_if = "Option::is_none")]

@@ -71,6 +71,34 @@ impl Runtime {
         self.serve(json!({"action": "status", "id": id}), &[])
     }
 
+    /// Drive a `get`: send the request, then split the raw stdout into the JSON
+    /// header line and the raw body bytes that follow it.
+    fn serve_get(&self, path: &str) -> (Value, Vec<u8>) {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_rxd"))
+            .arg("serve")
+            .env("XDG_RUNTIME_DIR", &self.dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            let req = json!({"action": "get", "path": path});
+            stdin.write_all(req.to_string().as_bytes()).unwrap();
+            stdin.write_all(b"\n").unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        let nl = out
+            .stdout
+            .iter()
+            .position(|&b| b == b'\n')
+            .expect("get response had no header newline");
+        let header: Value = serde_json::from_slice(&out.stdout[..nl]).unwrap();
+        let body = out.stdout[nl + 1..].to_vec();
+        (header, body)
+    }
+
     fn pipe_stdin(&self, id: &str, input: &[u8]) -> Output {
         let mut child = Command::new(env!("CARGO_BIN_EXE_rxd"))
             .args(["pipe-stdin", id])
@@ -570,6 +598,67 @@ fn put_accepts_matching_declared_size() {
     assert_eq!(resp["type"], "copied", "{resp}");
     assert_eq!(resp["bytes"].as_u64(), Some(payload.len() as u64));
     assert_eq!(fs::read(&target).unwrap(), payload);
+}
+
+#[test]
+fn get_streams_file_with_header_and_bytes() {
+    let runtime = Runtime::new("get-basic");
+    let src = runtime.dir.join("source.txt");
+    let content = b"hello\nremote file\n";
+    fs::write(&src, content).unwrap();
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o640)).unwrap();
+
+    let (header, body) = runtime.serve_get(src.to_str().unwrap());
+
+    assert_eq!(header["type"], "get_stream", "{header}");
+    assert_eq!(header["size"].as_u64(), Some(content.len() as u64));
+    assert_eq!(header["mode"].as_u64(), Some(0o640));
+    assert_eq!(body, content);
+}
+
+#[test]
+fn get_streams_binary_bytes_verbatim() {
+    // No encoding step: raw bytes down the wire, so NUL/high bytes survive.
+    let runtime = Runtime::new("get-binary");
+    let src = runtime.dir.join("blob.bin");
+    let content: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+    fs::write(&src, &content).unwrap();
+
+    let (header, body) = runtime.serve_get(src.to_str().unwrap());
+
+    assert_eq!(header["type"], "get_stream", "{header}");
+    assert_eq!(header["size"].as_u64(), Some(4096));
+    assert_eq!(body, content);
+}
+
+#[test]
+fn get_missing_file_is_typed_not_found() {
+    let runtime = Runtime::new("get-missing");
+    let (header, body) = runtime.serve_get(runtime.dir.join("nope").to_str().unwrap());
+
+    assert_eq!(header["type"], "error", "{header}");
+    assert_eq!(header["code"], "not_found", "{header}");
+    assert!(body.is_empty(), "an error header carries no body");
+}
+
+#[test]
+fn get_directory_is_rejected() {
+    let runtime = Runtime::new("get-dir");
+    let (header, _) = runtime.serve_get(runtime.dir.to_str().unwrap());
+    assert_eq!(header["type"], "error", "{header}");
+}
+
+#[test]
+fn get_empty_file_yields_zero_length_stream() {
+    let runtime = Runtime::new("get-empty");
+    let src = runtime.dir.join("empty");
+    fs::write(&src, b"").unwrap();
+
+    let (header, body) = runtime.serve_get(src.to_str().unwrap());
+
+    assert_eq!(header["type"], "get_stream", "{header}");
+    assert_eq!(header["size"].as_u64(), Some(0));
+    assert!(body.is_empty());
 }
 
 #[test]

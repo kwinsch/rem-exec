@@ -46,6 +46,7 @@ that substrate:
   list HOST
   clean HOST
   cp    LOCAL HOST:PATH [--mode OCTAL] [--owner USER] [--group GRP]
+  get   HOST:PATH LOCAL [--mode OCTAL]
   ping  HOST
   deploy HOST
   setup [--version V] [--arch ARCH]... [--force]
@@ -59,9 +60,16 @@ Notes:
 - --cwd and --env set the working directory and environment directly, so you
   don't need a `sh -c 'cd DIR && K=V ...'` wrapper. --env is repeatable and its
   overrides layer on the inherited environment.
-- cp writes atomically: the file streams to a temp file, gets its mode/owner/
-  group, then is renamed into place — it never appears with default perms.
-  --mode always works; --owner/--group need a privileged rxd and error otherwise.
+- cp/get move whole files with constant memory (streamed, no size cap) and are
+  safe on flaky links: the sender declares the byte count and the receiver
+  installs the file (atomic temp→rename) only if exactly that many bytes arrive —
+  a dropped connection yields `incomplete_transfer`, never a truncated file.
+  cp writes to the remote (--mode always works; --owner/--group need a privileged
+  rxd); get writes to the local path and applies the source's mode unless --mode
+  overrides. Both transport bytes faithfully but do NOT snapshot a live database
+  — dump/checkpoint first (e.g. `sqlite3 .backup`, `pg_dump`) before copying.
+- get vs `run -- cat`: use `run cat` to read small contents inline; use get to
+  materialize a large or binary remote file as a real local path efficiently.
 - run: stdin, if piped, is fed to the process, then EOF is sent so readers
   terminate. With no piped stdin, EOF is sent immediately. --keep-stdin-open
   suppresses the EOF. Inline stdin is capped at 4 MiB; larger uses start+pipe.
@@ -93,7 +101,8 @@ stdout/stderr/data fields pair with an `encoding`:
              exit_code|null, signal|null, stdout_size, stderr_size}
   output    {data, encoding, offset, size}
   written   {bytes}          # from close-stdin, bytes:0 means EOF sent
-  copied    {path, bytes, mode?}
+  copied    {path, bytes, mode?}     # cp result (remote file written)
+  got       {path, bytes, mode?}     # get result (local file written)
   killed    {id}
   list      {processes:[{id, state, cmd}]}
   cleaned   {removed:[id...]}
@@ -121,7 +130,8 @@ stdout/stderr/data fields pair with an `encoding`:
 ## Error codes (error.code)
 
   bad_request · invalid_process_id · process_not_found · process_exited ·
-  timeout · not_deployed · unsupported · ssh_unreachable · ssh_auth · internal
+  timeout · not_deployed · unsupported · ssh_unreachable · ssh_auth ·
+  not_found · incomplete_transfer · internal
 
 Branch on code, not message text. `retryable:true` means the same call may
 succeed on retry (e.g. after an auto-deploy, or a transient ssh_unreachable).
@@ -178,3 +188,7 @@ signal that a deploy is needed.
 
   # copy a file into place atomically, perms set before it becomes visible
   rx cp ./app.conf HOST:/etc/app/app.conf --mode 0640
+
+  # pull a file down atomically (size-verified); dump a live DB first
+  rx run HOST -- doas -u postgres pg_dump -Fc appdb -f /tmp/appdb.dump
+  rx get HOST:/tmp/appdb.dump ./appdb.dump
