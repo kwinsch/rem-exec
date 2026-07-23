@@ -38,6 +38,12 @@ pub enum Request {
         /// commands that read stdin don't block waiting for more input).
         #[serde(default)]
         keep_stdin_open: bool,
+        /// When true (default), delete the process dir after a fully-inlined
+        /// `completed` response so short agent runs do not accumulate remote
+        /// state. Skipped when output is truncated (still readable via
+        /// stdout/stderr) or the command is backgrounded (`running`).
+        #[serde(default = "default_true")]
+        ephemeral: bool,
     },
     /// Start a detached process and return its handle immediately.
     Start {
@@ -231,6 +237,10 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ProcessSummary {
     pub id: String,
@@ -257,6 +267,9 @@ pub enum DaemonRequest {
         stdin_b64: Option<String>,
         #[serde(default)]
         keep_stdin_open: bool,
+        /// See [`Request::Run::ephemeral`]. Default true (same as the wire).
+        #[serde(default = "default_true")]
+        ephemeral: bool,
     },
     #[serde(rename = "start")]
     Start {

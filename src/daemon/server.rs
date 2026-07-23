@@ -189,6 +189,7 @@ fn dispatch(
             timeout_ms,
             stdin_b64,
             keep_stdin_open,
+            ephemeral,
         } => {
             let body = stdin_b64
                 .as_deref()
@@ -202,6 +203,7 @@ fn dispatch(
                     env,
                     timeout_ms,
                     keep_stdin_open,
+                    ephemeral,
                 },
                 &body,
             )

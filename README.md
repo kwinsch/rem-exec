@@ -55,7 +55,9 @@ auto-deploy.
 rx deploy host
 
 # Run a command to completion — exit code + output in one JSON response
+# (ephemeral by default: remote process state is removed after a fully-inlined result)
 rx run host -- uname -a
+rx run --keep host -- uname -a   # retain process dir for later stdout/status
 
 # Feed stdin and collect the result together
 printf 'c\na\nb\n' | rx run host -- sort

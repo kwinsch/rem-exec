@@ -17,6 +17,18 @@ const WRITE_STDIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// tail-truncated here and remains fully readable via `read`.
 pub const RUN_INLINE_CAP: u64 = 256 * 1024;
 
+/// Per-stream cap under which an ephemeral `run` may delete the process dir.
+///
+/// Deliberately much smaller than [`RUN_INLINE_CAP`]: a `completed` response can
+/// carry up to 256 KiB, but an agent's tool-output window typically truncates
+/// well before that. If we deleted the dir whenever output merely fit inline,
+/// mid-band output (bigger than the agent sees, smaller than the inline cap)
+/// would be irretrievable — the agent would have to re-run the command, the
+/// exact failure mode this tool exists to remove. So we only delete when the
+/// output is small enough to be seen in full; anything larger keeps its dir so
+/// `rx stdout/stderr --offset` can re-page it.
+pub const RUN_EPHEMERAL_CAP: u64 = 16 * 1024;
+
 /// Default timeout for `run` when the caller doesn't specify one.
 pub const RUN_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
@@ -226,6 +238,10 @@ fn feed_fifo(pdir: &ProcessDir, data: &[u8]) -> std::io::Result<usize> {
 ///
 /// `body` is fed to the process's stdin. Unless `keep_stdin_open` is set, stdin
 /// is closed afterward so commands that read to EOF (cat, sort, sh) terminate.
+///
+/// When `ephemeral` is true (default), a fully-inlined `completed` response
+/// also removes the process directory so short runs do not accumulate state.
+/// Truncated output and `running` handles always keep the directory.
 pub fn run(
     command: &[String],
     cwd: Option<&str>,
@@ -233,6 +249,7 @@ pub fn run(
     timeout_ms: Option<u64>,
     body: &[u8],
     keep_stdin_open: bool,
+    ephemeral: bool,
 ) -> Response {
     if command.is_empty() {
         return Response::error_code(ErrorCode::BadRequest, "run: empty command");
@@ -258,9 +275,59 @@ pub fn run(
 
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(RUN_DEFAULT_TIMEOUT_MS));
     match await_exit_or_timeout(&pdir, timeout) {
-        Some(state) => completed_response(&id, &pdir, &state, run_started.elapsed().as_millis() as u64),
+        Some(state) => {
+            let resp = completed_response(
+                &id,
+                &pdir,
+                &state,
+                run_started.elapsed().as_millis() as u64,
+            );
+            maybe_ephemeral_clean(&pdir, &resp, ephemeral);
+            resp
+        }
         None => running_response(&id, &pdir, timeout),
     }
+}
+
+/// Remove a fully-inlined completed process dir when `ephemeral` is set and the
+/// output is small enough to have been seen in full. Must run after the response
+/// has been built (reads the stream files first).
+///
+/// Kept (not deleted) when output is truncated OR larger than
+/// [`RUN_EPHEMERAL_CAP`] — in both cases the agent may not have the whole output
+/// and needs `rx stdout/stderr --offset` to re-page it rather than re-running.
+fn maybe_ephemeral_clean(pdir: &ProcessDir, resp: &Response, ephemeral: bool) {
+    if !ephemeral {
+        return;
+    }
+    let Response::Completed {
+        stdout_truncated,
+        stderr_truncated,
+        stdout_size,
+        stderr_size,
+        ..
+    } = resp
+    else {
+        return;
+    };
+    if *stdout_truncated || *stderr_truncated {
+        return;
+    }
+    if *stdout_size > RUN_EPHEMERAL_CAP || *stderr_size > RUN_EPHEMERAL_CAP {
+        return;
+    }
+    remove_process_dir(pdir);
+}
+
+/// Tear down any leftover helper PIDs and delete the process directory.
+fn remove_process_dir(pdir: &ProcessDir) {
+    if let Ok(Some(rpid)) = pdir.read_runner_pid() {
+        unsafe { libc::kill(rpid as i32, libc::SIGTERM) };
+    }
+    if let Ok(Some(hpid)) = pdir.read_stdin_holder_pid() {
+        unsafe { libc::kill(hpid as i32, libc::SIGTERM) };
+    }
+    let _ = fs::remove_dir_all(&pdir.dir);
 }
 
 /// Block until an already-started process exits or `timeout_ms` elapses.
@@ -784,13 +851,7 @@ pub fn clean() -> Response {
             if let Some(state) = resolve_state(&pdir)
                 && !matches!(state, ProcessState::Running)
             {
-                if let Ok(Some(rpid)) = pdir.read_runner_pid() {
-                    unsafe { libc::kill(rpid as i32, libc::SIGTERM) };
-                }
-                if let Ok(Some(hpid)) = pdir.read_stdin_holder_pid() {
-                    unsafe { libc::kill(hpid as i32, libc::SIGTERM) };
-                }
-                let _ = fs::remove_dir_all(&pdir.dir);
+                remove_process_dir(&pdir);
                 removed.push(id);
             }
         }

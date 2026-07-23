@@ -143,6 +143,101 @@ fn run_returns_exit_code_and_text_output_in_one_call() {
 }
 
 #[test]
+fn run_ephemeral_by_default_removes_process_dir() {
+    let runtime = Runtime::new("run-ephemeral");
+    let resp = runtime.serve(
+        json!({"action": "run", "command": ["printf", "ok\n"]}),
+        &[],
+    );
+    assert_eq!(resp["type"], "completed", "{resp}");
+    let id = resp["id"].as_str().unwrap();
+
+    // Process dir is gone — status is process_not_found.
+    let status = runtime.status(id);
+    assert_eq!(status["type"], "error", "{status}");
+    assert_eq!(status["code"], "process_not_found");
+    assert!(!runtime.remote_base().join(id).exists());
+}
+
+#[test]
+fn run_keep_retains_process_dir() {
+    let runtime = Runtime::new("run-keep");
+    let resp = runtime.serve(
+        json!({"action": "run", "command": ["printf", "ok\n"], "ephemeral": false}),
+        &[],
+    );
+    assert_eq!(resp["type"], "completed", "{resp}");
+    let id = resp["id"].as_str().unwrap();
+
+    let status = runtime.status(id);
+    assert_eq!(status["type"], "status", "{status}");
+    assert_eq!(status["state"], "exited(0)");
+    assert!(runtime.remote_base().join(id).exists());
+}
+
+#[test]
+fn run_ephemeral_skips_when_truncated() {
+    let runtime = Runtime::new("run-trunc");
+    // Produce more than RUN_INLINE_CAP (256 KiB) so the response is truncated.
+    let resp = runtime.serve(
+        json!({
+            "action": "run",
+            "command": ["dd", "if=/dev/zero", "bs=1024", "count=300", "status=none"],
+            "timeout_ms": 10_000,
+        }),
+        &[],
+    );
+    assert_eq!(resp["type"], "completed", "{resp}");
+    assert_eq!(resp["stdout_truncated"], true, "{resp}");
+    let id = resp["id"].as_str().unwrap();
+
+    // Truncated → dir retained so the agent can drain with --offset.
+    let status = runtime.status(id);
+    assert_eq!(status["type"], "status", "{status}");
+    assert!(runtime.remote_base().join(id).exists());
+}
+
+#[test]
+fn run_ephemeral_keeps_dir_when_inlined_but_over_ephemeral_cap() {
+    // Output between RUN_EPHEMERAL_CAP (16 KiB) and RUN_INLINE_CAP (256 KiB):
+    // fully inlined (not truncated) yet possibly larger than the agent saw, so
+    // the dir must be kept for re-paging rather than deleted.
+    let runtime = Runtime::new("run-midband");
+    let resp = runtime.serve(
+        json!({
+            "action": "run",
+            "command": ["dd", "if=/dev/zero", "bs=1024", "count=64", "status=none"],
+            "timeout_ms": 10_000,
+        }),
+        &[],
+    );
+    assert_eq!(resp["type"], "completed", "{resp}");
+    assert_eq!(resp["stdout_truncated"], false, "{resp}");
+    assert!(resp["stdout_size"].as_u64().unwrap() > 16 * 1024, "{resp}");
+    let id = resp["id"].as_str().unwrap();
+
+    // Kept: still readable, not process_not_found.
+    let status = runtime.status(id);
+    assert_eq!(status["type"], "status", "{status}");
+    assert!(runtime.remote_base().join(id).exists());
+}
+
+#[test]
+fn run_ephemeral_skips_when_backgrounded() {
+    let runtime = Runtime::new("run-bg");
+    let resp = runtime.serve(
+        json!({"action": "run", "command": ["sleep", "10"], "timeout_ms": 150}),
+        &[],
+    );
+    assert_eq!(resp["type"], "running", "{resp}");
+    let id = resp["id"].as_str().unwrap();
+    assert!(runtime.remote_base().join(id).exists());
+
+    runtime.serve(json!({"action": "kill", "id": id}), &[]);
+    wait_for_exit(&runtime, id);
+}
+
+#[test]
 fn run_transports_shell_metacharacters_as_exact_argv() {
     // The payload never touches a shell: JSON stdin transport + direct execvp.
     // A shell-based transport would expand $(...), split on ; and |, and choke

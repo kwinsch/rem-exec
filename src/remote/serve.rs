@@ -57,9 +57,18 @@ pub fn serve() -> ExitCode {
             env,
             timeout_ms,
             keep_stdin_open,
+            ephemeral,
         } => {
             let body = read_to_end(&mut reader);
-            actions::run(&command, cwd.as_deref(), &env, timeout_ms, &body, keep_stdin_open)
+            actions::run(
+                &command,
+                cwd.as_deref(),
+                &env,
+                timeout_ms,
+                &body,
+                keep_stdin_open,
+                ephemeral,
+            )
         }
         Request::Start { command, cwd, env } => {
             // Start does not consume a body here; large stdin uses the dedicated

@@ -28,7 +28,7 @@ that substrate:
 
 ## Commands
 
-  run   HOST [--cwd DIR] [--env K=V]... [--timeout SECS] [--keep-stdin-open] -- CMD...
+  run   HOST [--cwd DIR] [--env K=V]... [--timeout SECS] [--keep-stdin-open] [--keep] -- CMD...
   start HOST [--cwd DIR] [--env K=V]... [--pipe] [--no-close-stdin] -- CMD...
   wait  HOST ID [--timeout SECS]
   status HOST ID
@@ -58,6 +58,12 @@ Notes:
 - run: stdin, if piped, is fed to the process, then EOF is sent so readers
   terminate. With no piped stdin, EOF is sent immediately. --keep-stdin-open
   suppresses the EOF. Inline stdin is capped at 4 MiB; larger uses start+pipe.
+- run is ephemeral by default: a `completed` response whose output is small
+  enough to be seen in full (<=16 KiB/stream) also deletes the remote process dir
+  (no leftover state). The dir is KEPT when output is truncated or larger than
+  that, or when backgrounded (`running`) — so bigger output stays re-pageable via
+  stdout/stderr --offset instead of forcing a re-run. Pass --keep to always
+  retain the dir after a completed run.
 - write TEXT appends a newline unless --raw. With TEXT omitted and stdin piped,
   the stream is forwarded raw and unbounded (binary-safe). close-stdin sends EOF.
 - start --pipe: local stdin → remote stdin and remote stdout → local stdout as
@@ -88,6 +94,8 @@ stdout/stderr/data fields pair with an `encoding`:
   error     {message, code?, retryable?, hint?}
 
 - run and wait yield completed or running. exit_code is null when signal is set.
+- After an ephemeral completed run the process id is still in the response for
+  logging, but status/stdout/stderr for that id return process_not_found.
 - state: running | exited(N) | signaled(N) | exited(killed) | exited(unknown).
 - completed inlines up to the last 256 KiB per stream; when *_truncated is true
   the full output remains readable via stdout/stderr with --offset.

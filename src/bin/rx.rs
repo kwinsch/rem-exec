@@ -51,6 +51,10 @@ enum Command {
         /// Keep stdin open instead of sending EOF after any piped input
         #[arg(long)]
         keep_stdin_open: bool,
+        /// Keep process state after a fully-inlined completed run (default:
+        /// remove the remote process dir so short runs do not accumulate)
+        #[arg(long)]
+        keep: bool,
     },
     /// Start a detached process on a remote host
     Start {
@@ -384,6 +388,7 @@ fn route_via_ssh(command: &Command) -> ExitCode {
             env,
             timeout,
             keep_stdin_open,
+            keep,
         } => {
             let body = match read_inline_stdin() {
                 Ok(b) => b.unwrap_or_default(),
@@ -405,6 +410,7 @@ fn route_via_ssh(command: &Command) -> ExitCode {
                 env,
                 timeout_ms: timeout.map(|s| s.saturating_mul(1000)),
                 keep_stdin_open: *keep_stdin_open,
+                ephemeral: !*keep,
             };
             dispatch_run(host, &request, &body)
         }
@@ -708,6 +714,7 @@ fn route_via_daemon(command: &Command) -> ExitCode {
             env,
             timeout,
             keep_stdin_open,
+            keep,
         } => {
             let stdin_b64 = match read_inline_stdin() {
                 Ok(Some(b)) if !b.is_empty() => Some(rem_exec::base64_encode(&b)),
@@ -732,6 +739,7 @@ fn route_via_daemon(command: &Command) -> ExitCode {
                 timeout_ms: timeout.map(|s| s.saturating_mul(1000)),
                 stdin_b64,
                 keep_stdin_open: *keep_stdin_open,
+                ephemeral: !*keep,
             }
         }
         Command::Wait { host, id, timeout } => DaemonRequest::Wait {
