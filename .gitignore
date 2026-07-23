@@ -1,4 +1,5 @@
 /target
+/dist
 rem-exec
 rem-execd
 test-confirm.sh
