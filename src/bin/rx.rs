@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read};
 use std::process::{ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use clap::{Parser, Subcommand};
@@ -16,6 +17,15 @@ use rem_exec::ssh::{
 /// the streaming path (`rx start --pipe`), which has no size limit.
 const INLINE_STDIN_CAP: usize = 4 * 1024 * 1024;
 
+/// Process-wide switch: emit compact single-line JSON instead of pretty output.
+/// Set once from `--compact` / `REM_EXEC_JSON=compact` at startup.
+static COMPACT_JSON: AtomicBool = AtomicBool::new(false);
+
+/// Whether compact JSON was requested via the flag or `REM_EXEC_JSON=compact`.
+fn compact_requested(flag: bool) -> bool {
+    flag || std::env::var("REM_EXEC_JSON").ok().as_deref() == Some("compact")
+}
+
 #[derive(Parser)]
 #[command(name = "rx")]
 #[command(version)]
@@ -23,6 +33,9 @@ const INLINE_STDIN_CAP: usize = 4 * 1024 * 1024;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Emit single-line JSON instead of pretty-printed (or REM_EXEC_JSON=compact)
+    #[arg(long, global = true)]
+    compact: bool,
 }
 
 #[derive(Subcommand)]
@@ -220,6 +233,10 @@ enum DaemonAction {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
+    if compact_requested(cli.compact) {
+        COMPACT_JSON.store(true, Ordering::Relaxed);
+    }
+
     // Handle daemon subcommands directly
     if let Command::Daemon { action } = &cli.command {
         return match action {
@@ -320,11 +337,39 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // For all other commands: try daemon first, fall back to direct SSH
-    if daemon::is_running() {
-        route_via_daemon(&cli.command)
+    // Direct SSH is the canonical path. The local daemon is an optional
+    // accelerator for repeated reads of long-running processes; it handles a
+    // command only when explicitly opted in (REM_EXEC_DAEMON=1), so a daemon
+    // that merely happens to be running never silently changes how a command is
+    // transported or how it fails.
+    if daemon_enabled() {
+        if daemon::is_running() {
+            route_via_daemon(&cli.command)
+        } else {
+            eprintln!("note: REM_EXEC_DAEMON set but no daemon running — using direct SSH");
+            route_via_ssh(&cli.command)
+        }
     } else {
         route_via_ssh(&cli.command)
+    }
+}
+
+/// Whether the caller opted into routing through the local daemon. Direct SSH
+/// is always the default; the daemon is used only when this is set, so a daemon
+/// that merely happens to be running never reroutes commands.
+fn daemon_enabled() -> bool {
+    daemon_opt_in(std::env::var("REM_EXEC_DAEMON").ok().as_deref())
+}
+
+/// Pure predicate behind [`daemon_enabled`], split out so it is testable without
+/// touching the process environment.
+fn daemon_opt_in(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => false,
     }
 }
 
@@ -580,7 +625,7 @@ fn dispatch_simple(host: &str, request: &Request, body: &[u8]) -> ExitCode {
             exit_for(&resp)
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            print_json_response(&transport_error_json(host, &e));
             ExitCode::FAILURE
         }
     }
@@ -595,7 +640,7 @@ fn dispatch_run(host: &str, request: &Request, body: &[u8]) -> ExitCode {
             run_exit(&resp)
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            print_json_response(&transport_error_json(host, &e));
             ExitCode::FAILURE
         }
     }
@@ -682,7 +727,7 @@ fn do_cp(
             exit_for(&resp)
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            print_json_response(&transport_error_json(host, &e));
             ExitCode::FAILURE
         }
     }
@@ -851,7 +896,7 @@ fn do_get(remote: &str, local: &str, mode: Option<&str>) -> ExitCode {
             exit_for(&resp)
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            print_json_response(&transport_error_json(host, &e));
             ExitCode::FAILURE
         }
     }
@@ -898,7 +943,7 @@ fn route_via_daemon(command: &Command) -> ExitCode {
                     pipe_local_stdin_to_remote(host, id, *no_close_stdin)
                 }
                 Ok(DaemonResponse::Error { message }) => {
-                    print_json_response(&Response::error(message));
+                    print_json_response(&daemon_error_json(message));
                     ExitCode::FAILURE
                 }
                 Err(e) => {
@@ -1052,7 +1097,7 @@ fn route_via_daemon(command: &Command) -> ExitCode {
             }
         }
         Ok(DaemonResponse::Error { message }) => {
-            print_json_response(&Response::error(message));
+            print_json_response(&daemon_error_json(message));
             ExitCode::FAILURE
         }
         Err(e) => {
@@ -1104,15 +1149,60 @@ fn run_exit_from_value(data: &serde_json::Value) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Turn a transport failure into a JSON error `Response`. Connectivity/auth
+/// failures classify into typed codes (`ssh_unreachable` / `ssh_auth`); an
+/// ambiguous failure triggers a `version` probe so a missing/outdated rxd
+/// surfaces as an actionable `not_deployed` (with a `rx deploy` /
+/// REM_EXEC_AUTO_DEPLOY hint) instead of a cryptic error an agent would give up
+/// on and fall back to raw ssh. Always a JSON object on stdout.
+fn transport_error_json(host: &str, e: &rem_exec::error::RemExecError) -> Response {
+    let message = e.to_string();
+    if let Some(code) = rem_exec::ssh::classify_ssh_failure(&message) {
+        return Response::error_code(code, message);
+    }
+    // A failed auto-deploy already carries the precise reason (e.g. a missing
+    // local cache → "run `rx setup` first"); surface it verbatim instead of
+    // re-probing into a generic not_deployed.
+    if message.contains("auto-deploy to ") {
+        return Response::error_code(rem_exec::protocol::ErrorCode::NotDeployed, message);
+    }
+    let status = rem_exec::deploy::remote_deploy_status(host);
+    if matches!(
+        status,
+        rem_exec::deploy::DeployStatus::Missing
+            | rem_exec::deploy::DeployStatus::Incompatible { .. }
+    ) {
+        return rem_exec::deploy::not_deployed_response(host, &status);
+    }
+    Response::error(message)
+}
+
+/// Classify a daemon-relayed error message. The daemon already forwarded the
+/// request and this path has no host to probe, so this is SSH-classify or
+/// untyped — no deploy probe.
+fn daemon_error_json(message: String) -> Response {
+    match rem_exec::ssh::classify_ssh_failure(&message) {
+        Some(code) => Response::error_code(code, message),
+        None => Response::error(message),
+    }
+}
+
 fn print_json_response(response: &Response) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(response).unwrap_or_default()
-    );
+    println!("{}", render_json(response));
 }
 
 fn print_json(value: &serde_json::Value) {
-    println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+    println!("{}", render_json(value));
+}
+
+/// Serialize a value as JSON, honoring the process-wide compact/pretty choice.
+fn render_json<T: serde::Serialize>(value: &T) -> String {
+    if COMPACT_JSON.load(Ordering::Relaxed) {
+        serde_json::to_string(value)
+    } else {
+        serde_json::to_string_pretty(value)
+    }
+    .unwrap_or_default()
 }
 
 fn report(result: rem_exec::error::Result<()>) -> ExitCode {
@@ -1130,6 +1220,22 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn daemon_opt_in_requires_an_explicit_truthy_value() {
+        assert!(daemon_opt_in(Some("1")));
+        assert!(daemon_opt_in(Some("true")));
+        assert!(daemon_opt_in(Some("YES")));
+        assert!(daemon_opt_in(Some(" on ")));
+        assert!(!daemon_opt_in(Some("0")));
+        assert!(!daemon_opt_in(Some("")));
+        assert!(!daemon_opt_in(None));
+    }
+
+    #[test]
+    fn compact_requested_honors_the_flag() {
+        assert!(compact_requested(true));
+    }
 
     fn test_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("rx-receive-{}-{name}", std::process::id()));

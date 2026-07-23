@@ -778,3 +778,68 @@ fn process_state_paths_have_private_permissions() {
     let status = wait_for_exit(&runtime, &id);
     assert_eq!(status["state"], "exited(killed)");
 }
+
+#[test]
+fn list_ignores_directories_that_are_not_process_ids() {
+    let runtime = Runtime::new("list-filter");
+    // A real managed process establishes the base dir.
+    let start = runtime.serve(json!({"action": "start", "command": ["sleep", "10"]}), &[]);
+    let id = started_id(&start);
+
+    // A foreign directory that happens to carry a status file — list must skip
+    // it instead of surfacing it as a process.
+    let bogus = runtime.remote_base().join("not-a-process-id");
+    fs::create_dir_all(&bogus).unwrap();
+    fs::write(bogus.join("status"), "running").unwrap();
+
+    let list = runtime.serve(json!({"action": "list"}), &[]);
+    assert_eq!(list["type"], "list", "{list}");
+    let ids: Vec<&str> = list["processes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&id.as_str()), "real process missing: {list}");
+    assert!(
+        !ids.contains(&"not-a-process-id"),
+        "foreign dir leaked into list: {list}"
+    );
+
+    let _ = runtime.serve(json!({"action": "kill", "id": id}), &[]);
+}
+
+#[test]
+fn rx_reports_unreachable_host_as_typed_json_error() {
+    // `.invalid` is reserved (RFC 2606) and never resolves, so `ssh` fails fast
+    // with "Could not resolve hostname" — deterministic, no network needed.
+    let dir =
+        std::env::temp_dir().join(format!("rem-exec-rx-unreachable-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rx"))
+        .args(["run", "rx-nonexistent.invalid", "--", "true"])
+        .env("XDG_RUNTIME_DIR", &dir)
+        .env_remove("REM_EXEC_AUTO_DEPLOY")
+        .env_remove("REM_EXEC_DAEMON")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success(), "expected a non-zero exit on transport failure");
+    // The contract: even a transport failure yields a JSON error object on
+    // stdout with a typed code — not just a bare stderr line.
+    let resp: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "expected JSON error on stdout: {e}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    assert_eq!(resp["type"], "error", "{resp}");
+    assert_eq!(resp["code"], "ssh_unreachable", "{resp}");
+    assert_eq!(resp["retryable"], true, "{resp}");
+
+    let _ = fs::remove_dir_all(&dir);
+}

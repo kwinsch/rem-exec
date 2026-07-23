@@ -50,7 +50,9 @@ rx setup --version v0.1.0 # specific release
 ```
 
 `rx` runs locally. `rxd` is the binary copied to remote hosts by `rx deploy` and
-auto-deploy.
+auto-deploy. Only the controller needs external tools installed — `ssh` for
+every operation, plus `scp`/`curl`/`sha256sum` for setup and deploy; the remote
+needs nothing but the single static `rxd` binary.
 
 ## Quick start
 
@@ -91,7 +93,8 @@ rx run host -- doas apt-get -y update    # auto-deploys if needed, elevates via 
 ## Architecture
 
 Two binaries:
-- **rx** — local CLI + optional caching daemon
+- **rx** — local CLI, plus an optional local caching daemon (opt-in via
+  `REM_EXEC_DAEMON=1`; direct SSH is the default and canonical path)
 - **rxd** — remote binary (static, no dependencies, deployed via `rx deploy`)
 
 Communication flows over SSH. No custom ports, no daemons to manage on the remote.

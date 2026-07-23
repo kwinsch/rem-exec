@@ -19,6 +19,13 @@ Invariants:
 - Trust model: rxd runs as the SSH user and is a transport, not a sandbox or
   privilege boundary. It can do anything that user can (write any path via cp,
   elevate via `doas` in a command). Your SSH access is the whole trust boundary.
+- Process exit mirrors the remote command (`rx run HOST -- false` → exit 1;
+  killed by signal N → 128+N); the JSON is the source of truth, the process exit
+  is a convenience. A transport failure (unreachable host, auth) is the one case
+  the command never ran — it still prints a JSON `error` with a `code` (e.g.
+  ssh_unreachable) on stdout and exits 1. Always read stdout JSON.
+- JSON is pretty-printed by default; pass --compact (or REM_EXEC_JSON=compact)
+  for single-line objects.
 
 ## Model
 
@@ -83,6 +90,11 @@ Notes:
   the stream is forwarded raw and unbounded (binary-safe). close-stdin sends EOF.
 - start --pipe: local stdin → remote stdin and remote stdout → local stdout as
   raw bytes; the JSON handle is written to stderr.
+- The local daemon (daemon start|stop|status) is an optional accelerator that
+  caches repeated reads of long-running processes locally. It is used only when
+  you opt in with REM_EXEC_DAEMON=1; direct SSH is the default and canonical
+  path, and it does not handle ping/cp/get. A daemon that merely happens to be
+  running never changes how a command is transported.
 
 ## Text encoding
 
@@ -144,12 +156,23 @@ REM_EXEC_AUTO_DEPLOY=1 to deploy-and-retry automatically against a missing or
 outdated remote. rx multiplexes SSH connections, so repeated operations to a
 host reuse one connection.
 
+Only the controller (where rx runs) needs external tools — ssh for every
+operation, plus scp/curl/sha256sum for setup/deploy. The remote needs nothing
+preinstalled: rxd is a single static binary.
+
 `ping` is the preflight: one round trip tells you the host is reachable, what
 rxd version/protocol it runs, and what it is (os/kernel/arch/distro) — enough to
 choose a package manager or shell before a batch. It is a pure probe with no
-side effects (it creates no state dir). With REM_EXEC_AUTO_DEPLOY=1 a ping to a
-missing/outdated remote deploys first; without it, a `not_deployed` error is the
-signal that a deploy is needed.
+side effects (it creates no state dir).
+
+A missing or outdated remote is detected by probing rxd's `version` (its
+protocol), not by guessing from stderr. With REM_EXEC_AUTO_DEPLOY=1 rx deploys
+the matching rxd and retries automatically; without it you get a typed
+`not_deployed` error whose hint names the fix — run `rx deploy HOST`, or set
+REM_EXEC_AUTO_DEPLOY=1. rx never silently falls back to a plain SSH command.
+Note: this catches a missing rxd or a protocol change; a same-protocol rxd
+update (e.g. a behavior fix that keeps the wire format) is not auto-detected —
+run `rx deploy HOST` after upgrading rx to pick up rxd-side fixes.
 
 ## Examples
 

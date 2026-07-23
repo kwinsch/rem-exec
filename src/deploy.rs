@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::{RemExecError, Result};
-use crate::protocol::{PROTOCOL_VERSION, Response};
+use crate::protocol::{ErrorCode, PROTOCOL_VERSION, Response};
 use crate::ssh::{RemoteArgs, ssh_command, ssh_exec};
 
 const RELEASE_BASE_URL: &str = "https://github.com/kwinsch/rem-exec/releases/download";
@@ -348,6 +348,62 @@ pub fn auto_deploy_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// What the remote's rxd looks like, determined by probing the stable `version`
+/// command. Lets a `serve` failure become a precise, actionable error instead of
+/// a guess from clap/shell stderr wording.
+#[derive(Debug)]
+pub enum DeployStatus {
+    /// rxd present and speaking our protocol.
+    Current { version: String },
+    /// rxd present but a different protocol than ours (older or newer).
+    Incompatible { version: String, protocol: u32 },
+    /// rxd absent, or too old/broken to answer `version` parseably.
+    Missing,
+    /// Couldn't tell — a connectivity/auth failure, not a deploy problem.
+    Unknown,
+}
+
+/// Probe the remote rxd via the stable `version` command and classify it.
+///
+/// Robust across versions: a parseable answer yields an exact protocol number,
+/// and an unparseable/absent one is treated as needing (re)deploy — never a
+/// guess from clap/shell stderr. A connectivity/auth failure is reported as
+/// `Unknown` so it is never mistaken for a deploy problem.
+pub fn remote_deploy_status(host: &str) -> DeployStatus {
+    match ssh_exec(host, &RemoteArgs::version().as_str_slice()) {
+        Ok(Response::Version { version, protocol }) => {
+            if protocol == PROTOCOL_VERSION {
+                DeployStatus::Current { version }
+            } else {
+                DeployStatus::Incompatible { version, protocol }
+            }
+        }
+        Ok(_) => DeployStatus::Missing,
+        Err(e) => {
+            if crate::ssh::classify_ssh_failure(&e.to_string()).is_some() {
+                DeployStatus::Unknown
+            } else {
+                DeployStatus::Missing
+            }
+        }
+    }
+}
+
+/// Build the actionable "remote rxd needs (re)deploying" error for the CLI to
+/// print as JSON. Names the remote's state and both ways to fix it, so an agent
+/// deploys (or sets REM_EXEC_AUTO_DEPLOY) rather than falling back to raw ssh.
+pub fn not_deployed_response(host: &str, status: &DeployStatus) -> Response {
+    let detail = match status {
+        DeployStatus::Incompatible { version, protocol } => format!(
+            "remote rxd {version} on {host} speaks protocol {protocol}, but rx needs protocol {PROTOCOL_VERSION}"
+        ),
+        _ => format!("rxd is missing or unversioned on {host}"),
+    };
+    Response::error_code(ErrorCode::NotDeployed, detail).with_hint(format!(
+        "run `rx deploy {host}` to install the matching rxd, or set REM_EXEC_AUTO_DEPLOY=1 to deploy and retry automatically"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +446,44 @@ mod tests {
         assert!(!should_auto_deploy(&RemExecError::Io(
             std::io::Error::other("boom")
         )));
+    }
+
+    #[test]
+    fn not_deployed_response_is_typed_and_names_the_fix() {
+        use crate::protocol::Response;
+
+        let incompatible = not_deployed_response(
+            "host1",
+            &DeployStatus::Incompatible {
+                version: "0.1.1".into(),
+                protocol: 1,
+            },
+        );
+        match incompatible {
+            Response::Error {
+                code,
+                message,
+                hint,
+                retryable,
+            } => {
+                assert_eq!(code, Some(ErrorCode::NotDeployed));
+                assert!(retryable, "a deploy could make the retry succeed");
+                assert!(message.contains("protocol 1"), "{message}");
+                let hint = hint.expect("hint present");
+                assert!(hint.contains("rx deploy host1"), "{hint}");
+                assert!(hint.contains("REM_EXEC_AUTO_DEPLOY"), "{hint}");
+            }
+            other => panic!("expected error response, got {other:?}"),
+        }
+
+        // The missing case still names the fix.
+        match not_deployed_response("h2", &DeployStatus::Missing) {
+            Response::Error { code, hint, .. } => {
+                assert_eq!(code, Some(ErrorCode::NotDeployed));
+                assert!(hint.unwrap().contains("rx deploy h2"));
+            }
+            other => panic!("expected error response, got {other:?}"),
+        }
     }
 
     #[test]

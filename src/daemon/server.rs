@@ -8,7 +8,7 @@ use std::thread;
 use crate::daemon::state::{DaemonState, TrackedProcess};
 use crate::daemon::stream::spawn_stream_thread;
 use crate::error::Result;
-use crate::protocol::{DaemonRequest, DaemonResponse, Request, Response};
+use crate::protocol::{DaemonRequest, DaemonResponse, ErrorCode, Request, Response};
 use crate::ssh::serve_request_auto_deploy;
 use crate::{base64_decode, encode_bytes};
 
@@ -191,10 +191,18 @@ fn dispatch(
             keep_stdin_open,
             ephemeral,
         } => {
-            let body = stdin_b64
-                .as_deref()
-                .and_then(|s| base64_decode(s).ok())
-                .unwrap_or_default();
+            let body = match stdin_b64.as_deref() {
+                Some(s) => match base64_decode(s) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return wrap_response(Response::error_code(
+                            ErrorCode::BadRequest,
+                            format!("invalid base64 in stdin: {e}"),
+                        ));
+                    }
+                },
+                None => Vec::new(),
+            };
             forward(
                 &host,
                 &Request::Run {
@@ -237,7 +245,15 @@ fn dispatch(
             id,
             data_b64,
         } => {
-            let body = base64_decode(&data_b64).unwrap_or_default();
+            let body = match base64_decode(&data_b64) {
+                Ok(b) => b,
+                Err(e) => {
+                    return wrap_response(Response::error_code(
+                        ErrorCode::BadRequest,
+                        format!("invalid base64 in write data: {e}"),
+                    ));
+                }
+            };
             forward(&host, &Request::Write { id }, &body)
         }
         DaemonRequest::CloseStdin { host, id } => {
@@ -429,5 +445,33 @@ fn wrap_response(response: Response) -> DaemonResponse {
         Err(e) => DaemonResponse::Error {
             message: e.to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn write_with_invalid_base64_fails_loud_without_forwarding() {
+        // Corrupt base64 must not become an empty body silently forwarded as a
+        // success — it returns a typed bad_request error (and never reaches SSH).
+        let state = Arc::new(Mutex::new(DaemonState::new(std::path::PathBuf::from(
+            "/tmp/rxd-test-unused",
+        ))));
+        let stop = Arc::new(AtomicBool::new(false));
+        let req = DaemonRequest::Write {
+            host: "unused".to_string(),
+            id: "0123abcd".to_string(),
+            data_b64: "!!!!".to_string(),
+        };
+        match dispatch(req, &state, &stop) {
+            DaemonResponse::Ok { data } => {
+                assert_eq!(data.get("type").and_then(|v| v.as_str()), Some("error"));
+                assert_eq!(data.get("code").and_then(|v| v.as_str()), Some("bad_request"));
+            }
+            other => panic!("expected a wrapped error response, got {other:?}"),
+        }
     }
 }

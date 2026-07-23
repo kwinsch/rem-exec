@@ -4,7 +4,7 @@ use std::process::{Child, Command, Output, Stdio};
 use crate::deploy;
 use crate::error::{RemExecError, Result};
 use crate::process::remote_base;
-use crate::protocol::{Request, Response};
+use crate::protocol::{ErrorCode, Request, Response};
 
 /// The remote binary path. Uses ~/.local/bin since it may not be on the
 /// non-login SSH PATH.
@@ -114,6 +114,36 @@ pub fn serve_stream_download(host: &str, request: &Request) -> Result<Child> {
     Ok(child)
 }
 
+/// Classify an OpenSSH transport failure from its stderr text into a typed
+/// [`ErrorCode`] the CLI can surface as JSON, so agents branch on `code` for
+/// connectivity/auth failures the same way they do for rxd-side errors.
+///
+/// Returns `None` for text that doesn't clearly indicate an unreachable host or
+/// an authentication failure (e.g. a host-key mismatch), leaving those as an
+/// untyped transport error rather than mislabeling them.
+pub fn classify_ssh_failure(stderr: &str) -> Option<ErrorCode> {
+    let s = stderr.to_ascii_lowercase();
+    // Authentication is unambiguous when present, so check it first.
+    if s.contains("permission denied")
+        || s.contains("publickey")
+        || s.contains("too many authentication failures")
+        || s.contains("no supported authentication methods")
+    {
+        return Some(ErrorCode::SshAuth);
+    }
+    if s.contains("connection refused")
+        || s.contains("could not resolve")
+        || s.contains("name or service not known")
+        || s.contains("no route to host")
+        || s.contains("network is unreachable")
+        || s.contains("connection timed out")
+        || s.contains("operation timed out")
+    {
+        return Some(ErrorCode::SshUnreachable);
+    }
+    None
+}
+
 /// Validate an `ssh ... serve` invocation and decode its single JSON response.
 fn parse_serve_output(output: Output) -> Result<Response> {
     if !output.status.success() {
@@ -139,12 +169,28 @@ fn parse_serve_output(output: Output) -> Result<Response> {
 pub fn serve_request_auto_deploy(host: &str, request: &Request, body: &[u8]) -> Result<Response> {
     match serve_request(host, request, body) {
         Ok(resp) => Ok(resp),
-        Err(e) if deploy::auto_deploy_enabled() && deploy::should_auto_deploy(&e) => {
-            deploy::deploy_to_host(host)
-                .map_err(|de| RemExecError::Ssh(format!("auto-deploy to {host} failed: {de} (original: {e})")))?;
-            serve_request(host, request, body)
+        Err(e) => {
+            // A clear connectivity/auth failure is not a deploy problem — surface
+            // it directly (the CLI turns it into ssh_unreachable / ssh_auth).
+            if classify_ssh_failure(&e.to_string()).is_some() {
+                return Err(e);
+            }
+            // Otherwise the usual cause is a missing/outdated rxd. Probe the
+            // stable `version` command for a precise verdict rather than guessing
+            // from the failure's stderr text.
+            match deploy::remote_deploy_status(host) {
+                deploy::DeployStatus::Current { .. } | deploy::DeployStatus::Unknown => Err(e),
+                _ if deploy::auto_deploy_enabled() => {
+                    deploy::deploy_to_host(host).map_err(|de| {
+                        RemExecError::Ssh(format!(
+                            "auto-deploy to {host} failed: {de} (original: {e})"
+                        ))
+                    })?;
+                    serve_request(host, request, body)
+                }
+                status => Ok(deploy::not_deployed_response(host, &status)),
+            }
         }
-        Err(e) => Err(e),
     }
 }
 
@@ -219,5 +265,41 @@ impl RemoteArgs {
 
     pub fn as_str_slice(&self) -> Vec<&str> {
         self.args.iter().map(|s| s.as_str()).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_ssh_failure_maps_known_phrases() {
+        assert_eq!(
+            classify_ssh_failure("ssh: Could not resolve hostname foo: Name or service not known"),
+            Some(ErrorCode::SshUnreachable)
+        );
+        assert_eq!(
+            classify_ssh_failure("connect to host x port 22: Connection refused"),
+            Some(ErrorCode::SshUnreachable)
+        );
+        assert_eq!(
+            classify_ssh_failure("ssh: connect to host x port 22: No route to host"),
+            Some(ErrorCode::SshUnreachable)
+        );
+        assert_eq!(
+            classify_ssh_failure("ssh: connect to host x port 22: Operation timed out"),
+            Some(ErrorCode::SshUnreachable)
+        );
+        assert_eq!(
+            classify_ssh_failure("foo@bar: Permission denied (publickey)."),
+            Some(ErrorCode::SshAuth)
+        );
+        assert_eq!(
+            classify_ssh_failure("Received disconnect from x: Too many authentication failures"),
+            Some(ErrorCode::SshAuth)
+        );
+        // Host-key mismatch and unknown text stay untyped rather than mislabeled.
+        assert_eq!(classify_ssh_failure("Host key verification failed."), None);
+        assert_eq!(classify_ssh_failure("some unrelated failure"), None);
     }
 }

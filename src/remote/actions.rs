@@ -762,6 +762,31 @@ pub fn pipe_stdin(id: &str, no_close: bool) {
     }
 }
 
+/// Decide what status a kill should record once its signals have landed.
+///
+/// `kill` signals the whole process group, which includes the runner that reaps
+/// the command and writes the true terminal status (`exited(N)`/`signaled(N)`).
+/// If the runner won that race and recorded the truth, we must not clobber it
+/// with the generic `exited(killed)`. We only stamp `exited(killed)` when the
+/// status is still `running` — i.e. the runner was killed before it could
+/// record anything, so nobody else will.
+fn finalize_kill_status(current: &ProcessState) -> Option<&'static str> {
+    match current {
+        ProcessState::Running => Some("exited(killed)"),
+        _ => None,
+    }
+}
+
+/// Re-read the status and record `exited(killed)` only if nothing truthful has
+/// landed. Preserves a runner-written terminal status; used on every kill exit.
+fn record_kill_outcome(pdir: &ProcessDir) {
+    let current = pdir.read_status().unwrap_or(ProcessState::Running);
+    if let Some(status) = finalize_kill_status(&current) {
+        let _ = pdir.write_status(status);
+        let _ = fs::write(pdir.ended_path(), unix_timestamp().to_string());
+    }
+}
+
 /// Kill a process with SIGTERM→wait→SIGKILL escalation.
 ///
 /// After setsid(), the runner is the process group leader (PGID == runner_pid).
@@ -801,9 +826,10 @@ pub fn kill(id: &str) -> Response {
     };
 
     if !sent {
-        // Process already dead — just update state
-        let _ = pdir.write_status("exited(killed)");
-        let _ = fs::write(pdir.ended_path(), unix_timestamp().to_string());
+        // Nothing left to signal — the group is already gone. The runner may
+        // have recorded the real status on its way out; only fall back to
+        // exited(killed) if it didn't.
+        record_kill_outcome(&pdir);
         return Response::Killed { id: id.to_string() };
     }
 
@@ -824,8 +850,10 @@ pub fn kill(id: &str) -> Response {
         thread::sleep(Duration::from_millis(50));
     }
 
-    let _ = pdir.write_status("exited(killed)");
-    let _ = fs::write(pdir.ended_path(), unix_timestamp().to_string());
+    // The signals hit the whole group, including the runner. Give it the brief
+    // window above to record the real terminal status, then only stamp
+    // exited(killed) if nothing truthful landed.
+    record_kill_outcome(&pdir);
 
     Response::Killed { id: id.to_string() }
 }
@@ -841,6 +869,11 @@ pub fn list() -> Response {
                 continue;
             }
             let id = entry.file_name().to_string_lossy().to_string();
+            // Only names that could be a managed process — never a stray temp
+            // file or foreign directory that happens to hold a status file.
+            if !is_valid_process_id(&id) {
+                continue;
+            }
             let pdir = ProcessDir::new(&base, &id);
             if !pdir.status_path().exists() {
                 continue;
@@ -867,6 +900,11 @@ pub fn clean() -> Response {
                 continue;
             }
             let id = entry.file_name().to_string_lossy().to_string();
+            // Only names that could be a managed process — never a stray temp
+            // file or foreign directory that happens to hold a status file.
+            if !is_valid_process_id(&id) {
+                continue;
+            }
             let pdir = ProcessDir::new(&base, &id);
             if !pdir.status_path().exists() {
                 continue;
@@ -887,9 +925,9 @@ pub fn clean() -> Response {
 /// Follow (tail) a stream file, writing raw bytes to stdout.
 /// Streams until the process exits and all output is flushed.
 /// If `offset` is provided, seeks to that position first (for resume).
-pub fn follow(id: &str, stream: &str, offset: Option<u64>) -> Response {
+pub fn follow(id: &str, stream: &str, offset: Option<u64>) {
     if !is_valid_process_id(id) {
-        return invalid_process_id(id);
+        return;
     }
 
     let base = remote_base();
@@ -897,17 +935,12 @@ pub fn follow(id: &str, stream: &str, offset: Option<u64>) -> Response {
     let path = match stream {
         "stdout" => pdir.stdout_path(),
         "stderr" => pdir.stderr_path(),
-        _ => return Response::error_code(ErrorCode::BadRequest, format!("invalid stream: {stream}")),
+        _ => return,
     };
 
     let mut file = match fs::File::open(&path) {
         Ok(f) => f,
-        Err(_) => {
-            return Response::error_code(
-                ErrorCode::ProcessNotFound,
-                format!("process not found: {id}"),
-            );
-        }
+        Err(_) => return,
     };
 
     if let Some(off) = offset
@@ -945,13 +978,29 @@ pub fn follow(id: &str, stream: &str, offset: Option<u64>) -> Response {
             Err(_) => break,
         }
     }
-
-    Response::error("follow completed")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finalize_kill_status_preserves_runner_recorded_terminal_status() {
+        // Still running: the runner never recorded a terminal status (it was in
+        // the killed group), so kill owns the outcome.
+        assert_eq!(
+            finalize_kill_status(&ProcessState::Running),
+            Some("exited(killed)")
+        );
+        // Any terminal status is the runner's truth — never clobber it with the
+        // generic exited(killed).
+        assert_eq!(finalize_kill_status(&ProcessState::Exited(0)), None);
+        assert_eq!(finalize_kill_status(&ProcessState::Exited(137)), None);
+        assert_eq!(finalize_kill_status(&ProcessState::Signaled(15)), None);
+        assert_eq!(finalize_kill_status(&ProcessState::ExitedKilled), None);
+        assert_eq!(finalize_kill_status(&ProcessState::ExitedUnknown), None);
+        assert_eq!(finalize_kill_status(&ProcessState::ExecFailed(2)), None);
+    }
 
     #[test]
     fn write_all_nonblocking_writes_payload_larger_than_pipe_capacity() {
