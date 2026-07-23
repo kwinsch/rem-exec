@@ -456,6 +456,7 @@ fn read_tail(pdir: &ProcessDir, stream: &str) -> (String, Encoding, u64, bool) {
 pub fn put<R: Read>(
     reader: &mut R,
     path: &str,
+    size: Option<u64>,
     mode: Option<u32>,
     owner: Option<&str>,
     group: Option<&str>,
@@ -500,6 +501,18 @@ pub fn put<R: Read>(
             }
         }
     };
+
+    // Completeness: a short stream (e.g. dropped connection) must not be
+    // installed as a truncated file. Verify the declared size before rename.
+    if let Some(expected) = size
+        && bytes != expected
+    {
+        let _ = fs::remove_file(&tmp);
+        return Response::error_code(
+            ErrorCode::IncompleteTransfer,
+            format!("incomplete transfer to {path}: expected {expected} bytes, received {bytes}"),
+        );
+    }
 
     if let Some(m) = mode
         && let Err(e) = fs::set_permissions(&tmp, fs::Permissions::from_mode(m))

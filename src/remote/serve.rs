@@ -99,10 +99,11 @@ pub fn serve() -> ExitCode {
         }
         Request::Put {
             path,
+            size,
             mode,
             owner,
             group,
-        } => actions::put(&mut reader, &path, mode, owner.as_deref(), group.as_deref()),
+        } => actions::put(&mut reader, &path, size, mode, owner.as_deref(), group.as_deref()),
         Request::Status { id } => actions::status(&id),
         Request::Read {
             id,

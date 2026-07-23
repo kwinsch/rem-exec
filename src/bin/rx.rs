@@ -628,16 +628,18 @@ fn do_cp(
         None => None,
     };
 
-    let request = Request::Put {
-        path: path.to_string(),
-        mode,
-        owner,
-        group,
-    };
-
-    // Each send re-opens the file so an auto-deploy retry starts fresh.
+    // Each send re-opens the file so an auto-deploy retry starts fresh, and
+    // re-stats it so the declared size matches the bytes actually streamed.
     let send = || -> rem_exec::error::Result<Response> {
         let mut f = std::fs::File::open(local)?;
+        let size = f.metadata()?.len();
+        let request = Request::Put {
+            path: path.to_string(),
+            size: Some(size),
+            mode,
+            owner: owner.clone(),
+            group: group.clone(),
+        };
         rem_exec::ssh::serve_request_stream(host, &request, &mut f)
     };
 

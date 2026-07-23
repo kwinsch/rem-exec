@@ -78,6 +78,11 @@ pub enum Request {
     /// file, apply mode/owner/group, then rename into place.
     Put {
         path: String,
+        /// Expected body length. When set, the file is renamed into place only
+        /// if exactly this many bytes arrived — a short stream (dropped
+        /// connection) is rejected instead of installing a truncated file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,6 +128,11 @@ pub enum ErrorCode {
     SshUnreachable,
     /// SSH authentication failed.
     SshAuth,
+    /// A streamed transfer ended before the declared byte count (e.g. a dropped
+    /// connection); the partial file was discarded, not installed.
+    IncompleteTransfer,
+    /// A referenced path does not exist (e.g. `get` of a missing file).
+    NotFound,
     /// Unexpected internal failure.
     Internal,
 }
@@ -132,7 +142,10 @@ impl ErrorCode {
     pub fn retryable(self) -> bool {
         matches!(
             self,
-            ErrorCode::NotDeployed | ErrorCode::SshUnreachable | ErrorCode::Internal
+            ErrorCode::NotDeployed
+                | ErrorCode::SshUnreachable
+                | ErrorCode::IncompleteTransfer
+                | ErrorCode::Internal
         )
     }
 }

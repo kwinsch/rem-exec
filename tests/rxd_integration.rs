@@ -533,6 +533,46 @@ fn put_writes_file_atomically_with_mode() {
 }
 
 #[test]
+fn put_rejects_incomplete_transfer_without_installing_file() {
+    let runtime = Runtime::new("put-incomplete");
+    let target = runtime.dir.join("out.bin");
+    // Declare far more bytes than the body carries: a short stream (as a dropped
+    // connection produces) must be rejected, not renamed into place truncated.
+    let payload = b"short body";
+    let resp = runtime.serve(
+        json!({"action": "put", "path": target.to_str().unwrap(), "size": 9_999}),
+        payload,
+    );
+
+    assert_eq!(resp["type"], "error", "{resp}");
+    assert_eq!(resp["code"], "incomplete_transfer", "{resp}");
+    assert_eq!(resp["retryable"], true, "{resp}");
+    assert!(!target.exists(), "a truncated file must not be installed");
+    // The temp file must be cleaned up, not left behind.
+    let leftovers: Vec<_> = fs::read_dir(&runtime.dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".rxd-put-"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+}
+
+#[test]
+fn put_accepts_matching_declared_size() {
+    let runtime = Runtime::new("put-sized");
+    let target = runtime.dir.join("out.bin");
+    let payload = b"exactly these bytes\x00\xff";
+    let resp = runtime.serve(
+        json!({"action": "put", "path": target.to_str().unwrap(), "size": payload.len()}),
+        payload,
+    );
+
+    assert_eq!(resp["type"], "copied", "{resp}");
+    assert_eq!(resp["bytes"].as_u64(), Some(payload.len() as u64));
+    assert_eq!(fs::read(&target).unwrap(), payload);
+}
+
+#[test]
 fn put_to_missing_directory_errors_without_partial_file() {
     let runtime = Runtime::new("put-baddir");
     let resp = runtime.serve(
