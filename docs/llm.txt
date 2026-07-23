@@ -3,6 +3,12 @@
 Read this whole file once; it is short and complete. It describes capabilities,
 not a mandatory workflow — compose the commands as the task needs.
 
+rx is one tool in your box, not a replacement for it — use whatever fits the
+task. Prefer rx when you want its edges: verbatim argv/stdin (nothing to quote),
+structured exit/signal/error results, or detach-and-reattach. For running a
+command and needing its exit code or clean output, rx beats ad-hoc `ssh host
+'…'`.
+
 Invariants:
 - Every command prints exactly one JSON object on stdout (type field). The only
   exceptions are `start --pipe` (data on stdout, JSON handle on stderr) and the
