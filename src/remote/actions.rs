@@ -41,9 +41,10 @@ fn exit_fields(state: &ProcessState) -> (Option<i32>, Option<i32>) {
     match state {
         ProcessState::Exited(code) => (Some(*code), None),
         ProcessState::Signaled(sig) => (None, Some(*sig)),
-        ProcessState::Running | ProcessState::ExitedKilled | ProcessState::ExitedUnknown => {
-            (None, None)
-        }
+        ProcessState::Running
+        | ProcessState::ExitedKilled
+        | ProcessState::ExitedUnknown
+        | ProcessState::ExecFailed(_) => (None, None),
     }
 }
 
@@ -52,6 +53,11 @@ fn exit_fields(state: &ProcessState) -> (Option<i32>, Option<i32>) {
 fn resolve_state(pdir: &ProcessDir) -> Option<ProcessState> {
     let state = pdir.read_status().ok()?;
     if !matches!(state, ProcessState::Running) {
+        // A recorded exec failure overrides the runner's generic exited(127):
+        // the command never actually started.
+        if let Some(errno) = pdir.read_exec_error() {
+            return Some(ProcessState::ExecFailed(errno));
+        }
         return Some(state);
     }
 
@@ -394,12 +400,17 @@ fn completed_response(
     duration_ms: u64,
 ) -> Response {
     let (exit_code, signal) = exit_fields(state);
+    let exec_error = match state {
+        ProcessState::ExecFailed(errno) => Some(crate::process::exec_reason(*errno)),
+        _ => None,
+    };
     let (stdout, stdout_encoding, stdout_size, stdout_truncated) = read_tail(pdir, "stdout");
     let (stderr, stderr_encoding, stderr_size, stderr_truncated) = read_tail(pdir, "stderr");
     Response::Completed {
         id: id.to_string(),
         exit_code,
         signal,
+        exec_error,
         duration_ms,
         stdout,
         stdout_encoding,

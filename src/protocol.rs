@@ -149,6 +149,12 @@ pub enum Response {
         exit_code: Option<i32>,
         /// Signal number when terminated by a signal, else `None`.
         signal: Option<i32>,
+        /// Set when the command never started because exec itself failed
+        /// (e.g. `command_not_found`, `permission_denied`); both exit_code and
+        /// signal are null in that case. Absent on a normal run. Branch on this
+        /// to tell "the tool isn't there" from "the tool ran and exited 127".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exec_error: Option<String>,
         duration_ms: u64,
         stdout: String,
         stdout_encoding: Encoding,

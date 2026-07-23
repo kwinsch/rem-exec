@@ -259,7 +259,19 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
 
                     unsafe { libc::execvp(prog.as_ptr(), argv.as_ptr()) };
 
-                    // exec failed
+                    // exec failed — capture errno first (before any libc call
+                    // clobbers it), tell the caller why on captured stderr, and
+                    // record the errno in a marker file the runner won't touch.
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    let msg = format!(
+                        "rx: exec {}: {}\n",
+                        command[0],
+                        std::io::Error::from_raw_os_error(errno)
+                    );
+                    unsafe {
+                        libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+                    }
+                    let _ = fs::write(pdir.exec_error_path(), errno.to_string());
                     let _ = fs::write(pdir.status_path(), "exited(127)");
                     unsafe { libc::_exit(127) };
                 }

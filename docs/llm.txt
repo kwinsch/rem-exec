@@ -77,7 +77,7 @@ stdout/stderr/data fields pair with an `encoding`:
 
 ## Response shapes (by type)
 
-  completed {id, exit_code|null, signal|null, duration_ms,
+  completed {id, exit_code|null, signal|null, exec_error?, duration_ms,
              stdout, stdout_encoding, stderr, stderr_encoding,
              stdout_size, stderr_size, stdout_truncated, stderr_truncated}
   running   {id, reason, stdout_size, stderr_size, hint}
@@ -94,9 +94,16 @@ stdout/stderr/data fields pair with an `encoding`:
   error     {message, code?, retryable?, hint?}
 
 - run and wait yield completed or running. exit_code is null when signal is set.
+- exec_error is present only when the command never started (the binary wasn't
+  found or wasn't executable) — then exit_code and signal are both null and
+  stderr carries a `rx: exec …` line. Values: command_not_found · permission_denied
+  · exec_format_error · errno_<n>. Branch on this to tell "the tool isn't there"
+  (install it, or use another) from "the tool ran and exited 127".
 - After an ephemeral completed run the process id is still in the response for
   logging, but status/stdout/stderr for that id return process_not_found.
-- state: running | exited(N) | signaled(N) | exited(killed) | exited(unknown).
+- state: running | exited(N) | signaled(N) | exited(killed) | exited(unknown) |
+  exec_failed(reason)  (reason as in exec_error above; the status view of a
+  command that failed to start).
 - completed inlines up to the last 256 KiB per stream; when *_truncated is true
   the full output remains readable via stdout/stderr with --offset.
 - output.size is the total file size — pass it back as the next --offset to read

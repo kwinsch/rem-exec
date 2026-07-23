@@ -284,6 +284,50 @@ fn run_bad_cwd_fails_with_diagnostic() {
 }
 
 #[test]
+fn run_reports_missing_command_as_typed_exec_error() {
+    // A missing command must be distinguishable from a command that ran and
+    // exited 127: exec_error is set, exit_code/signal are null, and stderr
+    // explains why. The marker also surfaces in a later status query.
+    let runtime = Runtime::new("run-nocmd");
+    let resp = runtime.serve(
+        json!({
+            "action": "run",
+            "command": ["rx-no-such-command-zzz", "arg"],
+            "ephemeral": false,
+        }),
+        &[],
+    );
+
+    assert_eq!(resp["type"], "completed", "{resp}");
+    assert!(resp["exit_code"].is_null(), "{resp}");
+    assert!(resp["signal"].is_null(), "{resp}");
+    assert_eq!(resp["exec_error"], "command_not_found", "{resp}");
+    let stderr = resp["stderr"].as_str().unwrap();
+    assert!(stderr.contains("rx: exec"), "{resp}");
+    assert!(stderr.contains("rx-no-such-command-zzz"), "{resp}");
+
+    let id = resp["id"].as_str().unwrap();
+    let status = runtime.status(id);
+    assert_eq!(status["type"], "status", "{status}");
+    assert_eq!(status["state"], "exec_failed(command_not_found)", "{status}");
+    assert!(status["exit_code"].is_null(), "{status}");
+}
+
+#[test]
+fn start_reports_missing_command_via_status() {
+    let runtime = Runtime::new("start-nocmd");
+    let start = runtime.serve(
+        json!({"action": "start", "command": ["rx-no-such-command-zzz"]}),
+        &[],
+    );
+    let id = started_id(&start);
+
+    let status = wait_for_exit(&runtime, &id);
+    assert_eq!(status["state"], "exec_failed(command_not_found)", "{status}");
+    assert!(status["exit_code"].is_null(), "{status}");
+}
+
+#[test]
 fn run_applies_env_overrides() {
     let runtime = Runtime::new("run-env");
     let resp = runtime.serve(

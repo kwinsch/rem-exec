@@ -14,6 +14,11 @@ Shipped since 0.2.0:
   `--mode` always works; `--owner`/`--group` need a privileged rxd.
 - `run` ephemeral by default — fully-inlined `completed` deletes the process
   dir; skip when truncated or backgrounded; `--keep` retains state.
+- Exec-failure legibility — when the command never starts (binary missing / not
+  executable), `completed` carries a typed `exec_error`
+  (`command_not_found`/`permission_denied`/`exec_format_error`/`errno_<n>`) with
+  exit_code+signal null and a `rx: exec …` stderr line; `status` shows
+  `exec_failed(reason)`. Distinguishes "tool isn't there" from a real 127.
 
 Everything below is proposed, not committed. Ordered by agent-experience value.
 
@@ -29,8 +34,15 @@ preserved for debugging. `run --merge`, or a combined field / a third capture
 file written with a tee.
 
 ### 3. `rx ping HOST`
-Fast typed reachability + `{version, protocol, arch}` in one round trip, so an
-agent can check connectivity / whether a (re)deploy is needed before a batch.
+Fast typed reachability + host identity in one round trip, so an agent can check
+connectivity, whether a (re)deploy is needed, and orient itself before a batch.
+Returns `{version, protocol, arch, os, kernel, hostname, distro_id?,
+distro_version?}`. Gather it natively in rxd — `uname(2)` for os/kernel/machine
+and a direct read of `/etc/os-release` for distro (both absent → null) — no
+remote shell, consistent with the no-shell thesis. The distro fields are the
+actually-useful bit (apk vs apt, bash-vs-ash: Alpine ships busybox ash, no bash).
+Keep the tool-availability probe (`rx which`) a *separate* verb: ping stays a
+fixed cheap round trip, `which` takes a variable name list.
 
 ### 4. Idempotency keys
 Optional client-supplied key on `run`/`start` so a retried request after a

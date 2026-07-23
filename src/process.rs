@@ -122,6 +122,12 @@ impl ProcessDir {
     pub fn stderr_path(&self) -> PathBuf {
         self.dir.join("stderr")
     }
+    /// Marker written by the grandchild when `execvp` fails, holding the raw
+    /// errno. It lives in its own file because the runner overwrites `status`
+    /// with the generic `exited(127)` after reaping the grandchild.
+    pub fn exec_error_path(&self) -> PathBuf {
+        self.dir.join("exec_error")
+    }
 
     /// Read the status string from the status file.
     pub fn read_status(&self) -> Result<ProcessState> {
@@ -181,6 +187,13 @@ impl ProcessDir {
         }
     }
 
+    /// Read the recorded exec-failure errno, if the command never started.
+    pub fn read_exec_error(&self) -> Option<i32> {
+        fs::read_to_string(self.exec_error_path())
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+    }
+
     /// Extract the process ID from the directory path.
     pub fn id(&self) -> &str {
         self.dir
@@ -212,6 +225,19 @@ pub enum ProcessState {
     ExitedKilled,
     /// Died without a recorded exit status (detected by self-healing).
     ExitedUnknown,
+    /// The command never started because `execvp` failed; carries the errno.
+    ExecFailed(i32),
+}
+
+/// Map an exec-failure errno to a stable, agent-branchable reason token.
+/// Known cases get a name; anything else falls back to `errno_<n>`.
+pub fn exec_reason(errno: i32) -> String {
+    match errno {
+        libc::ENOENT => "command_not_found".to_string(),
+        libc::EACCES => "permission_denied".to_string(),
+        libc::ENOEXEC => "exec_format_error".to_string(),
+        other => format!("errno_{other}"),
+    }
 }
 
 impl ProcessState {
@@ -241,6 +267,7 @@ impl fmt::Display for ProcessState {
             ProcessState::Signaled(sig) => write!(f, "signaled({sig})"),
             ProcessState::ExitedKilled => write!(f, "exited(killed)"),
             ProcessState::ExitedUnknown => write!(f, "exited(unknown)"),
+            ProcessState::ExecFailed(errno) => write!(f, "exec_failed({})", exec_reason(*errno)),
         }
     }
 }
