@@ -600,6 +600,163 @@ fn put_accepts_matching_declared_size() {
     assert_eq!(fs::read(&target).unwrap(), payload);
 }
 
+/// Frame a payload the way `rx put -` does.
+fn framed(payload: &[u8]) -> Vec<u8> {
+    let mut wire = Vec::new();
+    rem_exec::framing::write_framed(&mut &payload[..], &mut wire).unwrap();
+    wire
+}
+
+fn leftover_temps(dir: &PathBuf) -> Vec<String> {
+    fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|name| name.contains(".rxd-put-"))
+        .collect()
+}
+
+#[test]
+fn put_stream_installs_a_complete_stream_privately_by_default() {
+    let runtime = Runtime::new("put-stream");
+    let target = runtime.dir.join("secret");
+    // Larger than one frame, and binary, so framing is exercised for real.
+    let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 256) as u8).collect();
+
+    let resp = runtime.serve(
+        json!({"action": "put_stream", "path": target.to_str().unwrap()}),
+        &framed(&payload),
+    );
+
+    assert_eq!(resp["type"], "copied", "{resp}");
+    assert_eq!(resp["bytes"].as_u64(), Some(payload.len() as u64));
+    assert_eq!(fs::read(&target).unwrap(), payload);
+    // No --mode: the file keeps the temp file's 0600 rather than the umask, and
+    // the response reports what it actually got, not what was asked for.
+    let mode = fs::symlink_metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert_eq!(resp["mode"], "0600");
+    assert!(leftover_temps(&runtime.dir).is_empty());
+}
+
+#[test]
+fn put_stream_applies_mode_before_the_file_is_visible() {
+    let runtime = Runtime::new("put-stream-mode");
+    let target = runtime.dir.join("app.conf");
+
+    let resp = runtime.serve(
+        json!({"action": "put_stream", "path": target.to_str().unwrap(), "mode": 0o640}),
+        &framed(b"key = value\n"),
+    );
+
+    assert_eq!(resp["type"], "copied", "{resp}");
+    assert_eq!(resp["mode"], "0640");
+    let mode = fs::symlink_metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o640);
+}
+
+#[test]
+fn put_stream_rejects_a_stream_cut_before_its_end_marker() {
+    let runtime = Runtime::new("put-stream-cut");
+    let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 256) as u8).collect();
+    let wire = framed(&payload);
+
+    // Mid-payload, and one byte short of the trailer: a killed sender produces
+    // both shapes, and neither may install a file.
+    for (label, cut) in [("mid-payload", 40_000), ("before-trailer", wire.len() - 1)] {
+        let target = runtime.dir.join(format!("out-{label}"));
+        let resp = runtime.serve(
+            json!({"action": "put_stream", "path": target.to_str().unwrap()}),
+            &wire[..cut],
+        );
+
+        assert_eq!(resp["type"], "error", "{label}: {resp}");
+        assert_eq!(resp["code"], "incomplete_transfer", "{label}: {resp}");
+        assert_eq!(resp["retryable"], true, "{label}: {resp}");
+        assert!(!target.exists(), "{label}: a truncated stream must install nothing");
+    }
+    assert!(leftover_temps(&runtime.dir).is_empty());
+}
+
+#[test]
+fn put_stream_carrying_every_byte_but_no_end_marker_is_still_rejected() {
+    // The bytes all arrived; the sender never said it was done. This is the
+    // case a declared size cannot catch and framing exists for.
+    let runtime = Runtime::new("put-stream-unterminated");
+    let target = runtime.dir.join("out.bin");
+    let payload = b"complete-looking payload";
+    let wire = framed(payload);
+    let without_terminator = &wire[..wire.len() - 12];
+
+    let resp = runtime.serve(
+        json!({"action": "put_stream", "path": target.to_str().unwrap()}),
+        without_terminator,
+    );
+
+    assert_eq!(resp["code"], "incomplete_transfer", "{resp}");
+    assert!(!target.exists());
+}
+
+#[test]
+fn put_stream_refuses_an_empty_stream_so_a_failed_producer_cannot_blank_a_file() {
+    let runtime = Runtime::new("put-stream-empty");
+    let target = runtime.dir.join("db_password");
+    fs::write(&target, b"the-real-secret").unwrap();
+
+    // `producer | rx put -` where the producer failed: a well-formed stream of
+    // zero bytes. Installing it would atomically blank the file and report ok.
+    let resp = runtime.serve(
+        json!({"action": "put_stream", "path": target.to_str().unwrap()}),
+        &framed(b""),
+    );
+
+    assert_eq!(resp["type"], "error", "{resp}");
+    assert_eq!(resp["code"], "empty_stream", "{resp}");
+    // Not retryable: the same broken pipeline yields the same empty stream.
+    // (`retryable` is omitted when false, which consumers read as false.)
+    assert!(!resp["retryable"].as_bool().unwrap_or(false), "{resp}");
+    assert!(resp["hint"].is_string(), "{resp}");
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        b"the-real-secret",
+        "the existing file must survive untouched"
+    );
+    assert!(leftover_temps(&runtime.dir).is_empty());
+}
+
+#[test]
+fn put_stream_allow_empty_writes_the_empty_file_on_purpose() {
+    let runtime = Runtime::new("put-stream-empty-ok");
+    let target = runtime.dir.join("marker");
+
+    let resp = runtime.serve(
+        json!({"action": "put_stream", "path": target.to_str().unwrap(), "allow_empty": true}),
+        &framed(b""),
+    );
+
+    assert_eq!(resp["type"], "copied", "{resp}");
+    assert_eq!(resp["bytes"].as_u64(), Some(0));
+    assert!(target.exists());
+    assert_eq!(fs::read(&target).unwrap(), b"");
+}
+
+#[test]
+fn put_reports_the_mode_the_file_actually_got() {
+    // Sized put with no --mode: 0600, not null. An agent placing a secret can
+    // assert on this instead of trusting a default.
+    let runtime = Runtime::new("put-effective-mode");
+    let target = runtime.dir.join("out.bin");
+    let payload = b"bytes";
+
+    let resp = runtime.serve(
+        json!({"action": "put", "path": target.to_str().unwrap(), "size": payload.len()}),
+        payload,
+    );
+
+    assert_eq!(resp["type"], "copied", "{resp}");
+    assert_eq!(resp["mode"], "0600", "{resp}");
+}
+
 #[test]
 fn get_streams_file_with_header_and_bytes() {
     let runtime = Runtime::new("get-basic");
@@ -612,7 +769,7 @@ fn get_streams_file_with_header_and_bytes() {
 
     assert_eq!(header["type"], "get_stream", "{header}");
     assert_eq!(header["size"].as_u64(), Some(content.len() as u64));
-    assert_eq!(header["mode"].as_u64(), Some(0o640));
+    assert_eq!(header["mode"], "0640");
     assert_eq!(body, content);
 }
 

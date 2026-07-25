@@ -9,6 +9,154 @@ use crate::ssh::{RemoteArgs, ssh_command, ssh_exec};
 const RELEASE_BASE_URL: &str = "https://github.com/kwinsch/rem-exec/releases/download";
 const SUPPORTED_ARCHES: &[&str] = &["x86_64", "aarch64", "riscv64", "armv7"];
 
+/// How much rx may do on its own when a host's rxd is missing or mismatched.
+///
+/// rx and rxd are two halves of one wire protocol, so the only correct rxd for
+/// a given rx is its own version — there is no separate version to pin, and the
+/// pin is the rx binary itself. What an operator actually wants to control is
+/// *when remote hosts change*, which is what this selects. The default is
+/// [`DeployPolicy::Off`]: rx never touches a host you did not tell it to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeployPolicy {
+    /// Never deploy as a side effect. A mismatch is reported as `not_deployed`
+    /// with the command that fixes it.
+    #[default]
+    Off,
+    /// May deploy from the local cache during another command, but never
+    /// downloads. For hosts that should self-heal from a pre-seeded cache with
+    /// no network access at run time.
+    Local,
+    /// May fetch the matching rxd and deploy it during another command.
+    On,
+}
+
+impl DeployPolicy {
+    /// Whether rx may deploy as a side effect of some other command.
+    pub fn implicit_deploy(self) -> bool {
+        !matches!(self, DeployPolicy::Off)
+    }
+
+    /// Whether rx may download a missing binary without being asked to.
+    pub fn implicit_fetch(self) -> bool {
+        matches!(self, DeployPolicy::On)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeployPolicy::Off => "off",
+            DeployPolicy::Local => "local",
+            DeployPolicy::On => "on",
+        }
+    }
+}
+
+/// Parse a policy from a flag value or env var. `1`/`true`/`yes` map to `on`
+/// so `REM_EXEC_AUTO_DEPLOY=1` keeps meaning what it did in 0.2.x.
+pub fn parse_policy(value: &str) -> Option<DeployPolicy> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "0" | "false" | "no" | "" => Some(DeployPolicy::Off),
+        "local" | "cache" => Some(DeployPolicy::Local),
+        "on" | "1" | "true" | "yes" => Some(DeployPolicy::On),
+        _ => None,
+    }
+}
+
+static POLICY: std::sync::OnceLock<DeployPolicy> = std::sync::OnceLock::new();
+
+/// Fix the policy for this process (from `--auto-deploy`). First call wins.
+pub fn set_policy(policy: DeployPolicy) {
+    let _ = POLICY.set(policy);
+}
+
+/// The effective policy: `--auto-deploy` if given, else `REM_EXEC_AUTO_DEPLOY`,
+/// else off.
+pub fn policy() -> DeployPolicy {
+    if let Some(p) = POLICY.get() {
+        return *p;
+    }
+    std::env::var("REM_EXEC_AUTO_DEPLOY")
+        .ok()
+        .and_then(|v| parse_policy(&v))
+        .unwrap_or_default()
+}
+
+/// The rxd version this rx speaks to, as a release tag.
+fn own_version() -> String {
+    format!("v{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// `(major, minor, patch)` for ordering. A `v` prefix and any pre-release or
+/// build suffix are dropped, so `0.3.1-rc1` orders as `0.3.1` — coarse, but the
+/// only question asked of it is "is this host behind us". Anything that is not
+/// three numeric components yields `None` so callers decline to guess rather
+/// than order two versions wrongly.
+fn version_tuple(version: &str) -> Option<(u64, u64, u64)> {
+    let core = version.trim().trim_start_matches('v');
+    let core = core.split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// Order a remote rxd version against this rx's own. `None` when either side
+/// cannot be parsed — the caller must then take whichever action is safe under
+/// uncertainty, not assume equality.
+pub fn compare_to_own_version(remote: &str) -> Option<std::cmp::Ordering> {
+    Some(version_tuple(remote)?.cmp(&version_tuple(env!("CARGO_PKG_VERSION"))?))
+}
+
+/// Whether a remote rxd is *provably* behind this rx. Used where the cost of
+/// being wrong is a needless deploy, so an unorderable version means "leave it
+/// alone".
+pub fn is_older_than_own(remote: &str) -> bool {
+    matches!(compare_to_own_version(remote), Some(std::cmp::Ordering::Less))
+}
+
+/// Whether a remote rxd is *provably* ahead of this rx.
+pub fn is_newer_than_own(remote: &str) -> bool {
+    matches!(
+        compare_to_own_version(remote),
+        Some(std::cmp::Ordering::Greater)
+    )
+}
+
+/// Knobs for a deployment. Defaults suit an explicit `rx deploy`: fetch what is
+/// needed, refuse to move a host backwards.
+pub struct DeployOpts {
+    /// Push this local binary instead of a cached release asset.
+    pub binary: Option<PathBuf>,
+    /// May download the matching release asset if the cache lacks it.
+    pub allow_fetch: bool,
+    /// Permit replacing an rxd that speaks a *newer* protocol than this rx.
+    pub allow_downgrade: bool,
+}
+
+impl Default for DeployOpts {
+    fn default() -> Self {
+        Self {
+            binary: None,
+            allow_fetch: true,
+            allow_downgrade: false,
+        }
+    }
+}
+
+impl DeployOpts {
+    /// The opts an implicit (policy-driven) deploy runs with.
+    pub fn for_policy(policy: DeployPolicy) -> Self {
+        Self {
+            binary: None,
+            allow_fetch: policy.implicit_fetch(),
+            allow_downgrade: false,
+        }
+    }
+}
+
 /// Result of a successful deployment.
 pub struct DeployResult {
     pub host: String,
@@ -66,13 +214,37 @@ pub fn binary_store_dir() -> PathBuf {
     PathBuf::from(home).join(".local/share/rem-exec/bin")
 }
 
-/// Return the path to the local rxd binary for the given architecture.
-/// Errors if the binary does not exist.
-fn binary_for_arch(arch: &str) -> Result<PathBuf> {
-    let path = binary_store_dir().join(format!("rxd-{arch}"));
+/// Path a cached release asset lives at. The version is part of the name so an
+/// upgraded rx can never deploy the previous rx's binary: an unversioned cache
+/// passes an existence check and then fails *after* overwriting the remote.
+fn cached_binary_path(version: &str, arch: &str) -> PathBuf {
+    binary_store_dir().join(format!("rxd-{version}-{arch}"))
+}
+
+/// Locate the cached rxd matching this rx, fetching it when allowed.
+///
+/// Fetching during an explicit `rx deploy` is not "auto" anything — it finishes
+/// the job that was asked for. It is refused when the caller says so
+/// (`--offline`, or an implicit deploy under `--auto-deploy=local`), and then
+/// the error names the exact command that fills the cache.
+fn binary_for_arch(arch: &str, allow_fetch: bool) -> Result<PathBuf> {
+    let version = own_version();
+    let path = cached_binary_path(&version, arch);
+    if path.exists() {
+        return Ok(path);
+    }
+    if !allow_fetch {
+        return Err(RemExecError::Other(format!(
+            "no cached rxd {version} for {arch} at {} — run `rx setup --arch {arch}` \
+             (needs network), or pass --binary PATH to deploy a local build",
+            path.display(),
+        )));
+    }
+
+    setup_release_binaries(Some(&version), &[arch.to_string()], false)?;
     if !path.exists() {
         return Err(RemExecError::Other(format!(
-            "no binary for {arch} at {} — run `rx setup` first",
+            "rxd {version} for {arch} still missing at {} after fetch",
             path.display(),
         )));
     }
@@ -99,7 +271,7 @@ pub fn setup_release_binaries(
                 "SHA256SUMS for {version} does not contain checksum for {asset}"
             ))
         })?;
-        let dest = store.join(&asset);
+        let dest = cached_binary_path(&version, &arch);
 
         if !force && dest.exists() {
             let current = sha256_file(&dest)?;
@@ -114,7 +286,7 @@ pub fn setup_release_binaries(
             }
         }
 
-        let tmp = store.join(format!("{asset}.download-{}", std::process::id()));
+        let tmp = store.join(format!("{asset}-{version}.download-{}", std::process::id()));
         if tmp.exists() {
             fs::remove_file(&tmp)?;
         }
@@ -257,16 +429,70 @@ fn sha256_file(path: &Path) -> Result<String> {
         })
 }
 
+/// The reason to refuse replacing `host`'s rxd, if it is ahead of this rx.
+///
+/// A host can be ahead two ways: a later wire protocol, or a later build of the
+/// same protocol. Either means it belongs to a newer rx — someone else's, or a
+/// later one of yours — and "fixing" this rx by overwriting it would break that
+/// one. Only refuses when the remote is *provably* ahead: an unreadable version
+/// must not block an explicit deploy, which is the very thing that repairs a
+/// host in an unknown state.
+fn downgrade_refusal(host: &str) -> Option<String> {
+    let own = env!("CARGO_PKG_VERSION");
+    match remote_deploy_status(host) {
+        DeployStatus::Incompatible { version, protocol } if protocol > PROTOCOL_VERSION => {
+            Some(format!(
+                "refusing to downgrade {host}: it runs rxd {version} (protocol {protocol}), \
+                 newer than this rx {own} (protocol {PROTOCOL_VERSION}) — upgrade rx, or pass \
+                 --allow-downgrade to overwrite it anyway"
+            ))
+        }
+        DeployStatus::Current { version } | DeployStatus::Incompatible { version, .. } => {
+            is_newer_than_own(&version).then(|| {
+                format!(
+                    "refusing to downgrade {host}: it runs rxd {version}, newer than this rx \
+                     {own} — upgrade rx, or pass --allow-downgrade to overwrite it anyway"
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Deploy rem-execd to a remote host with default options (fetch if needed,
+/// never downgrade).
+pub fn deploy_to_host(host: &str) -> Result<DeployResult> {
+    deploy_to_host_with(host, &DeployOpts::default())
+}
+
 /// Deploy rem-execd to a remote host.
 ///
-/// 1. Detect remote architecture via `uname -m`
-/// 2. Find matching binary in local store
-/// 3. Ensure ~/.local/bin exists on remote
-/// 4. SCP binary to remote
-/// 5. Verify with version check
-pub fn deploy_to_host(host: &str) -> Result<DeployResult> {
+/// 1. Refuse to move a host backwards unless told to
+/// 2. Detect remote architecture via `uname -m`
+/// 3. Find the matching binary locally (fetching it when allowed)
+/// 4. Ensure ~/.local/bin exists on remote
+/// 5. SCP binary to remote
+/// 6. Verify with version check
+pub fn deploy_to_host_with(host: &str, opts: &DeployOpts) -> Result<DeployResult> {
+    if !opts.allow_downgrade
+        && let Some(refusal) = downgrade_refusal(host)
+    {
+        return Err(RemExecError::Other(refusal));
+    }
+
     let arch = detect_arch(host)?;
-    let local_binary = binary_for_arch(&arch)?;
+    let local_binary = match &opts.binary {
+        Some(path) => {
+            if !path.exists() {
+                return Err(RemExecError::Other(format!(
+                    "no such binary: {}",
+                    path.display()
+                )));
+            }
+            path.clone()
+        }
+        None => binary_for_arch(&arch, opts.allow_fetch)?,
+    };
 
     // Ensure remote directory exists
     let mkdir = ssh_command(host)
@@ -282,8 +508,11 @@ pub fn deploy_to_host(host: &str) -> Result<DeployResult> {
     }
 
     // SCP binary to remote
+    let binary_arg = local_binary.to_str().ok_or_else(|| {
+        RemExecError::Other(format!("binary path is not valid UTF-8: {}", local_binary.display()))
+    })?;
     let scp = Command::new("scp")
-        .arg(local_binary.to_str().unwrap())
+        .arg(binary_arg)
         .arg(format!("{host}:.local/bin/rxd"))
         .output()
         .map_err(RemExecError::Io)?;
@@ -312,8 +541,13 @@ fn verify_remote_version(host: &str) -> Result<String> {
             version, protocol, ..
         } => {
             if protocol != PROTOCOL_VERSION {
+                // The copy succeeded but the binary is the wrong one — a
+                // hand-picked --binary, or a stale cache entry.
                 return Err(RemExecError::Protocol(format!(
-                    "remote protocol {protocol} != local {PROTOCOL_VERSION} after deploy"
+                    "deployed rxd {version} on {host} speaks protocol {protocol}, but rx \
+                     {} needs {PROTOCOL_VERSION} — the deployed binary is not the matching \
+                     build (retry without --binary, or `rx setup --force`)",
+                    env!("CARGO_PKG_VERSION"),
                 )));
             }
             Ok(version)
@@ -344,11 +578,10 @@ pub fn should_auto_deploy(err: &RemExecError) -> bool {
     }
 }
 
-/// Returns true if REM_EXEC_AUTO_DEPLOY=1 is set.
+/// Whether rx may deploy to `host` as a side effect of the current command, per
+/// the effective [`policy`].
 pub fn auto_deploy_enabled() -> bool {
-    std::env::var("REM_EXEC_AUTO_DEPLOY")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    policy().implicit_deploy()
 }
 
 /// What the remote's rxd looks like, determined by probing the stable `version`
@@ -403,13 +636,77 @@ pub fn not_deployed_response(host: &str, status: &DeployStatus) -> Response {
         _ => format!("rxd is missing or unversioned on {host}"),
     };
     Response::error_code(ErrorCode::NotDeployed, detail).with_hint(format!(
-        "run `rx deploy {host}` to install the matching rxd, or set REM_EXEC_AUTO_DEPLOY=1 to deploy and retry automatically"
+        "run `rx deploy {host}` — it installs rxd {}, fetching it if the local cache lacks it; \
+         or pass --auto-deploy=on (env REM_EXEC_AUTO_DEPLOY=on) to let rx do that during a \
+         command instead of failing",
+        own_version(),
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_parses_flag_values_and_the_legacy_env_form() {
+        assert_eq!(parse_policy("off"), Some(DeployPolicy::Off));
+        assert_eq!(parse_policy("local"), Some(DeployPolicy::Local));
+        assert_eq!(parse_policy("on"), Some(DeployPolicy::On));
+        // REM_EXEC_AUTO_DEPLOY=1 kept meaning what it did in 0.2.x.
+        assert_eq!(parse_policy("1"), Some(DeployPolicy::On));
+        assert_eq!(parse_policy("0"), Some(DeployPolicy::Off));
+        assert_eq!(parse_policy(" On "), Some(DeployPolicy::On));
+        assert_eq!(parse_policy("sometimes"), None);
+        // Default is the careful one: hosts never change as a side effect.
+        assert_eq!(DeployPolicy::default(), DeployPolicy::Off);
+    }
+
+    #[test]
+    fn policy_gates_side_effects_not_explicit_deploys() {
+        assert!(!DeployPolicy::Off.implicit_deploy());
+        assert!(DeployPolicy::Local.implicit_deploy());
+        assert!(!DeployPolicy::Local.implicit_fetch());
+        assert!(DeployPolicy::On.implicit_fetch());
+    }
+
+    #[test]
+    fn version_ordering_handles_the_shapes_rxd_reports() {
+        assert_eq!(version_tuple("0.3.1"), Some((0, 3, 1)));
+        assert_eq!(version_tuple("v0.3.1"), Some((0, 3, 1)));
+        assert_eq!(version_tuple("1.10.0"), Some((1, 10, 0)));
+        // Pre-release/build metadata is dropped rather than mis-ordered.
+        assert_eq!(version_tuple("0.3.1-rc1"), Some((0, 3, 1)));
+        // Anything else is unorderable, not "equal".
+        assert_eq!(version_tuple("0.3"), None);
+        assert_eq!(version_tuple("0.3.1.2"), None);
+        assert_eq!(version_tuple("nightly"), None);
+        assert_eq!(version_tuple(""), None);
+        // 10 > 9 numerically, not lexically.
+        assert!(version_tuple("0.10.0") > version_tuple("0.9.0"));
+    }
+
+    #[test]
+    fn version_comparisons_only_fire_when_provable() {
+        let own = env!("CARGO_PKG_VERSION");
+        assert!(!is_older_than_own(own));
+        assert!(!is_newer_than_own(own));
+        assert!(is_older_than_own("0.0.1"));
+        assert!(is_newer_than_own("99.0.0"));
+        // Unorderable: neither older nor newer, so callers take the safe path
+        // (no needless deploy, and no block on an explicit one).
+        assert!(!is_older_than_own("nightly"));
+        assert!(!is_newer_than_own("nightly"));
+    }
+
+    #[test]
+    fn cached_binaries_are_keyed_by_version() {
+        // The 0.2.x cache was version-blind, so an upgraded rx could deploy the
+        // previous binary and only notice after overwriting the remote.
+        let old = cached_binary_path("v0.2.1", "x86_64");
+        let new = cached_binary_path("v0.3.0", "x86_64");
+        assert_ne!(old, new);
+        assert!(new.ends_with("rxd-v0.3.0-x86_64"));
+    }
 
     #[test]
     fn normalizes_release_versions() {

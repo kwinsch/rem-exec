@@ -38,7 +38,81 @@ Shipped since 0.2.0:
   temp→rename, size-verified, source mode preserved unless overridden. rxd sends
   a one-line JSON header (size/mode or a typed error) then raw bytes; no base64.
 
+Shipped in 0.3.0:
+- `rx put` — `cp` renamed (kept as an undocumented alias), so the transfer pair
+  reads `put`/`get`. `put -` streams stdin: a value goes from a pipeline to a
+  remote file without a local temp file or an argv, at 0600 before the file is
+  visible. `rxv get host1/db_password | rx put - host1:/run/secrets/db_pass`.
+  Since stdin has no length known in advance, the body is length-framed with an
+  end marker (`src/framing.rs`) — a severed stream ends without its marker and is
+  rejected as `incomplete_transfer`, exactly as a short sized transfer is.
+  Carried as a separate `put_stream` action rather than a flag on `put`: an older
+  rxd ignores unknown *fields* (and would write the frame headers into the file)
+  but rejects an unknown *action*. Boundary worth stating: put guarantees "what
+  rx read landed, or nothing landed" — the remote does write plaintext to disk
+  (that is the point), and a pipe cannot tell a producer that finished from one
+  that died.
+- Empty-stream guard — a zero-byte stdin transfer is refused (`empty_stream`,
+  not retryable) unless `--allow-empty`. A failed producer sends a *well-formed*
+  stream of zero bytes, so framing cannot catch it; installing it would blank a
+  good secret and report success.
+- Transport error fidelity — a body-write failure no longer masks the receiver's
+  answer. rxd answering early (unwritable target) closed the pipe and rx reported
+  `broken pipe`, so error quality depended on whether the payload fit in the pipe
+  buffer; it also stopped auto-deploy from firing for large files against a host
+  with no rxd.
+- Deploy policy — `--auto-deploy=off|local|on` (env `REM_EXEC_AUTO_DEPLOY`,
+  `1` still means on), default **off**. rx and rxd are halves of one protocol, so
+  there is no separate version to pin; the pin is the rx binary, and what an
+  operator controls is when *hosts* change. `off` never deploys as a side effect,
+  `local` repairs from the cache without downloading, `on` may fetch. Explicit
+  `rx deploy` is always allowed and completes the job it was given.
+- Deploy workflow — `rx deploy HOST...` takes several hosts, fetches the matching
+  asset when the cache lacks it, `--offline` refuses to download, `--binary PATH`
+  pushes a local build (so an unreleased rxd can be tested). The cache is keyed
+  by version, so an upgraded rx can no longer deploy the previous version's
+  binary and fail *after* overwriting the remote. rx refuses to replace an rxd
+  that is ahead of it — later protocol, or a later build of the same protocol —
+  without `--allow-downgrade`; that host belongs to a newer rx, and repairing
+  this one by breaking that one is not a trade rx gets to make silently.
+  Version comparisons only fire when the ordering is provable, so an unreadable
+  version never causes a needless deploy nor blocks an explicit repair.
+- `ping` reports `up_to_date` + `local_version`. Version skew belongs in the
+  health probe, not as a warning on every command: an older rxd is still correct
+  for nearly every request, and a per-command warning trains an agent to ignore
+  it.
+- Modes are octal strings (`"0600"`) in `copied`/`got`/`get_stream`, matching
+  what `--mode` accepts. A decimal `384` is the same number and unreadable.
+
 Everything below is proposed, not committed. Ordered by agent-experience value.
+
+## Next
+
+### Declared capabilities instead of inferred compatibility
+
+Compatibility is currently inferred from the protocol number, which answers
+"can we talk" but not "does this host support the request I am about to send".
+`put_stream` exposed the gap: it was additive, so protocol 2 stayed 2, and a
+0.2.x rxd looks current right up until that one request fails. The stopgap is
+`put -`'s own version check.
+
+As the wire settles, additive changes become the normal kind, so this recurs
+per feature and protocol equality over-approximates a little more each time —
+while exact-version equality over-constrains, forcing a fleet redeploy for
+patches that changed nothing you use. Both are proxies for the real question.
+
+Answer it directly: have `version`/`ping` declare a monotonic capability level
+(or a feature list), and let each request state its floor. `put -`'s pre-flight
+then stops being a special case and becomes the general rule, correctly scoped —
+deploy when the host genuinely lacks the capability, not when a digit differs.
+Worth building at the second or third additive action, not the first.
+
+### Stale transfer temps
+
+If rxd is killed mid-transfer (SIGHUP on a severed session, not the ordinary
+dropped-connection case, which already cleans up) a `.rxd-put-*.tmp` survives in
+the target directory holding partial content at 0600. Sweep temps older than an
+hour on the next put into that directory, or from `rx clean`.
 
 ## Nice-to-have
 

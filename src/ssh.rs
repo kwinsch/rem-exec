@@ -38,36 +38,58 @@ pub fn ssh_command(host: &str) -> Command {
 /// stdin before emitting, so writing the whole body then reading cannot
 /// deadlock even when the body exceeds the OS pipe buffer.
 pub fn serve_request(host: &str, request: &Request, body: &[u8]) -> Result<Response> {
-    let mut child = ssh_command(host)
-        .arg(REMOTE_BIN)
-        .arg("serve")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(RemExecError::Io)?;
-
-    {
-        let mut stdin = child.stdin.take().expect("stdin was piped");
-        let mut line = serde_json::to_vec(request)?;
-        line.push(b'\n');
-        stdin.write_all(&line)?;
-        if !body.is_empty() {
-            stdin.write_all(body)?;
+    serve_with_body(host, request, |stdin| {
+        if body.is_empty() {
+            Ok(())
+        } else {
+            stdin.write_all(body)
         }
-        // Dropping stdin closes the write side (EOF) so rxd stops reading.
-    }
-
-    parse_serve_output(child.wait_with_output().map_err(RemExecError::Io)?)
+    })
 }
 
-/// Like [`serve_request`] but streams the body from a reader (used by `cp`),
+/// Like [`serve_request`] but streams the body from a reader (used by `put`),
 /// so large files never sit fully in memory on either side.
 pub fn serve_request_stream(
     host: &str,
     request: &Request,
     body: &mut dyn std::io::Read,
 ) -> Result<Response> {
+    serve_with_body(host, request, |stdin| {
+        std::io::copy(body, stdin).map(|_| ())
+    })
+}
+
+/// Like [`serve_request_stream`] but frames the body (see [`crate::framing`]),
+/// so a receiver can tell a finished stream from a severed one without knowing
+/// the length in advance. Pairs with [`Request::PutStream`].
+pub fn serve_request_framed(
+    host: &str,
+    request: &Request,
+    body: &mut dyn std::io::Read,
+) -> Result<Response> {
+    serve_with_body(host, request, |stdin| {
+        crate::framing::write_framed(body, stdin).map(|_| ())
+    })
+}
+
+/// Send one framed request whose body is produced by `write_body`, then decode
+/// the single JSON response.
+///
+/// Body-write failures are deliberately not fatal on their own. When rxd
+/// answers early and exits — an unwritable target directory, say — it closes
+/// the pipe and our write dies with EPIPE partway through a large body. That
+/// EPIPE is a symptom; rxd's typed response (or ssh's stderr, which is what
+/// tells auto-deploy that rxd is missing) is the actual cause, and reporting
+/// the symptom instead made error quality depend on whether the payload
+/// happened to fit in the pipe buffer.
+fn serve_with_body(
+    host: &str,
+    request: &Request,
+    write_body: impl FnOnce(&mut std::process::ChildStdin) -> std::io::Result<()>,
+) -> Result<Response> {
+    let mut line = serde_json::to_vec(request)?;
+    line.push(b'\n');
+
     let mut child = ssh_command(host)
         .arg(REMOTE_BIN)
         .arg("serve")
@@ -77,15 +99,25 @@ pub fn serve_request_stream(
         .spawn()
         .map_err(RemExecError::Io)?;
 
-    {
+    let write_result = {
         let mut stdin = child.stdin.take().expect("stdin was piped");
-        let mut line = serde_json::to_vec(request)?;
-        line.push(b'\n');
-        stdin.write_all(&line)?;
-        std::io::copy(body, &mut stdin).map_err(RemExecError::Io)?;
-    }
+        let r = stdin.write_all(&line).and_then(|()| write_body(&mut stdin));
+        // Closes the write side (EOF) so rxd stops reading and answers.
+        drop(stdin);
+        r
+    };
 
-    parse_serve_output(child.wait_with_output().map_err(RemExecError::Io)?)
+    let output = child.wait_with_output().map_err(RemExecError::Io)?;
+
+    match (parse_serve_output(output), write_result) {
+        // rxd explained itself — that beats any local write symptom.
+        (Ok(resp @ Response::Error { .. }), _) => Ok(resp),
+        (Ok(resp), Ok(())) => Ok(resp),
+        // A success response we can't trust: the body never fully arrived, so
+        // whatever rxd acted on is not what we meant to send.
+        (Ok(_), Err(e)) => Err(RemExecError::Io(e)),
+        (Err(transport_err), _) => Err(transport_err),
+    }
 }
 
 /// Spawn `rxd serve` for a streaming *download*: write the request line, then
@@ -180,8 +212,9 @@ pub fn serve_request_auto_deploy(host: &str, request: &Request, body: &[u8]) -> 
             // from the failure's stderr text.
             match deploy::remote_deploy_status(host) {
                 deploy::DeployStatus::Current { .. } | deploy::DeployStatus::Unknown => Err(e),
-                _ if deploy::auto_deploy_enabled() => {
-                    deploy::deploy_to_host(host).map_err(|de| {
+                _ if deploy::policy().implicit_deploy() => {
+                    let opts = deploy::DeployOpts::for_policy(deploy::policy());
+                    deploy::deploy_to_host_with(host, &opts).map_err(|de| {
                         RemExecError::Ssh(format!(
                             "auto-deploy to {host} failed: {de} (original: {e})"
                         ))

@@ -90,6 +90,29 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group: Option<String>,
     },
+    /// Write a length-framed request body to a file at `path`, atomically — the
+    /// `Put` of a stream whose length is not known in advance (`rx put -`).
+    ///
+    /// Completeness travels inside the body (see [`crate::framing`]) instead of
+    /// in a `size` field: the file is installed only if the terminator arrives.
+    /// This is a separate action rather than a flag on `Put` on purpose — an
+    /// older rxd silently ignores unknown *fields* (and would write the frame
+    /// headers into the file), but rejects an unknown *action* outright.
+    PutStream {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
+        /// Install a zero-byte file instead of rejecting it. Default false: a
+        /// failed upstream pipe (`producer | rx put -`) sends a well-formed
+        /// stream of zero bytes, and installing that would atomically replace a
+        /// good file with an empty one and report success.
+        #[serde(default)]
+        allow_empty: bool,
+    },
     CloseStdin {
         id: String,
     },
@@ -137,6 +160,11 @@ pub enum ErrorCode {
     /// A streamed transfer ended before the declared byte count (e.g. a dropped
     /// connection); the partial file was discarded, not installed.
     IncompleteTransfer,
+    /// A stdin transfer carried zero bytes and `--allow-empty` was not set —
+    /// almost always a failed producer in the pipeline, not an intended empty
+    /// file. Nothing was written. Not retryable: rerunning the same broken pipe
+    /// produces the same empty stream.
+    EmptyStream,
     /// A referenced path does not exist (e.g. `get` of a missing file).
     NotFound,
     /// Unexpected internal failure.
@@ -229,18 +257,21 @@ pub enum Response {
     #[serde(rename = "written")]
     Written { bytes: usize },
 
+    /// `put`/`put -` result. `mode` is the mode the installed file actually has,
+    /// not the one requested — with no `--mode` a put lands 0600 (inherited from
+    /// the private temp file), so reporting the request would understate it.
     #[serde(rename = "copied")]
     Copied {
         path: String,
         bytes: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
-        mode: Option<u32>,
+        mode: Option<String>,
     },
 
     /// `get` header line, written before the raw file bytes: the client reads
     /// exactly `size` bytes next. `mode` is the source file's permission bits.
     #[serde(rename = "get_stream")]
-    GetStream { size: u64, mode: u32 },
+    GetStream { size: u64, mode: String },
 
     /// `get` final result, synthesized by the client after the local file is
     /// verified (`bytes == size`) and atomically renamed into place.
@@ -249,7 +280,7 @@ pub enum Response {
         path: String,
         bytes: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
-        mode: Option<u32>,
+        mode: Option<String>,
     },
 
     #[serde(rename = "killed")]
@@ -295,6 +326,19 @@ pub enum Response {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// Render permission bits the way `--mode` accepts them (`0600`), so what a
+/// response reports can be passed straight back into the next command. A
+/// decimal 384 is technically the same number and useless to read.
+pub fn octal_mode(mode: u32) -> String {
+    format!("{:04o}", mode & 0o7777)
+}
+
+/// Parse permission bits from `0644`, `644`, or `0o644`.
+pub fn parse_octal_mode(s: &str) -> Result<u32, String> {
+    let digits = s.strip_prefix("0o").unwrap_or(s);
+    u32::from_str_radix(digits, 8).map_err(|_| format!("invalid mode '{s}' (expected octal like 0644)"))
 }
 
 fn default_true() -> bool {

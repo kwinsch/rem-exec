@@ -36,6 +36,12 @@ struct Cli {
     /// Emit single-line JSON instead of pretty-printed (or REM_EXEC_JSON=compact)
     #[arg(long, global = true)]
     compact: bool,
+    /// When rx may deploy rxd during another command: off (default, never),
+    /// local (from the cache only), on (fetch + deploy). Env:
+    /// REM_EXEC_AUTO_DEPLOY. `rx deploy` is always allowed — this governs
+    /// whether a host can change as a side effect of something else.
+    #[arg(long, value_name = "off|local|on", global = true)]
+    auto_deploy: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -168,23 +174,35 @@ enum Command {
         /// Remote host
         host: String,
     },
-    /// Deploy rem-execd to a remote host (detects architecture automatically)
+    /// Deploy rem-execd to one or more hosts (detects architecture automatically)
     Deploy {
-        /// Remote host (SSH destination)
-        host: String,
+        /// Remote hosts (SSH destinations)
+        #[arg(required = true)]
+        hosts: Vec<String>,
+        /// Deploy this local rxd build instead of a cached release asset
+        #[arg(long, value_name = "PATH")]
+        binary: Option<std::path::PathBuf>,
+        /// Never download; deploy only what the local cache already has
+        #[arg(long)]
+        offline: bool,
+        /// Allow replacing an rxd that speaks a newer protocol than this rx
+        #[arg(long)]
+        allow_downgrade: bool,
     },
     /// Probe reachability + host identity (rxd version, OS, kernel, arch, distro)
     Ping {
         /// Remote host (SSH destination)
         host: String,
     },
-    /// Copy a local file to a remote path (atomic; optional mode/owner/group)
-    Cp {
-        /// Local source file
+    /// Write a local file — or stdin, with `-` — to a remote path (atomic;
+    /// optional mode/owner/group)
+    #[command(alias = "cp")]
+    Put {
+        /// Local source file, or `-` to stream stdin (use ./- for a file so named)
         local: String,
         /// Destination as HOST:REMOTE_PATH
         remote: String,
-        /// File mode in octal, e.g. 0644
+        /// File mode in octal, e.g. 0644 (default: 0600)
         #[arg(long)]
         mode: Option<String>,
         /// Owner user name or uid (needs a privileged rxd)
@@ -193,6 +211,10 @@ enum Command {
         /// Group name or gid (needs a privileged rxd)
         #[arg(long)]
         group: Option<String>,
+        /// With `-`: write an empty file when stdin carries no bytes, instead of
+        /// refusing (an empty stream usually means the producer failed)
+        #[arg(long)]
+        allow_empty: bool,
     },
     /// Download a remote file to a local path (atomic; verifies full size)
     Get {
@@ -237,6 +259,19 @@ fn main() -> ExitCode {
         COMPACT_JSON.store(true, Ordering::Relaxed);
     }
 
+    // Fix the deploy policy before anything can act on it. Unset falls back to
+    // REM_EXEC_AUTO_DEPLOY, then to "off" — rx never changes a host you did not
+    // point it at.
+    if let Some(raw) = cli.auto_deploy.as_deref() {
+        match rem_exec::deploy::parse_policy(raw) {
+            Some(policy) => rem_exec::deploy::set_policy(policy),
+            None => {
+                eprintln!("error: invalid --auto-deploy '{raw}' (expected off, local, or on)");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     // Handle daemon subcommands directly
     if let Command::Daemon { action } = &cli.command {
         return match action {
@@ -247,40 +282,40 @@ fn main() -> ExitCode {
     }
 
     // Deploy is always handled locally (no daemon routing)
-    if let Command::Deploy { host } = &cli.command {
-        return match rem_exec::deploy::deploy_to_host(host) {
-            Ok(result) => {
-                print_json(&serde_json::json!({
-                    "type": "deployed",
-                    "host": result.host,
-                    "arch": result.arch,
-                    "version": result.version,
-                }));
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::FAILURE
-            }
-        };
+    if let Command::Deploy {
+        hosts,
+        binary,
+        offline,
+        allow_downgrade,
+    } = &cli.command
+    {
+        return do_deploy(hosts, binary.clone(), *offline, *allow_downgrade);
     }
 
-    // Copy streams a file directly over SSH (not through the daemon).
-    if let Command::Cp {
+    // Put streams its body directly over SSH (not through the daemon).
+    if let Command::Put {
         local,
         remote,
         mode,
         owner,
         group,
+        allow_empty,
     } = &cli.command
     {
-        return do_cp(local, remote, mode.as_deref(), owner.clone(), group.clone());
+        return do_put(
+            local,
+            remote,
+            mode.as_deref(),
+            owner.clone(),
+            group.clone(),
+            *allow_empty,
+        );
     }
 
     // Ping is a stateless probe: go direct over SSH (no daemon), honoring
     // auto-deploy like other remote commands.
     if let Command::Ping { host } = &cli.command {
-        return dispatch_simple(host, &Request::Ping, &[]);
+        return do_ping(host);
     }
 
     // Get streams a remote file down directly over SSH (not through the daemon).
@@ -609,7 +644,7 @@ fn route_via_ssh(command: &Command) -> ExitCode {
         Command::Deploy { .. }
         | Command::Ping { .. }
         | Command::Get { .. }
-        | Command::Cp { .. }
+        | Command::Put { .. }
         | Command::Setup { .. }
         | Command::Skill
         | Command::Daemon { .. } => unreachable!("handled before routing"),
@@ -662,19 +697,118 @@ fn parse_env(pairs: &[String]) -> Result<BTreeMap<String, String>, String> {
 
 /// Parse an octal file mode like `0644`, `644`, or `0o644`.
 fn parse_mode(s: &str) -> Result<u32, String> {
-    let digits = s.strip_prefix("0o").unwrap_or(s);
-    u32::from_str_radix(digits, 8)
+    rem_exec::protocol::parse_octal_mode(s)
         .map_err(|_| format!("invalid --mode '{s}' (expected octal like 0644)"))
 }
 
-/// Stream a local file to `HOST:PATH` via the `put` request, with one
-/// auto-deploy retry. Runs direct (not through the daemon).
-fn do_cp(
+/// Deploy rxd to each host in turn, reporting one result per host. Explicit, so
+/// it may fetch the matching binary unless `--offline`; the deploy policy only
+/// governs deploys that happen as a side effect of other commands.
+fn do_deploy(
+    hosts: &[String],
+    binary: Option<std::path::PathBuf>,
+    offline: bool,
+    allow_downgrade: bool,
+) -> ExitCode {
+    let opts = rem_exec::deploy::DeployOpts {
+        binary,
+        allow_fetch: !offline,
+        allow_downgrade,
+    };
+
+    let mut results = Vec::with_capacity(hosts.len());
+    let mut failed = false;
+    for host in hosts {
+        match rem_exec::deploy::deploy_to_host_with(host, &opts) {
+            Ok(result) => results.push(serde_json::json!({
+                "host": result.host,
+                "arch": result.arch,
+                "version": result.version,
+                "status": "deployed",
+            })),
+            Err(e) => {
+                failed = true;
+                eprintln!("error: {host}: {e}");
+                results.push(serde_json::json!({
+                    "host": host,
+                    "status": "failed",
+                    "error": e.to_string(),
+                }));
+            }
+        }
+    }
+
+    // One host stays a flat object; several become a list, so the common case
+    // reads exactly as it did before.
+    if let [only] = results.as_slice() {
+        let mut value = only.clone();
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("type".into(), serde_json::json!("deployed"));
+        }
+        print_json(&value);
+    } else {
+        print_json(&serde_json::json!({"type": "deployed", "hosts": results}));
+    }
+
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Probe a host, annotating the reply with whether its rxd matches this rx.
+/// `ping` is the health probe, so version skew is reported here rather than as
+/// a warning on every command — a 0.2.x rxd is still correct for everything
+/// except the newest requests, and crying wolf on each call would train an
+/// agent to ignore it.
+fn do_ping(host: &str) -> ExitCode {
+    match serve_request_auto_deploy(host, &Request::Ping, &[]) {
+        Ok(resp) => {
+            let mut value = serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null);
+            if let Response::Ping {
+                version, protocol, ..
+            } = &resp
+                && let Some(obj) = value.as_object_mut()
+            {
+                let local = env!("CARGO_PKG_VERSION");
+                let matched =
+                    *protocol == rem_exec::protocol::PROTOCOL_VERSION && version == local;
+                obj.insert("local_version".into(), serde_json::json!(local));
+                obj.insert("up_to_date".into(), serde_json::json!(matched));
+                if !matched {
+                    // Point at the end that is actually behind: telling someone
+                    // to deploy onto a newer host would only earn a refusal.
+                    let hint = if rem_exec::deploy::is_newer_than_own(version) {
+                        format!(
+                            "{host} runs rxd {version}, ahead of rx {local} — upgrade rx rather \
+                             than deploying onto it"
+                        )
+                    } else {
+                        format!("run `rx deploy {host}` to match rx {local}")
+                    };
+                    obj.insert("hint".into(), serde_json::json!(hint));
+                }
+            }
+            print_json(&value);
+            exit_for(&resp)
+        }
+        Err(e) => {
+            print_json_response(&transport_error_json(host, &e));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Write a local file or stdin to `HOST:PATH`. Runs direct (not through the
+/// daemon).
+fn do_put(
     local: &str,
     remote: &str,
     mode: Option<&str>,
     owner: Option<String>,
     group: Option<String>,
+    allow_empty: bool,
 ) -> ExitCode {
     let (host, path) = match remote.split_once(':') {
         Some((h, p)) if !h.is_empty() && !p.is_empty() => (h, p),
@@ -694,8 +828,34 @@ fn do_cp(
         None => None,
     };
 
-    // Each send re-opens the file so an auto-deploy retry starts fresh, and
-    // re-stats it so the declared size matches the bytes actually streamed.
+    let result = if local == "-" {
+        put_stdin(host, path, mode, owner, group, allow_empty)
+    } else {
+        put_file(local, host, path, mode, owner, group)
+    };
+
+    match result {
+        Ok(resp) => {
+            print_json_response(&resp);
+            exit_for(&resp)
+        }
+        Err(e) => {
+            print_json_response(&transport_error_json(host, &e));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Stream a local file, declaring its size up front. Retryable: each attempt
+/// re-opens and re-stats the file, so an auto-deploy retry starts clean.
+fn put_file(
+    local: &str,
+    host: &str,
+    path: &str,
+    mode: Option<u32>,
+    owner: Option<String>,
+    group: Option<String>,
+) -> rem_exec::error::Result<Response> {
     let send = || -> rem_exec::error::Result<Response> {
         let mut f = std::fs::File::open(local)?;
         let size = f.metadata()?.len();
@@ -709,9 +869,13 @@ fn do_cp(
         rem_exec::ssh::serve_request_stream(host, &request, &mut f)
     };
 
-    let result = match send() {
-        Err(e) if rem_exec::deploy::auto_deploy_enabled() && rem_exec::deploy::should_auto_deploy(&e) => {
-            match rem_exec::deploy::deploy_to_host(host) {
+    match send() {
+        Err(e)
+            if rem_exec::deploy::policy().implicit_deploy()
+                && rem_exec::deploy::should_auto_deploy(&e) =>
+        {
+            let opts = rem_exec::deploy::DeployOpts::for_policy(rem_exec::deploy::policy());
+            match rem_exec::deploy::deploy_to_host_with(host, &opts) {
                 Ok(_) => send(),
                 Err(de) => Err(rem_exec::error::RemExecError::Ssh(format!(
                     "auto-deploy to {host} failed: {de} (original: {e})"
@@ -719,18 +883,91 @@ fn do_cp(
             }
         }
         other => other,
-    };
+    }
+}
 
-    match result {
-        Ok(resp) => {
-            print_json_response(&resp);
-            exit_for(&resp)
-        }
-        Err(e) => {
-            print_json_response(&transport_error_json(host, &e));
-            ExitCode::FAILURE
+/// Stream stdin, framed so the receiver can tell a finished stream from a
+/// severed one.
+///
+/// There is no retry here: stdin cannot be rewound, so anything that would
+/// normally be fixed and retried has to be settled *before* the first byte is
+/// read. Under a policy that permits it, that means probing the host and
+/// deploying first; otherwise the transfer runs once and reports why it failed.
+fn put_stdin(
+    host: &str,
+    path: &str,
+    mode: Option<u32>,
+    owner: Option<String>,
+    group: Option<String>,
+    allow_empty: bool,
+) -> rem_exec::error::Result<Response> {
+    if std::io::stdin().is_terminal() {
+        return Err(rem_exec::error::RemExecError::Other(
+            "`rx put -` reads the file from stdin, but stdin is a terminal — pipe something \
+             into it, or pass a path instead of `-` (./- for a file named `-`)"
+                .to_string(),
+        ));
+    }
+
+    if rem_exec::deploy::policy().implicit_deploy() {
+        use rem_exec::deploy::DeployStatus;
+        // A protocol match is not enough here: a 0.2.x rxd speaks this protocol
+        // but has no streamed put, and finding that out costs the stdin we
+        // cannot rewind. So this one command also requires the host not be
+        // *behind* us. Only provably-older triggers a deploy — a host that is
+        // ahead already has the feature, and pushing our build over it would
+        // downgrade someone else's rx.
+        let needs_deploy = match rem_exec::deploy::remote_deploy_status(host) {
+            DeployStatus::Current { version } => rem_exec::deploy::is_older_than_own(&version),
+            DeployStatus::Unknown => false,
+            _ => true,
+        };
+        if needs_deploy {
+            let opts = rem_exec::deploy::DeployOpts::for_policy(rem_exec::deploy::policy());
+            rem_exec::deploy::deploy_to_host_with(host, &opts).map_err(|de| {
+                rem_exec::error::RemExecError::Ssh(format!("auto-deploy to {host} failed: {de}"))
+            })?;
         }
     }
+
+    let request = Request::PutStream {
+        path: path.to_string(),
+        mode,
+        owner,
+        group,
+        allow_empty,
+    };
+    let stdin = std::io::stdin();
+    let mut handle = stdin.lock();
+    let resp = rem_exec::ssh::serve_request_framed(host, &request, &mut handle)?;
+    Ok(explain_old_rxd(host, resp))
+}
+
+/// An rxd too old to know `put_stream` rejects it as a malformed request. That
+/// is a deploy problem wearing the wrong error code — relabel it so an agent
+/// branches on `not_deployed` here exactly as it does everywhere else.
+fn explain_old_rxd(host: &str, resp: Response) -> Response {
+    use rem_exec::protocol::ErrorCode;
+    if let Response::Error {
+        code: Some(ErrorCode::BadRequest),
+        message,
+        ..
+    } = &resp
+        && message.contains("put_stream")
+    {
+        return Response::error_code(
+            ErrorCode::NotDeployed,
+            format!(
+                "rxd on {host} is too old for `rx put -`: it does not understand streamed \
+                 stdin transfers"
+            ),
+        )
+        .with_hint(format!(
+            "run `rx deploy {host}` to install rxd {}, then re-run the pipeline",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    resp
 }
 
 /// Outcome of streaming a download body into a local file.
@@ -856,6 +1093,8 @@ fn do_get(remote: &str, local: &str, mode: Option<&str>) -> ExitCode {
                 Ok(header) // typed error (not_found, etc.) — print as-is
             }
             Response::GetStream { size, mode: src_mode } => {
+                let src_mode = rem_exec::protocol::parse_octal_mode(&src_mode)
+                    .map_err(rem_exec::error::RemExecError::Protocol)?;
                 let applied = mode_override.unwrap_or(src_mode);
                 let outcome = receive_file(&mut reader, std::path::Path::new(local), size, applied);
                 let _ = child.wait();
@@ -863,7 +1102,7 @@ fn do_get(remote: &str, local: &str, mode: Option<&str>) -> ExitCode {
                     Ok(bytes) => Ok(Response::Got {
                         path: local.to_string(),
                         bytes,
-                        mode: Some(applied),
+                        mode: Some(rem_exec::protocol::octal_mode(applied)),
                     }),
                     Err(ReceiveError::Incomplete { expected, got }) => Ok(Response::error_code(
                         ErrorCode::IncompleteTransfer,
@@ -1078,7 +1317,7 @@ fn route_via_daemon(command: &Command) -> ExitCode {
         Command::Deploy { .. }
         | Command::Ping { .. }
         | Command::Get { .. }
-        | Command::Cp { .. }
+        | Command::Put { .. }
         | Command::Setup { .. }
         | Command::Skill
         | Command::Daemon { .. } => unreachable!("handled before routing"),

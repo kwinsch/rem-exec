@@ -109,6 +109,20 @@ pub fn serve() -> ExitCode {
             owner,
             group,
         } => actions::put(&mut reader, &path, size, mode, owner.as_deref(), group.as_deref()),
+        Request::PutStream {
+            path,
+            mode,
+            owner,
+            group,
+            allow_empty,
+        } => actions::put_stream(
+            &mut reader,
+            &path,
+            mode,
+            owner.as_deref(),
+            group.as_deref(),
+            allow_empty,
+        ),
         Request::Status { id } => actions::status(&id),
         Request::Read {
             id,
@@ -199,7 +213,7 @@ fn serve_get(path: &str) -> ExitCode {
 
     let header = Response::GetStream {
         size: meta.len(),
-        mode: meta.permissions().mode() & 0o777,
+        mode: crate::protocol::octal_mode(meta.permissions().mode()),
     };
     let json = serde_json::to_string(&header).unwrap_or_default();
     if out.write_all(json.as_bytes()).is_err() || out.write_all(b"\n").is_err() {

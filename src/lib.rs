@@ -1,6 +1,7 @@
 pub mod daemon;
 pub mod deploy;
 pub mod error;
+pub mod framing;
 pub mod process;
 pub mod protocol;
 pub mod remote;

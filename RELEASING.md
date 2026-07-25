@@ -48,12 +48,18 @@ cd dist && sha256sum rx-* rxd-* > SHA256SUMS && sha256sum -c SHA256SUMS
 
 ## Publish (order matters)
 
+crates.io comes **last**: a publish cannot be undone (only yanked), while a
+GitHub release can be deleted and recreated. Publishing first would burn the
+version number if the assets turn out wrong — and the published `rx` fetches
+those assets, so they must already exist.
+
 1. Bump `version` in `Cargo.toml`; commit. (Bump `PROTOCOL_VERSION` only on a
    breaking wire change — a mismatch triggers redeploy via the version check.)
 2. Push commits: `git push origin master`.
-3. Tag the release commit and push it: `git tag -a v0.2.0 -m v0.2.0 && git push origin v0.2.0`.
-4. Create the release with all 7 assets:
-   `gh release create v0.2.0 dist/rx-* dist/rxd-* dist/SHA256SUMS --title ... --notes ...`
+3. Tag the release commit and push it: `git tag -a v0.3.0 -m v0.3.0 && git push origin v0.3.0`.
+4. Create the release with all 9 assets (4 arches × 2 binaries + SHA256SUMS):
+   `gh release create v0.3.0 dist/rx-* dist/rxd-* dist/SHA256SUMS --title ... --notes ...`
 5. Verify the hashed release resolves and auto-deploy works:
-   `rx setup --version v0.2.0 --force` (downloads + checksum-verifies), then
+   `rx setup --version v0.3.0 --force` (downloads + checksum-verifies), then
    `rx deploy <host>` against a test host (version/protocol check must pass).
+6. Publish to crates.io: `cargo publish` (dry-run first: `cargo publish --dry-run`).

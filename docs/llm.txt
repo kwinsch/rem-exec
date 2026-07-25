@@ -17,7 +17,7 @@ Invariants:
   channel — no remote shell parses them. There is nothing to escape/quote.
 - Process IDs are 8 lowercase hex characters.
 - Trust model: rxd runs as the SSH user and is a transport, not a sandbox or
-  privilege boundary. It can do anything that user can (write any path via cp,
+  privilege boundary. It can do anything that user can (write any path via put,
   elevate via `doas` in a command). Your SSH access is the whole trust boundary.
 - Process exit mirrors the remote command (`rx run HOST -- false` → exit 1;
   killed by signal N → 128+N); the JSON is the source of truth, the process exit
@@ -52,13 +52,15 @@ that substrate:
   kill HOST ID
   list HOST
   clean HOST
-  cp    LOCAL HOST:PATH [--mode OCTAL] [--owner USER] [--group GRP]
+  put   LOCAL|- HOST:PATH [--mode OCTAL] [--owner USER] [--group GRP] [--allow-empty]
   get   HOST:PATH LOCAL [--mode OCTAL]
   ping  HOST
-  deploy HOST
+  deploy HOST... [--binary PATH] [--offline] [--allow-downgrade]
   setup [--version V] [--arch ARCH]... [--force]
   skill
   daemon start|stop|status
+
+Global: --compact, --auto-deploy off|local|on
 
 Notes:
 - Everything after `--` is the remote argv. `--` is optional but disambiguates a
@@ -67,14 +69,39 @@ Notes:
 - --cwd and --env set the working directory and environment directly, so you
   don't need a `sh -c 'cd DIR && K=V ...'` wrapper. --env is repeatable and its
   overrides layer on the inherited environment.
-- cp/get move whole files with constant memory (streamed, no size cap) and are
-  safe on flaky links: the sender declares the byte count and the receiver
-  installs the file (atomic temp→rename) only if exactly that many bytes arrive —
-  a dropped connection yields `incomplete_transfer`, never a truncated file.
-  cp writes to the remote (--mode always works; --owner/--group need a privileged
-  rxd); get writes to the local path and applies the source's mode unless --mode
-  overrides. Both transport bytes faithfully but do NOT snapshot a live database
-  — dump/checkpoint first (e.g. `sqlite3 .backup`, `pg_dump`) before copying.
+- put/get move whole files with constant memory (streamed, no size cap) and are
+  safe on flaky links: the receiver installs the file (atomic temp→rename) only
+  if the whole transfer arrived — a dropped connection yields
+  `incomplete_transfer`, never a truncated file. With a local file the sender
+  declares the byte count; with `-` it frames the stream and marks its end, so
+  the guarantee holds for input whose length is unknown in advance.
+  put writes to the remote (--mode always works; --owner/--group need a
+  privileged rxd); get writes to the local path and applies the source's mode
+  unless --mode overrides. Both transport bytes faithfully but do NOT snapshot a
+  live database — dump/checkpoint first (e.g. `sqlite3 .backup`, `pg_dump`).
+- `put -` streams stdin, so a value can go from a pipeline straight to a remote
+  file without ever being written to a local temp file or passed as an argument:
+
+      producer | rx put - HOST:/run/secrets/db_pass --mode 0600
+
+  Mode is applied before the file is visible, so there is no window where it sits
+  world-readable — unlike `rx run HOST -- tee PATH`, which creates it at the
+  remote umask. With no --mode a put lands 0600, and the `copied` response
+  reports the mode the file actually got (octal string, e.g. "0600").
+- An empty stdin stream is REFUSED (`empty_stream`, not retryable) rather than
+  installed, because `producer | rx put -` where the producer failed sends a
+  well-formed stream of zero bytes — installing it would blank an existing file
+  and report success. Use `set -o pipefail` to catch the producer's exit status,
+  or --allow-empty when an empty file is what you mean.
+  Scope: put guarantees "exactly what rx read landed, or nothing landed". It
+  cannot tell a producer that finished from one that died mid-output — a pipe
+  carries no exit status. Where that matters, write a file first and put that.
+- `put -` cannot be retried (stdin does not rewind), so it settles deployment
+  before reading a byte: under --auto-deploy=local|on it probes the host and
+  deploys first. Under the default (off) a mismatched host fails with
+  `not_deployed` and nothing is consumed downstream — re-run the pipeline after
+  deploying.
+- `cp` still works as an alias for `put`; prefer `put`, which pairs with `get`.
 - get vs `run -- cat`: use `run cat` to read small contents inline; use get to
   materialize a large or binary remote file as a real local path efficiently.
 - run: stdin, if piped, is fed to the process, then EOF is sent so readers
@@ -93,7 +120,7 @@ Notes:
 - The local daemon (daemon start|stop|status) is an optional accelerator that
   caches repeated reads of long-running processes locally. It is used only when
   you opt in with REM_EXEC_DAEMON=1; direct SSH is the default and canonical
-  path, and it does not handle ping/cp/get. A daemon that merely happens to be
+  path, and it does not handle ping/put/get. A daemon that merely happens to be
   running never changes how a command is transported.
 
 ## Text encoding
@@ -113,14 +140,16 @@ stdout/stderr/data fields pair with an `encoding`:
              exit_code|null, signal|null, stdout_size, stderr_size}
   output    {data, encoding, offset, size}
   written   {bytes}          # from close-stdin, bytes:0 means EOF sent
-  copied    {path, bytes, mode?}     # cp result (remote file written)
+  copied    {path, bytes, mode?}     # put result (remote file written)
   got       {path, bytes, mode?}     # get result (local file written)
+                                     # mode is octal as a string: "0600"
   killed    {id}
   list      {processes:[{id, state, cmd}]}
   cleaned   {removed:[id...]}
   version   {version, protocol}
   ping      {version, protocol, arch, os, kernel, hostname,
-             distro_id?, distro_version?}
+             distro_id?, distro_version?,
+             local_version, up_to_date, hint?}
   error     {message, code?, retryable?, hint?}
 
 - run and wait yield completed or running. exit_code is null when signal is set.
@@ -143,18 +172,32 @@ stdout/stderr/data fields pair with an `encoding`:
 
   bad_request · invalid_process_id · process_not_found · process_exited ·
   timeout · not_deployed · unsupported · ssh_unreachable · ssh_auth ·
-  not_found · incomplete_transfer · internal
+  not_found · incomplete_transfer · empty_stream · internal
 
 Branch on code, not message text. `retryable:true` means the same call may
 succeed on retry (e.g. after an auto-deploy, or a transient ssh_unreachable).
 
 ## Deploy and connections
 
-rxd is the remote binary; rx deploys the arch-matched build to ~/.local/bin/rxd
-(`rx deploy HOST`, needs a local cache from `rx setup`). Set
-REM_EXEC_AUTO_DEPLOY=1 to deploy-and-retry automatically against a missing or
-outdated remote. rx multiplexes SSH connections, so repeated operations to a
-host reuse one connection.
+rxd is the remote binary; `rx deploy HOST...` installs the arch-matched build to
+~/.local/bin/rxd, downloading it if the local cache lacks it (`--offline` to
+refuse, `--binary PATH` to push a local build, and several hosts in one call).
+rx multiplexes SSH connections, so repeated operations to a host reuse one
+connection.
+
+rx and rxd are two halves of one wire protocol, so the only correct rxd for a
+given rx is its own version — there is nothing separate to pin, and upgrading rx
+is what moves the pair. What --auto-deploy controls is when *hosts* change:
+
+  off    (default) never deploy as a side effect; a mismatch is a typed
+         not_deployed error naming the command that fixes it
+  local  may deploy during another command, but only from the local cache
+  on     may fetch and deploy during another command
+
+`rx deploy` is explicit and always allowed regardless of this setting. Env
+equivalent: REM_EXEC_AUTO_DEPLOY=off|local|on (1/true still mean on). rx never
+downgrades a host that is ahead of it — by protocol or by version — without
+--allow-downgrade; that host belongs to a newer rx.
 
 Only the controller (where rx runs) needs external tools — ssh for every
 operation, plus scp/curl/sha256sum for setup/deploy. The remote needs nothing
@@ -163,16 +206,20 @@ preinstalled: rxd is a single static binary.
 `ping` is the preflight: one round trip tells you the host is reachable, what
 rxd version/protocol it runs, and what it is (os/kernel/arch/distro) — enough to
 choose a package manager or shell before a batch. It is a pure probe with no
-side effects (it creates no state dir).
+side effects (it creates no state dir). It also reports `up_to_date` (does the
+host's rxd match this rx exactly?) plus `local_version`, so version skew is
+visible here rather than as a warning on every command — an older rxd is still
+correct for most requests, so ping is where you check a fleet.
 
 A missing or outdated remote is detected by probing rxd's `version` (its
-protocol), not by guessing from stderr. With REM_EXEC_AUTO_DEPLOY=1 rx deploys
-the matching rxd and retries automatically; without it you get a typed
-`not_deployed` error whose hint names the fix — run `rx deploy HOST`, or set
-REM_EXEC_AUTO_DEPLOY=1. rx never silently falls back to a plain SSH command.
-Note: this catches a missing rxd or a protocol change; a same-protocol rxd
-update (e.g. a behavior fix that keeps the wire format) is not auto-detected —
-run `rx deploy HOST` after upgrading rx to pick up rxd-side fixes.
+protocol), not by guessing from stderr. Under --auto-deploy=local|on rx deploys
+the matching rxd and retries; otherwise you get a typed `not_deployed` error
+whose hint names the fix. rx never silently falls back to a plain SSH command.
+Note: protocol equality is what makes a host "current", so a same-protocol rxd
+update (a behavior fix that keeps the wire format) is not auto-detected — run
+`rx deploy HOST` after upgrading rx to pick up rxd-side fixes. The exception is
+`put -`, which additionally requires that the host not be *behind* this rx
+before it will read stdin (a host that is ahead already has what it needs).
 
 ## Examples
 
@@ -209,8 +256,13 @@ run `rx deploy HOST` after upgrading rx to pick up rxd-side fixes.
   # large or binary input streams unbounded via the pipe path
   cat firmware.bin | rx start HOST -- doas tee /var/lib/app/firmware.bin
 
-  # copy a file into place atomically, perms set before it becomes visible
-  rx cp ./app.conf HOST:/etc/app/app.conf --mode 0640
+  # write a file into place atomically, perms set before it becomes visible
+  rx put ./app.conf HOST:/etc/app/app.conf --mode 0640
+
+  # place a secret straight from a pipeline: no local temp file, no argv,
+  # never world-readable, and an empty stream is refused rather than installed
+  set -o pipefail
+  secret-store get db_password | rx put - HOST:/run/secrets/db_pass --mode 0600
 
   # pull a file down atomically (size-verified); dump a live DB first
   rx run HOST -- doas -u postgres pg_dump -Fc appdb -f /tmp/appdb.dump

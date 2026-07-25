@@ -449,17 +449,21 @@ fn read_tail(pdir: &ProcessDir, stream: &str) -> (String, Encoding, u64, bool) {
     (data, encoding, size, truncated)
 }
 
-/// Write the request body to `path` atomically: stream to a temp file in the
-/// target directory, apply mode then owner/group, fsync, and rename into place.
-/// The final file only ever appears with its intended permissions — there is no
+/// Write a body to `path` atomically: stream to a temp file in the target
+/// directory, apply mode then owner/group, fsync, and rename into place. The
+/// final file only ever appears with its intended permissions — there is no
 /// window where it sits at the destination path with default perms.
-pub fn put<R: Read>(
-    reader: &mut R,
+///
+/// `fill` streams the body into the (already private, 0600) temp file and
+/// returns the byte count, or the typed error that should be reported. Either
+/// way the temp file is removed unless the rename succeeds, so a rejected
+/// transfer never leaves a partial file behind.
+fn install_file(
     path: &str,
-    size: Option<u64>,
     mode: Option<u32>,
     owner: Option<&str>,
     group: Option<&str>,
+    fill: impl FnOnce(&mut fs::File) -> Result<u64, Response>,
 ) -> Response {
     let target = Path::new(path);
     if target.file_name().is_none() {
@@ -473,7 +477,6 @@ pub fn put<R: Read>(
     let suffix = crate::process::generate_id().unwrap_or_else(|_| std::process::id().to_string());
     let tmp = dir.join(format!(".rxd-put-{suffix}.tmp"));
 
-    // Stream body → temp file (constant memory), created private (0600).
     let bytes = {
         let mut f = match fs::OpenOptions::new()
             .create_new(true)
@@ -489,30 +492,18 @@ pub fn put<R: Read>(
                 );
             }
         };
-        match std::io::copy(reader, &mut f) {
+        match fill(&mut f) {
             Ok(n) => {
                 let _ = f.sync_all();
                 n
             }
-            Err(e) => {
+            Err(response) => {
                 drop(f);
                 let _ = fs::remove_file(&tmp);
-                return Response::error_code(ErrorCode::Internal, format!("write failed: {e}"));
+                return response;
             }
         }
     };
-
-    // Completeness: a short stream (e.g. dropped connection) must not be
-    // installed as a truncated file. Verify the declared size before rename.
-    if let Some(expected) = size
-        && bytes != expected
-    {
-        let _ = fs::remove_file(&tmp);
-        return Response::error_code(
-            ErrorCode::IncompleteTransfer,
-            format!("incomplete transfer to {path}: expected {expected} bytes, received {bytes}"),
-        );
-    }
 
     if let Some(m) = mode
         && let Err(e) = fs::set_permissions(&tmp, fs::Permissions::from_mode(m))
@@ -529,16 +520,112 @@ pub fn put<R: Read>(
             .with_hint("owner/group need a privileged rxd (e.g. deploy+invoke rxd via doas)");
     }
 
+    // Report the mode the file actually has, not the one requested: with no
+    // --mode it keeps the temp file's 0600 rather than any source or umask mode.
+    let effective_mode = fs::metadata(&tmp)
+        .map(|m| crate::protocol::octal_mode(m.permissions().mode()))
+        .ok();
+
     if let Err(e) = fs::rename(&tmp, target) {
         let _ = fs::remove_file(&tmp);
         return Response::error_code(ErrorCode::Internal, format!("rename to {path}: {e}"));
     }
 
+    // The file contents are fsynced above; fsync the directory too so the
+    // rename itself survives a crash, not just the bytes it points at.
+    if let Ok(d) = fs::File::open(&dir) {
+        let _ = d.sync_all();
+    }
+
     Response::Copied {
         path: path.to_string(),
         bytes,
-        mode,
+        mode: effective_mode,
     }
+}
+
+/// Write the request body to `path` atomically. `size`, when set, is the byte
+/// count the sender declared up front: a short stream (e.g. a dropped
+/// connection) is rejected rather than installed as a truncated file.
+pub fn put<R: Read>(
+    reader: &mut R,
+    path: &str,
+    size: Option<u64>,
+    mode: Option<u32>,
+    owner: Option<&str>,
+    group: Option<&str>,
+) -> Response {
+    install_file(path, mode, owner, group, |f| {
+        let bytes = std::io::copy(reader, f)
+            .map_err(|e| Response::error_code(ErrorCode::Internal, format!("write failed: {e}")))?;
+        match size {
+            Some(expected) if bytes != expected => Err(Response::error_code(
+                ErrorCode::IncompleteTransfer,
+                format!(
+                    "incomplete transfer to {path}: expected {expected} bytes, received {bytes}"
+                ),
+            )),
+            _ => Ok(bytes),
+        }
+    })
+}
+
+/// Write a length-framed request body to `path` atomically — the `put` of a
+/// stream whose length is not known in advance.
+///
+/// Completeness comes from the framing rather than a declared size: the file is
+/// installed only when the terminator arrives, so a sender that dies mid-stream
+/// yields `incomplete_transfer` and no file. A stream that is well-formed but
+/// empty is rejected too unless `allow_empty` — that shape is what a failed
+/// producer in a pipeline sends, and installing it would replace a good file
+/// with an empty one and report success.
+pub fn put_stream<R: Read>(
+    reader: &mut R,
+    path: &str,
+    mode: Option<u32>,
+    owner: Option<&str>,
+    group: Option<&str>,
+    allow_empty: bool,
+) -> Response {
+    install_file(path, mode, owner, group, |f| {
+        let mut framed = crate::framing::FramedReader::new(reader);
+        let copied = std::io::copy(&mut framed, f);
+        let bytes = framed.total();
+
+        match copied {
+            Ok(_) if !framed.is_complete() => Err(incomplete_stream(path, bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                Err(incomplete_stream(path, bytes))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err(
+                Response::error_code(ErrorCode::IncompleteTransfer, format!("{path}: {e}")),
+            ),
+            Err(e) => Err(Response::error_code(
+                ErrorCode::Internal,
+                format!("write failed: {e}"),
+            )),
+            Ok(_) if bytes == 0 && !allow_empty => Err(Response::error_code(
+                ErrorCode::EmptyStream,
+                format!("refusing to install an empty file at {path}: stdin carried 0 bytes"),
+            )
+            .with_hint(
+                "the producer in the pipe most likely failed (`set -o pipefail` surfaces that); \
+                 pass --allow-empty to write an empty file on purpose",
+            )),
+            Ok(_) => Ok(bytes),
+        }
+    })
+}
+
+/// The rejection for a stdin transfer that ended before its terminator.
+fn incomplete_stream(path: &str, bytes: u64) -> Response {
+    Response::error_code(
+        ErrorCode::IncompleteTransfer,
+        format!(
+            "incomplete transfer to {path}: stream ended after {bytes} bytes without its \
+             end marker (sender died or the connection dropped)"
+        ),
+    )
 }
 
 /// chown a path by user/group name-or-id. Either may be None (left unchanged).
