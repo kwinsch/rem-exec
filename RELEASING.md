@@ -1,6 +1,6 @@
 # Releasing rem-exec
 
-`rx setup` / `rx deploy` / auto-deploy fetch static `rxd` binaries from the
+`rx cache fetch` / `rx deploy` / auto-deploy fetch static `rxd` binaries from the
 GitHub Release whose tag matches `CARGO_PKG_VERSION` (e.g. `v0.2.0`), and verify
 them against `SHA256SUMS`. So the release must exist, be tagged correctly, and
 carry assets whose hashes match — build and checksum *before* publishing.
@@ -18,7 +18,14 @@ Always build with `crt-static` forced. Without it, **riscv64gc-musl links
 dynamically** (interpreter `/lib/ld-musl-riscv64.so.1`), which breaks the
 static-portability guarantee and auto-deploy onto hosts without musl.
 
+**Clear `dist/` first.** It is untracked staging, so whatever a previous release
+left behind survives — and step 4 below globs `dist/rx-*`, which would publish
+those stale binaries under the new tag. Starting empty makes that impossible
+rather than merely unlikely. (It has already happened: the whole directory sat
+at 0.3.0 while the source was 0.4.0.)
+
 ```bash
+rm -rf dist && mkdir dist
 export PATH="$MUSL_PATH:$PATH"
 export RUSTFLAGS="-C target-feature=+crt-static"
 for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl riscv64gc-unknown-linux-musl armv7-unknown-linux-musleabihf; do
@@ -46,6 +53,15 @@ Verify every binary is self-contained — `file` must show `statically linked` o
 cd dist && sha256sum rx-* rxd-* > SHA256SUMS && sha256sum -c SHA256SUMS
 ```
 
+Then confirm every staged binary really carries this version. Cross-arch builds
+cannot be run locally, so grep the embedded string — enough to catch a leftover
+from an earlier release, which is the failure this guards:
+
+```bash
+VERSION=$(grep -m1 '^version' ../Cargo.toml | cut -d'"' -f2)
+for f in rx-* rxd-*; do grep -qa "$VERSION" "$f" || echo "STALE: $f"; done
+```
+
 ## Publish (order matters)
 
 crates.io comes **last**: a publish cannot be undone (only yanked), while a
@@ -60,6 +76,6 @@ those assets, so they must already exist.
 4. Create the release with all 9 assets (4 arches × 2 binaries + SHA256SUMS):
    `gh release create v0.3.0 dist/rx-* dist/rxd-* dist/SHA256SUMS --title ... --notes ...`
 5. Verify the hashed release resolves and auto-deploy works:
-   `rx setup --version v0.3.0 --force` (downloads + checksum-verifies), then
+   `rx cache fetch --version v0.3.0 --force` (downloads + checksum-verifies), then
    `rx deploy <host>` against a test host (version/protocol check must pass).
 6. Publish to crates.io: `cargo publish` (dry-run first: `cargo publish --dry-run`).

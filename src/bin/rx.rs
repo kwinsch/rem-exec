@@ -124,7 +124,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// The full guide: commands, response shapes, error codes (agent-oriented,
-    /// ~350 lines — pipe it to a pager)
+    /// ~390 lines — pipe it to a pager)
     Skill,
     /// Probe reachability + host identity (rxd version, OS, kernel, arch, distro)
     Ping {

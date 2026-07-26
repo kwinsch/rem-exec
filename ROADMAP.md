@@ -233,13 +233,67 @@ existing `skill` noun rather than a new `rx plugin` / `rx install` top-level:
   skill file", and both tools' after_help ends with the repository URL —
   someone who unpacked a release tarball has no README beside it.
 
-**Still open (minor):** `rx status HOST <malformed-id>` validates remotely, so
-the error depends on host reachability; validating the 8-hex form locally would
-be deterministic and save a round trip. `rx daemon status` reports
-`changed:false` on a pure query, where the field means nothing.
+**Slice 4 — what an agent's error handling actually does with the answer.**
+Found by walking the same podman path with an external CLI review in hand. The
+review's presentation findings (top-level density, `--auto-deploy` spam on every
+subcommand help, clap prose inside `message`) are real and still open; these are
+the ones underneath them, where the response was not merely noisy but wrong.
 
-**Release hygiene:** `dist/rxd-x86_64` is stale — it deploys **0.3.0** against
-0.4.0 source. Rebuild before any release.
+- **`put` reported caller errors as `internal`, which is retryable.** A missing
+  target directory and an unwritable one both answered
+  `{"code":"internal","retryable":true}` with no hint — so the two put failures
+  that can *never* succeed were the two rx told a caller to try again, on one of
+  the two daily verbs. `get` had answered `not_found` for the same OS condition
+  since it shipped. The mapping lives in `protocol::io_error_code` now, and both
+  halves of the pair share it: ENOENT → `not_found`, EACCES → `bad_request`, and
+  `internal` means only what the contract says it means. ENOENT's hint names
+  `mkdir -p`; EACCES's names the privileged-rxd option.
+- **Errors could still arrive with no `code` at all.** `Response::error()` — the
+  untyped constructor — survived 0.4.0's typing pass at two call sites in the
+  transport classifier's fall-through. A *local* `get` failure (unwritable
+  destination on this machine) reached it, so the one field both skills tell
+  callers to branch on was absent, after paying a `remote_deploy_status` round
+  trip to diagnose a directory on the controller. Local failures are now typed
+  where they happen, the fall-through says `internal`, and the constructor is
+  gone so the shape cannot come back. `docs/CONTRACT.md` states the invariant.
+- **ssh could prompt, and could not be bounded.** `ssh_command` set only the
+  ControlMaster options: no `BatchMode`, so OpenSSH reached for an askpass helper
+  against a host needing a password — on a desktop with one installed (DISPLAY is
+  usually set) that is a GUI dialog no agent harness can answer, and without one
+  it burned three auth attempts; and no `ConnectTimeout`, so a black-holed host
+  cost **over 90 seconds** measured. Since rx deliberately has no fleet loop, the
+  caller iterates inventory and pays that per dead host. Both are set now
+  (`ConnectTimeout=10`, `RX_CONNECT_TIMEOUT` to override — env-only, so the
+  command surface does not grow), and `ssh_auth` carries a hint naming ssh-agent.
+  `deploy`'s `scp` had *no* options at all — not even ControlPath, so it opened a
+  second connection moments after ssh established a multiplexed one; it shares
+  the builder now.
+- **Malformed process IDs no longer need the host.** `invalid_process_id` lived
+  only in rxd, so `rx status <unreachable-host> NOTANID` answered
+  `ssh_unreachable` + `retryable:true` after the full connect timeout: a typo
+  wearing the shape of a transient network fault, which a retry loop treats as
+  "try again forever". rx checks the 8-hex form before it spawns anything, beside
+  the existing `bad_host` check. rxd keeps its check — an older rx against a
+  current rxd must not lose it — and both emit the same code, so the answer does
+  not depend on which side caught it.
+
+Breaking: `put` and `get` error *codes* changed for missing/unwritable paths
+(`internal` → `not_found`/`bad_request`) and those errors are no longer
+`retryable`. A caller branching on `code` sees a more accurate answer; one
+branching on `retryable` stops looping. BatchMode is a behaviour change for
+anyone relying on an interactive password prompt — use ssh-agent.
+
+**Still open (minor):** `rx daemon status` reports `changed:false` on a pure
+query, where the field means nothing. rx orders the error envelope
+`type,message,code,…` while rxv uses `type,code,message,…` — `docs/CONTRACT.md`
+shows rxv's order, and `preserve_order` exists precisely so the same error reads
+the same way in both tools.
+
+**Release hygiene:** `dist/` is untracked staging and the publish step globs it,
+so a leftover set ships under the new tag — which nearly happened: the whole
+directory sat at **0.3.0** against 0.4.0 source. Cleared, and `RELEASING.md` now
+starts the build with `rm -rf dist` plus an embedded-version check after
+checksumming, so staleness is structurally impossible rather than merely noticed.
 
 **Test hosts:** rootless podman, two distros so `ping`'s distro detection is
 exercised for real. rx shells out to bare `ssh`/`scp` with no `-F` and no option

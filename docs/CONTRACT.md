@@ -77,12 +77,20 @@ convenience.
  "hint":"run `rxv list` to see what is stored"}
 ```
 
-- `code` is the stable part. **Branch on it, never on message text** — messages
-  get rewritten, codes do not.
+- `code` is the stable part, and it is **always present**. **Branch on it, never
+  on message text** — messages get rewritten, codes do not. A `switch` on `code`
+  never has to handle a missing one; when nothing else fits, the answer is
+  `internal`, not an absent field.
 - `retryable` is always present. `true` means the identical call could plausibly
   succeed on a retry (a transient network failure, a host that just got its rxd
   deployed). It never means "the caller should change something" — that is what
   `hint` is for.
+
+  A corollary both tools now hold to: a condition the caller must fix is never
+  `retryable`. A missing directory, a path the user cannot write, a malformed
+  process ID — these do not resolve themselves, and reporting them as retryable
+  turns a caller's error handling into an infinite loop. When the fix is a
+  different call, that belongs in `hint`.
 - `hint`, when present, names a concrete different command.
 
 **Idempotence.** Asking for a state that already holds is success, not failure:

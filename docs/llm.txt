@@ -242,8 +242,17 @@ stdout/stderr/data fields pair with an `encoding`:
   not_found · incomplete_transfer · empty_stream · bad_host · file_changed ·
   deploy_failed · internal
 
-Branch on code, not message text. `retryable:true` means the same call may
-succeed on retry (e.g. after an auto-deploy, or a transient ssh_unreachable).
+Branch on code, not message text. `code` is ALWAYS present — when nothing more
+specific fits, it is `internal`, never absent — so a switch on it never falls
+through to undefined. `retryable:true` means the same call may succeed on retry
+(e.g. after an auto-deploy, or a transient ssh_unreachable).
+
+Anything you have to fix yourself is NOT retryable, so a retry loop terminates:
+a missing target directory or a path the SSH user cannot write answers
+`not_found` / `bad_request` with a hint (not `internal`), and a malformed process
+ID answers `invalid_process_id` locally, without contacting the host at all — so
+a typo cannot come back as a retryable `ssh_unreachable` from a host that happens
+to be down.
 
 ## HOST argument
 
@@ -289,6 +298,19 @@ operation, plus scp/curl/sha256sum for cache fetch/deploy. The remote needs noth
 preinstalled: rxd is a single static binary. Those tools are resolved through
 PATH, so rx assumes a trusted PATH on the controller; it is a single-user
 machine by design.
+
+rx never prompts. Every ssh/scp invocation carries BatchMode=yes, so a host whose
+credentials are not usable unattended fails immediately with `ssh_auth` and a
+hint, instead of stalling on a password prompt or a GUI askpass dialog that no
+agent harness can answer. Load keys into ssh-agent; check a host with
+`ssh -o BatchMode=yes HOST true`.
+
+Connecting is bounded at 10s (ConnectTimeout), so a black-holed host costs ten
+seconds rather than the OS default of well over a minute — which matters because
+rx has no fleet loop of its own: you iterate your inventory, and one dead host
+must not stall it. Override with RX_CONNECT_TIMEOUT=<seconds> when a link is
+genuinely slow to establish; it does not bound the command's own runtime (that is
+--timeout on run/wait).
 
 deploy uploads to a temp name and renames over ~/.local/bin/rxd, so a failed
 transfer cannot leave a truncated binary and a currently-running rxd does not
