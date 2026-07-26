@@ -700,14 +700,29 @@ pub fn remote_deploy_status(host: &str) -> DeployStatus {
             }
         }
         Ok(_) => DeployStatus::Missing,
-        Err(e) => {
-            if crate::ssh::classify_ssh_failure(&e.to_string()).is_some() {
-                DeployStatus::Unknown
-            } else {
-                DeployStatus::Missing
-            }
-        }
+        Err(e) => deploy_status_from_probe_error(&e),
     }
+}
+
+/// Classify a failed `version` probe: only phrases that mean "rxd is gone or
+/// too old" become [`DeployStatus::Missing`]. Everything else — including
+/// host-key verification, which `classify_ssh_failure` deliberately leaves
+/// untyped — stays [`DeployStatus::Unknown`].
+///
+/// The previous default was the opposite: any unrecognised probe failure became
+/// `Missing` → `not_deployed` + `retryable:true`, so first contact with a host
+/// absent from `known_hosts` told agents to deploy forever into the same wall.
+fn deploy_status_from_probe_error(err: &RemExecError) -> DeployStatus {
+    if let RemExecError::Ssh(msg) = err
+        && crate::ssh::classify_ssh_failure(msg).is_some()
+    {
+        return DeployStatus::Unknown;
+    }
+    // Same phrase set auto-deploy uses for "binary missing / too old".
+    if should_auto_deploy(err) {
+        return DeployStatus::Missing;
+    }
+    DeployStatus::Unknown
 }
 
 /// Build the actionable "remote rxd needs (re)deploying" error for the CLI to
@@ -750,6 +765,11 @@ fn one_line(s: &str) -> String {
 /// retryability) by reusing the classifier the rest of rx uses, so an
 /// unreachable host reports `ssh_unreachable` here exactly as it would
 /// anywhere else.
+///
+/// Download failures keep the AssetNotFound / Other split that `cache fetch`
+/// already uses: a 404 is permanent `deploy_failed`, while a DNS/connect/
+/// timeout is `internal` + `retryable:true` so an agent does not give up on a
+/// blip (and does not loop forever on a missing tag).
 pub fn deploy_error_response(host: &str, err: &RemExecError) -> Response {
     if let RemExecError::Ssh(detail) = err
         && let Some(code) = crate::ssh::classify_ssh_failure(detail)
@@ -759,14 +779,25 @@ pub fn deploy_error_response(host: &str, err: &RemExecError) -> Response {
             one_line(&format!("deploy to {host} failed: {detail}")),
         );
     }
-    Response::error_code(
-        ErrorCode::DeployFailed,
-        one_line(&format!("deploy to {host} failed: {err}")),
-    )
-    .with_hint(
-        "pass --binary PATH to push a local rxd build, or --offline to use only \
-         what the deploy cache already has",
-    )
+
+    let message = one_line(&format!("deploy to {host} failed: {err}"));
+    let hint = "pass --binary PATH to push a local rxd build, or --offline to use only \
+         what the deploy cache already has";
+
+    match err {
+        // HTTP 404 (or equivalent): the release is not there.
+        RemExecError::AssetNotFound(_) => {
+            Response::error_code(ErrorCode::DeployFailed, message).with_hint(hint)
+        }
+        // Transient download / local IO while fetching: same answer as `cache fetch`.
+        RemExecError::Other(msg) if msg.starts_with("failed to download") => {
+            Response::error_code(ErrorCode::Internal, message).with_hint(hint)
+        }
+        RemExecError::Io(_) => Response::error_code(ErrorCode::Internal, message).with_hint(hint),
+        // Permanent deploy problems (missing local binary, downgrade refusal,
+        // checksum mismatch, unreadable scp that was not SSH-classified, …).
+        _ => Response::error_code(ErrorCode::DeployFailed, message).with_hint(hint),
+    }
 }
 
 #[cfg(test)]
@@ -800,28 +831,32 @@ mod tests {
     fn a_missing_asset_reports_deploy_failed() {
         let err = RemExecError::AssetNotFound("failed to download …: 404".into());
         let json = serde_json::to_value(deploy_error_response("host1", &err)).expect("serializes");
-        assert_eq!(json["code"], "deploy_failed");
-        assert_eq!(json["retryable"], false);
-    }
-
-    #[test]
-    fn deploy_failure_is_a_typed_error_not_a_deployed_object() {
-        let err = RemExecError::Other("failed to download SHA256SUMS: curl: (22) 404\n".into());
-        let response = deploy_error_response("host1", &err);
-        let json = serde_json::to_value(&response).expect("serializes");
-
         assert_eq!(json["type"], "error");
         assert_eq!(json["code"], "deploy_failed");
-        // A release that 404s does not appear on a second attempt.
         assert_eq!(json["retryable"], false);
         assert!(json["hint"].as_str().expect("hint").contains("--binary"));
+    }
+
+    /// A blip reaching the download source is retryable on `deploy` the same
+    /// way it is on `cache fetch` — folding it into permanent `deploy_failed`
+    /// made agents stop on DNS/connect noise.
+    #[test]
+    fn a_transient_download_failure_is_retryable_on_deploy() {
+        let err = RemExecError::Other(
+            "failed to download https://example/SHA256SUMS: curl: (6) Could not resolve host"
+                .into(),
+        );
+        let json = serde_json::to_value(deploy_error_response("host1", &err)).expect("serializes");
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["code"], "internal");
+        assert_eq!(json["retryable"], true);
     }
 
     /// The message reaches the caller as one line: a compact JSON object is
     /// what an agent reads, and a raw `\n` in the middle of it is noise.
     #[test]
     fn deploy_failure_message_is_collapsed_to_one_line() {
-        let err = RemExecError::Other("failed to download:\ncurl: (22) 404\n".into());
+        let err = RemExecError::AssetNotFound("failed to download:\ncurl: (22) 404\n".into());
         let response = deploy_error_response("host1", &err);
         let json = serde_json::to_value(&response).expect("serializes");
 
@@ -842,6 +877,49 @@ mod tests {
 
         assert_eq!(json["code"], "ssh_unreachable");
         assert_eq!(json["retryable"], true);
+    }
+
+    /// A probe failure is only `Missing` when it actually looks like a missing
+    /// or too-old rxd. Host-key verification is the common counter-example:
+    /// agents used to loop on `not_deployed` into the same wall.
+    #[test]
+    fn probe_errors_default_to_unknown_not_missing() {
+        assert!(matches!(
+            deploy_status_from_probe_error(&RemExecError::Ssh(
+                "Host key verification failed.".into()
+            )),
+            DeployStatus::Unknown
+        ));
+        assert!(matches!(
+            deploy_status_from_probe_error(&RemExecError::Ssh(
+                "ssh: Could not resolve hostname host1".into()
+            )),
+            DeployStatus::Unknown
+        ));
+        assert!(matches!(
+            deploy_status_from_probe_error(&RemExecError::Ssh(
+                "Permission denied (publickey).".into()
+            )),
+            DeployStatus::Unknown
+        ));
+
+        // Real missing / too-old binary phrases still mean deploy.
+        assert!(matches!(
+            deploy_status_from_probe_error(&RemExecError::Ssh(
+                "bash: line 1: .local/bin/rxd: not found".into()
+            )),
+            DeployStatus::Missing
+        ));
+        assert!(matches!(
+            deploy_status_from_probe_error(&RemExecError::Ssh(
+                "error: unrecognized subcommand 'serve'".into()
+            )),
+            DeployStatus::Missing
+        ));
+        assert!(matches!(
+            deploy_status_from_probe_error(&RemExecError::Protocol("invalid JSON".into())),
+            DeployStatus::Missing
+        ));
     }
 
     #[test]
