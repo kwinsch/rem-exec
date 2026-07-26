@@ -42,6 +42,64 @@ fn query_outcome(action: &str, running: bool) -> serde_json::Value {
     })
 }
 
+/// Give the forked daemon its own stdio: /dev/null in and out, `daemon.log` for
+/// anything it has to report.
+///
+/// The inherited descriptors cannot be kept. stderr used to be — "keep stderr
+/// for logging" — but nothing ever read it, and holding it open means a caller
+/// that reads to EOF (`Command::output()`, `subprocess.run(capture_output=True)`
+/// — most agent harnesses) blocks until the daemon *exits* rather than until
+/// `daemon start` returns. That is a hang on a command that reported success.
+///
+/// A log file rather than /dev/null so a daemon that cannot bind still says why:
+/// the parent's "socket never appeared" error names this path. It lives in the
+/// 0700 base directory beside the socket and pid file, and the daemon writes to
+/// it only on failure.
+fn detach_stdio(log_path: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::IntoRawFd;
+
+    let devnull = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+        .map(|f| f.into_raw_fd());
+
+    // Append: a restarted daemon keeps whatever the last failure said.
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(log_path)
+        .map(|f| f.into_raw_fd());
+
+    // SAFETY: dup2 onto the standard descriptors, in a freshly forked child
+    // that has not yet spawned a thread. A descriptor that could not be opened
+    // is left alone rather than closed: a daemon with no stderr is better than
+    // one whose fd 2 is closed and gets reused by the next open().
+    unsafe {
+        if let Ok(fd) = devnull {
+            libc::dup2(fd, 0);
+            libc::dup2(fd, 1);
+            // Falls back to /dev/null when the log could not be opened, so the
+            // caller's pipe is released either way — that is the property this
+            // function exists for.
+            if log.is_err() {
+                libc::dup2(fd, 2);
+            }
+            if fd > 2 {
+                libc::close(fd);
+            }
+        }
+        if let Ok(fd) = log {
+            libc::dup2(fd, 2);
+            if fd > 2 {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
 /// Read the recorded daemon pid, if the file is there and parses.
 fn recorded_pid() -> Option<u32> {
     fs::read_to_string(super::pid_path())
@@ -59,6 +117,9 @@ pub fn start_daemon() -> Result<serde_json::Value> {
     let sock_path = super::socket_path();
     let pid_path = super::pid_path();
     let base = super::local_base();
+    // Beside the socket and pid file, not in `local_base()` — that one holds
+    // cached process output and is a different directory.
+    let log_path = crate::process::remote_base().join("daemon.log");
 
     // Check for stale socket
     if sock_path.exists() {
@@ -88,20 +149,7 @@ pub fn start_daemon() -> Result<serde_json::Value> {
         0 => {
             // Child: become the daemon
             unsafe { libc::setsid() };
-
-            // Redirect stdio to /dev/null
-            let devnull_path = std::ffi::CString::new("/dev/null").unwrap();
-            let devnull = unsafe { libc::open(devnull_path.as_ptr(), libc::O_RDWR) };
-            if devnull >= 0 {
-                unsafe {
-                    libc::dup2(devnull, 0);
-                    libc::dup2(devnull, 1);
-                    // Keep stderr for logging
-                    if devnull > 2 {
-                        libc::close(devnull);
-                    }
-                }
-            }
+            detach_stdio(&log_path);
 
             // Write PID file
             let _ = fs::write(&pid_path, std::process::id().to_string());
@@ -116,9 +164,10 @@ pub fn start_daemon() -> Result<serde_json::Value> {
             // Parent: wait briefly, verify daemon is up, report.
             std::thread::sleep(std::time::Duration::from_millis(200));
             if !super::is_running() {
-                return Err(crate::error::RemExecError::Other(
-                    "daemon failed to start (socket never appeared)".to_string(),
-                ));
+                return Err(crate::error::RemExecError::Other(format!(
+                    "daemon failed to start (socket never appeared); see {}",
+                    log_path.display()
+                )));
             }
             let mut value = outcome("start", true, true);
             if let Some(obj) = value.as_object_mut() {

@@ -363,14 +363,21 @@ Breaking: the five codes above exit 2 where they exited 1, `rx daemon status` no
 longer carries `changed`, and the error envelope's key order changed (a
 positional reader would notice; nothing branching on names does).
 
-**Found in passing, not fixed:** the forked daemon keeps the stderr it
-inherited ("keep stderr for logging", but nothing reads it), so a caller that
-reads to EOF — `Command::output()`, `subprocess.run(capture_output=True)`, most
-agent harnesses — blocks on `rx daemon start` until the daemon *exits*, not
-until start returns. It is behind `RX_DAEMON` and cost the new test an explicit
-`Stdio::null()`, which is the shape of the workaround a caller would need.
-Redirect it to `/dev/null` (or a real log file) after the fork, next time the
-daemon is touched.
+**`rx daemon start` no longer holds its caller's stderr.** Found while writing
+the test above, which needed an explicit `Stdio::null()` to finish. The forked
+daemon kept the stderr it inherited — "keep stderr for logging", though nothing
+ever read it — so a caller that reads to EOF (`Command::output()`,
+`subprocess.run(capture_output=True)`, most agent harnesses) blocked until the
+daemon *exited* rather than until start returned: a hang on a command that had
+already reported success, which is the worst shape an agent-facing failure can
+take.
+
+It logs to `daemon.log` in its own 0700 base directory now, beside the socket
+and pid file, at 0600 and append. A log file rather than `/dev/null` because
+`start`'s "socket never appeared" error is otherwise undiagnosable — it names
+the path, and the log then says `failed to bind socket: Address in use`. The
+test reads the caller's stderr on a deadline in a thread, so a regression fails
+the suite with a message instead of hanging it.
 
 **Still open, roughly in the order they are worth doing:**
 

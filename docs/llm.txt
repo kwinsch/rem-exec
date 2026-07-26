@@ -207,7 +207,10 @@ Notes:
   caches repeated reads of long-running processes locally. It is used only when
   you opt in with RX_DAEMON=1; direct SSH is the default and canonical
   path, and it does not handle ping/deploy/put/get. A daemon that merely happens
-  to be running never changes how a command is transported.
+  to be running never changes how a command is transported. It detaches from the
+  caller's stdio at startup — `daemon start` returns immediately even when you
+  capture its output — and writes anything it has to report to `daemon.log` in
+  its base directory, which the "socket never appeared" error names.
 
 ## Text encoding
 

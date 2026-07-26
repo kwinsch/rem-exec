@@ -391,15 +391,11 @@ fn the_parser_object_splits_the_diagnosis_from_the_fix() {
 /// developer is using.
 #[test]
 fn the_daemon_outlives_a_client_that_hangs_up() {
-    let runtime = std::env::temp_dir().join(format!("rx-daemon-test-{}", std::process::id()));
-    std::fs::create_dir_all(&runtime).expect("runtime dir");
-    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
-        .expect("0700 on the runtime dir");
+    let runtime = daemon_runtime("hangup");
 
-    // stderr goes to /dev/null, not a pipe: the forked daemon keeps the stderr
-    // it inherited, so a caller that reads to EOF — `Command::output()`, and
-    // most harnesses — would block until the daemon exits rather than until
-    // `daemon start` returns.
+    // stderr to /dev/null here, deliberately: this test is about the daemon's
+    // lifetime, and a regression in the *stderr* behaviour should fail the test
+    // below with a message rather than hang this one.
     let daemon = |args: &[&str]| -> Output {
         Command::new(env!("CARGO_BIN_EXE_rx"))
             .args(args)
@@ -433,6 +429,69 @@ fn the_daemon_outlives_a_client_that_hangs_up() {
 
     daemon(&["daemon", "stop"]);
     let _ = std::fs::remove_dir_all(&runtime);
+}
+
+/// An isolated `XDG_RUNTIME_DIR`, so a daemon test never touches the one the
+/// developer is using. Tagged as well as pid-keyed because these tests run
+/// concurrently inside one process.
+fn daemon_runtime(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("rx-daemon-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("runtime dir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .expect("0700 on the runtime dir");
+    dir
+}
+
+/// `daemon start` returns to its caller, rather than holding the caller's
+/// stderr for the daemon's whole life.
+///
+/// The forked daemon used to keep the stderr it inherited ("keep stderr for
+/// logging", though nothing read it), so any caller that reads to EOF —
+/// `Command::output()`, `subprocess.run(capture_output=True)`, most agent
+/// harnesses — blocked until the daemon *exited*, on a command that had already
+/// reported success. It now logs to `daemon.log` in its own base directory.
+///
+/// Read on a deadline in a thread: if this regresses, the read blocks forever,
+/// and the point of the deadline is that the suite fails with this message
+/// instead of hanging.
+#[test]
+fn daemon_start_does_not_hold_its_callers_stderr() {
+    use std::io::Read;
+
+    let runtime = daemon_runtime("stderr");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rx"))
+        .args(["--compact", "daemon", "start"])
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("rx should be runnable");
+
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+
+    let drained = rx.recv_timeout(std::time::Duration::from_secs(15));
+
+    // Stop the daemon before asserting, so a failure does not leave one behind.
+    let _ = Command::new(env!("CARGO_BIN_EXE_rx"))
+        .args(["daemon", "stop"])
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&runtime);
+
+    assert!(
+        drained.is_ok(),
+        "the daemon is holding its caller's stderr open — reading it to EOF blocked"
+    );
 }
 
 /// A closed stdout is an ordinary end to a pipeline, not a crash.
