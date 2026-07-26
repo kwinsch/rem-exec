@@ -10,7 +10,10 @@ rx is one tool in your box, not a replacement for it — use whatever fits the
 task. Prefer rx when you want its edges: verbatim argv/stdin (nothing to quote),
 structured exit/signal/error results, or detach-and-reattach. For running a
 command and needing its exit code or clean output, rx beats ad-hoc `ssh host
-'…'`.
+'…'`. rx has no secret store of its own and no dependency on one: `put -` takes
+whatever a pipeline hands it — `pass`, `op read`, `sops -d`, or rxv
+(`rxv skill`), a separate tool built to this same contract, so its output and
+errors read the way rx's do.
 
 ## Start here
 
@@ -24,17 +27,27 @@ and its `hint` names the one command that fixes it. Deploy is a single static
 binary and needs nothing on the remote — no runtime, no package, no daemon to
 manage. Expect the sequence above once per host, then never again.
 
-`rx put -` reads its body from stdin, so any secret store that prints to stdout
-composes with it — pipe, never print the value into your own output:
+## Which command
 
-  <secret-store read …> | rx put - HOST:/run/secrets/name --mode 0600
-  rxv get SCOPE/NAME    | rx put - HOST:/run/secrets/name --mode 0600   # rxv
-  pass show infra/db    | rx put - HOST:/run/secrets/name --mode 0600   # pass
-  op read op://v/i/f    | rx put - HOST:/run/secrets/name --mode 0600   # 1Password
+Most work is `run` plus `put`/`get`. The process verbs (status, stdout, stderr,
+list, clean, write, close-stdin, kill, wait) are for processes you keep.
 
-rx has no secret store of its own and no dependency on one. rxv (`rxv skill`) is
-a separate tool built to the same contract, so its output and errors read the
-same way — use it if you want that, or keep whatever you already have.
+  one command, want its output and exit code  →  run
+  long-lived, streaming, or interactive       →  start, then stdout / wait
+  raw bytes in and out, no JSON in the way    →  start --pipe
+  move a file, either direction               →  put / get
+
+Commands run detached on the remote under a private per-user state dir; stdout
+and stderr are captured to files that survive disconnect. Two ways to start work
+over that substrate, and one to block on what you started:
+- run   — synchronous. Blocks up to a timeout (--timeout, default 30s); if the
+          command outlives it, the process keeps running and a `running` handle
+          is returned instead.
+- start — returns a handle immediately. For long-lived, streaming, or
+          interactive processes you read/write later.
+- wait  — block on an already-started process until it exits or a timeout
+          (--timeout, default 30s), returning the same completed/running shapes
+          as run (no polling).
 
 ## Invariants
 
@@ -48,7 +61,9 @@ same way — use it if you want that, or keep whatever you already have.
   malformed. On exit 2 stdout stays EMPTY and the typed object goes to stderr —
   a mistyped flag and a rejected argument value are one class of failure, and
   stdout is kept clean because the subcommand is not yet known when the parser
-  rejects a call. `run`/`wait` also propagate the remote command's status:
+  rejects a call. The one exit-2 case with NO object is a bare `rx`: it named no
+  operation, so it prints help to stderr like the rest of discovery.
+  `run`/`wait` also propagate the remote command's status:
   `rx run HOST -- false` → exit 1, killed by signal N → 128+N, and a command
   that never started (see exec_error) → 127, so
   `rx run HOST -- missing-tool && next` does not run `next`. The JSON is the
@@ -75,20 +90,6 @@ same way — use it if you want that, or keep whatever you already have.
   `"changed": false` (`rx daemon start` on a running daemon; `rx deploy` on a
   host already running this exact rxd, which answers `status:"current"` and
   uploads nothing).
-
-## Model
-
-Commands run detached on the remote under a private per-user state dir; stdout
-and stderr are captured to files that survive disconnect. Two entry points over
-that substrate:
-- run   — synchronous. Blocks up to a timeout (--timeout, default 30s); if the
-          command outlives it, the process keeps running and a `running` handle
-          is returned instead.
-- start — returns a handle immediately. For long-lived, streaming, or
-          interactive processes you read/write later.
-- wait  — block on an already-started process until it exits or a timeout
-          (--timeout, default 30s), returning the same completed/running shapes
-          as run (no polling).
 
 ## Commands
 
