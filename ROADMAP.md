@@ -107,6 +107,20 @@ then stops being a special case and becomes the general rule, correctly scoped �
 deploy when the host genuinely lacks the capability, not when a digit differs.
 Worth building at the second or third additive action, not the first.
 
+### Deploy cache pruning
+
+Keying the cache by version (0.3.0) fixed deploying the previous release's
+binary, but nothing removes the old entries: the store grows by one set per
+release — up to four arches, ~4.5 MB — and 0.2.x's unversioned `rxd-<arch>`
+files are orphaned outright by the rename, since only `rxd-<version>-<arch>` is
+ever read now.
+
+Prune from `rx setup`: drop entries older than the running rx, plus the
+unversioned leftovers. Keeping the current version and one predecessor is the
+useful shape — the predecessor is what you deploy when rolling a host back —
+so this is "keep N", not "delete everything else". `--prune-all` for reclaiming
+the lot. Worth doing before the cache has enough versions in it to matter.
+
 ### Stale transfer temps
 
 If rxd is killed mid-transfer (SIGHUP on a severed session, not the ordinary
