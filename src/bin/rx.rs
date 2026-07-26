@@ -1729,7 +1729,18 @@ fn run_exit_from_value(data: &serde_json::Value) -> ExitCode {
 fn transport_error_json(host: &str, e: &rem_exec::error::RemExecError) -> Response {
     let message = e.to_string();
     if let Some(code) = rem_exec::ssh::classify_ssh_failure(&message) {
-        return Response::error_code(code, message);
+        let response = Response::error_code(code, message);
+        // rx runs ssh with BatchMode=yes, so this is now always a refusal rather
+        // than a prompt nobody answered. Name the fix: the credential has to be
+        // one ssh can use unattended.
+        return if code == rem_exec::protocol::ErrorCode::SshAuth {
+            response.with_hint(
+                "rx never prompts — load the key into ssh-agent (`ssh-add`), or use a key \
+                 usable without a passphrase; verify with `ssh -o BatchMode=yes HOST true`",
+            )
+        } else {
+            response
+        };
     }
     // A failed auto-deploy already carries the precise reason (e.g. a missing
     // local cache → "run `rx cache fetch` first"); surface it verbatim instead of

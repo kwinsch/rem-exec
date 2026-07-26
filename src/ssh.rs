@@ -59,6 +59,50 @@ pub fn validate_host(host: &str) -> Result<()> {
 /// attacker-controlled base would mean an attacker-controlled socket.
 pub fn ssh_command(host: &str) -> Command {
     let mut cmd = Command::new("ssh");
+    apply_common_options(&mut cmd);
+    cmd.arg("--").arg(host);
+    cmd
+}
+
+/// Build an `scp` command carrying the same options as [`ssh_command`].
+///
+/// The caller supplies source and destination; `--` is applied here for the same
+/// reason it is there — an argument that reaches scp unchecked is an option.
+///
+/// deploy's upload used to build a bare `Command::new("scp")` with no options at
+/// all, so it prompted where ssh would not and opened a second connection
+/// moments after ssh had established a multiplexed one.
+pub fn scp_command() -> Command {
+    let mut cmd = Command::new("scp");
+    apply_common_options(&mut cmd);
+    cmd.arg("--");
+    cmd
+}
+
+/// Default seconds to wait for a TCP connect before giving up.
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Options shared by every `ssh` and `scp` invocation rx makes.
+fn apply_common_options(cmd: &mut Command) {
+    // BatchMode: rx answers every operation with one JSON object, and a password
+    // prompt is not one. Without it OpenSSH reaches for an askpass helper when
+    // there is no controlling terminal — which an agent harness never has — so
+    // on a desktop with one installed (seahorse, ksshaskpass) the tool blocks on
+    // a GUI dialog nobody is watching, and on one without it burns three auth
+    // attempts before failing. A passphrase-protected key belongs in ssh-agent;
+    // the `ssh_auth` hint says so.
+    cmd.arg("-o").arg("BatchMode=yes");
+
+    // ConnectTimeout: rx has no fleet loop by design, so the caller iterates its
+    // own inventory — which means one black-holed host costs that loop the OS
+    // default (measured at over 90 seconds) with nothing to bound it.
+    cmd.arg("-o")
+        .arg(format!("ConnectTimeout={}", connect_timeout()));
+
+    // ControlMaster reuses one SSH connection across every rx operation to a
+    // host (the poll-heavy background path especially), so only the first call
+    // pays the handshake. `auto` falls back to a fresh connection if the master
+    // cannot be created, so this never makes rx fail.
     if let Some(control_path) = control_path() {
         cmd.arg("-o")
             .arg("ControlMaster=auto")
@@ -67,8 +111,20 @@ pub fn ssh_command(host: &str) -> Command {
             .arg("-o")
             .arg("ControlPersist=30");
     }
-    cmd.arg("--").arg(host);
-    cmd
+}
+
+/// Seconds to wait for a TCP connect, overridable via `RX_CONNECT_TIMEOUT`.
+///
+/// Env-only on purpose: this is a harness knob, not a decision an agent should
+/// have to weigh per call, so it stays out of `--help` and the guide's command
+/// list. A value that is absent, unparseable or zero falls back to the default —
+/// `ConnectTimeout=0` means "wait forever", which is the bug this closes.
+fn connect_timeout() -> u64 {
+    std::env::var("RX_CONNECT_TIMEOUT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS)
 }
 
 /// Private directory for ControlMaster sockets, or `None` when the base cannot
@@ -369,6 +425,46 @@ impl RemoteArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Both invocations must carry BatchMode and a connect timeout. scp had
+    /// neither: deploy's upload could prompt where every other call would not,
+    /// which put the prompt on the one command a host sees before anything works.
+    #[test]
+    fn ssh_and_scp_both_refuse_to_prompt_and_bound_the_connect() {
+        for args in [args_of(&ssh_command("host")), args_of(&scp_command())] {
+            assert!(
+                args.iter().any(|a| a == "BatchMode=yes"),
+                "missing BatchMode: {args:?}"
+            );
+            assert!(
+                args.iter().any(|a| a.starts_with("ConnectTimeout=")),
+                "missing ConnectTimeout: {args:?}"
+            );
+            assert!(args.iter().any(|a| a == "--"), "missing `--`: {args:?}");
+        }
+    }
+
+    /// `ConnectTimeout=0` means "wait forever" to OpenSSH — the exact behaviour
+    /// the default exists to bound — so a zero or unparseable override must fall
+    /// back rather than be passed through.
+    #[test]
+    fn connect_timeout_default_survives_a_useless_override() {
+        assert_eq!(connect_timeout(), DEFAULT_CONNECT_TIMEOUT_SECS);
+        for bad in ["0", "", "abc", "-5"] {
+            // SAFETY: single-threaded assertion on process env, restored below.
+            unsafe { std::env::set_var("RX_CONNECT_TIMEOUT", bad) };
+            assert_eq!(connect_timeout(), DEFAULT_CONNECT_TIMEOUT_SECS, "for {bad:?}");
+        }
+        unsafe { std::env::set_var("RX_CONNECT_TIMEOUT", "3") };
+        assert_eq!(connect_timeout(), 3);
+        unsafe { std::env::remove_var("RX_CONNECT_TIMEOUT") };
+    }
 
     #[test]
     fn classify_ssh_failure_maps_known_phrases() {

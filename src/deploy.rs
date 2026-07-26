@@ -548,8 +548,7 @@ pub fn deploy_to_host_with(host: &str, opts: &DeployOpts) -> Result<DeployResult
         RemExecError::Other(format!("binary path is not valid UTF-8: {}", local_binary.display()))
     })?;
     let staged = format!(".local/bin/.rxd-deploy.{}.tmp", std::process::id());
-    let scp = Command::new("scp")
-        .arg("--")
+    let scp = crate::ssh::scp_command()
         .arg(binary_arg)
         .arg(format!("{host}:{staged}"))
         .output()
