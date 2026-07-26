@@ -65,15 +65,30 @@ exception is the argument-parser rejection below, which has nowhere else to go.
 | code | meaning |
 |---|---|
 | 0 | success |
-| 1 | the call was understood and failed |
-| 2 | the call was malformed — typed object on **stderr**, stdout stays empty |
+| 1 | the call was usable and the operation failed |
+| 2 | the call itself is unusable — nothing was attempted |
 
-A malformed call answers with the same `{"type":"error","code":…}` shape as
-everything else, so a mistyped flag and a rejected argument value are one class
-of failure rather than two. It goes to stderr because stdout must stay
-byte-empty on exit 2: at the moment the parser rejects a call, the subcommand is
-not yet known, and if it were `rxv get` then anything on stdout would land in
-whatever the pipe feeds.
+Exit 2 covers a mistyped flag and a rejected argument *value* alike: `--mode
+9999`, a destination that is not `HOST:PATH`, a process ID that is not 8 hex
+digits, a secret path with a `..` in it. They are one class of mistake — the
+command line cannot be used — so which layer noticed is not something a caller
+should be able to see. That matters because the layer is not stable: a value
+parsed by hand today can become a parser-level check tomorrow without anything
+observable changing. Both tools derive the status from the error `code` for
+exactly that reason.
+
+The line is *usable*, not *permanent*. `secret_not_found`, `not_found` and
+`empty_stream` are all permanent too, but the invocation that produced them was
+well-formed and it is the world, not the command line, that has to change —
+those are exit 1. Nothing is ever both exit 2 and `retryable`.
+
+**Which stream the object goes to is a separate question** — it follows the
+table above, not the exit code. stdout carries the product, so an object goes
+there unless the product is bytes. The one forced case is a rejection by the
+argument parser itself: the subcommand is not known yet, so the object is the
+whole of **stderr** and stdout stays byte-empty. If the command had turned out
+to be `rxv get`, anything on stdout would have landed in whatever the pipe
+feeds.
 
 `rx run` and `rx wait` additionally propagate the remote command's exit status
 (`rx run HOST -- false` exits 1; killed by signal N exits 128+N; a command that

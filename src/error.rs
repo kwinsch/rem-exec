@@ -23,6 +23,14 @@ pub enum RemExecError {
     #[error("{0}")]
     BadHost(String),
 
+    /// A release asset is not there: the download source answered with an HTTP
+    /// error rather than failing to be reached. Kept distinct from
+    /// [`RemExecError::Other`] because the two need opposite answers — a 404 for
+    /// `--version v9.9.9` never becomes a 200 on a retry, while a name that did
+    /// not resolve might.
+    #[error("{0}")]
+    AssetNotFound(String),
+
     #[error("daemon not running")]
     DaemonNotRunning,
 

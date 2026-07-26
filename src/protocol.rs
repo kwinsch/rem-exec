@@ -198,6 +198,27 @@ impl ErrorCode {
                 | ErrorCode::Internal
         )
     }
+
+    /// The process exit code this failure answers with: 2 when the *call* is
+    /// unusable as written, 1 when a usable call failed.
+    ///
+    /// Deriving it from the code rather than from each call site is what keeps
+    /// the answer independent of *which layer* rejected the request. `--mode
+    /// 9999` is parsed by hand today and could be a clap `value_parser`
+    /// tomorrow; a caller must not be able to see that refactor. It is the same
+    /// rule `invalid_process_id` already follows on the wire, where rx and rxd
+    /// both check and emit one code.
+    ///
+    /// The line is "is my command line usable", not "is this permanent":
+    /// `not_found`, `empty_stream` and `deploy_failed` are all permanent, but
+    /// the call that produced them was well-formed and something about the
+    /// world, not the invocation, has to change.
+    pub fn exit_code(self) -> u8 {
+        match self {
+            ErrorCode::BadRequest | ErrorCode::BadHost | ErrorCode::InvalidProcessId => 2,
+            _ => 1,
+        }
+    }
 }
 
 /// Response from rxd. `Follow` streams raw bytes and has no JSON envelope.
@@ -330,9 +351,13 @@ pub enum Response {
 
     #[serde(rename = "error")]
     Error {
-        message: String,
+        // `code` precedes `message`: it is the field both guides tell callers to
+        // branch on, so it belongs beside the discriminant, and rxv already
+        // emits this order. `preserve_order` exists so the same error reads the
+        // same way in both tools; until this moved, it did not.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         code: Option<ErrorCode>,
+        message: String,
         // Always serialized, even when false. Omitting it made `retryable`
         // absent on most errors, so a caller reading the documented error shape
         // had to treat "missing" and "false" as the same thing — and the
@@ -493,5 +518,83 @@ impl Response {
             *h = Some(hint.into());
         }
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every code, so a new one has to be classified deliberately rather than
+    /// inheriting a default nobody looked at.
+    const ALL_CODES: &[ErrorCode] = &[
+        ErrorCode::BadRequest,
+        ErrorCode::InvalidProcessId,
+        ErrorCode::ProcessNotFound,
+        ErrorCode::ProcessExited,
+        ErrorCode::Timeout,
+        ErrorCode::NotDeployed,
+        ErrorCode::Unsupported,
+        ErrorCode::SshUnreachable,
+        ErrorCode::SshAuth,
+        ErrorCode::IncompleteTransfer,
+        ErrorCode::EmptyStream,
+        ErrorCode::NotFound,
+        ErrorCode::BadHost,
+        ErrorCode::FileChanged,
+        ErrorCode::DeployFailed,
+        ErrorCode::Internal,
+    ];
+
+    /// Exit 2 means "this call is unusable as written". The line is not "is it
+    /// permanent" — `not_found`, `empty_stream` and `deploy_failed` are all
+    /// permanent, but the invocation that produced them was well-formed and it
+    /// is the world, not the command line, that has to change.
+    #[test]
+    fn exit_two_is_exactly_the_unusable_call() {
+        for code in ALL_CODES {
+            let unusable = matches!(
+                code,
+                ErrorCode::BadRequest | ErrorCode::BadHost | ErrorCode::InvalidProcessId
+            );
+            assert_eq!(
+                code.exit_code(),
+                if unusable { 2 } else { 1 },
+                "{code:?} is on the wrong side of the exit-2 line"
+            );
+        }
+    }
+
+    /// A malformed call can never be retryable: re-sending the identical bad
+    /// argument produces the identical rejection, so a retry loop would spin.
+    #[test]
+    fn nothing_is_both_malformed_and_retryable() {
+        for code in ALL_CODES {
+            assert!(
+                !(code.exit_code() == 2 && code.retryable()),
+                "{code:?} tells a caller both 'fix your call' and 'try again'"
+            );
+        }
+    }
+
+    /// `code` leads the object, ahead of `message`: it is the field callers
+    /// branch on, and rxv already emits this order. `preserve_order` exists so
+    /// the same error reads the same way in both tools.
+    #[test]
+    fn the_error_envelope_leads_with_type_then_code() {
+        let response = Response::error_code(ErrorCode::BadHost, "nope").with_hint("do this");
+        let json = serde_json::to_string(&response).expect("serializes");
+        let keys: Vec<&str> = ["type", "code", "message", "retryable", "hint"].to_vec();
+        let positions: Vec<usize> = keys
+            .iter()
+            .map(|k| {
+                json.find(&format!("\"{k}\""))
+                    .unwrap_or_else(|| panic!("{k} must be present in {json}"))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "key order must be {keys:?}, got {json}"
+        );
     }
 }

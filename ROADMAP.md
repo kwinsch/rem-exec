@@ -120,10 +120,11 @@ verbatim in rem-exec-vault):
   does not exist.
 
 Breaking, and deliberate before 1.0: argument errors moved from stderr text to
-stdout JSON; an unusable argument value now exits 2; piped JSON is compact; `rx
-daemon` prints objects. `PROTOCOL_VERSION` is unchanged — the rx↔rxd wire did
-not move — but the version bump means `ping` reports `up_to_date:false` for a
-0.3.x rxd, so run `rx deploy` across the fleet after upgrading.
+stdout JSON; an unusable argument value exits 2 (see the exit-code slice below —
+0.4.0 claimed this before it was true); piped JSON is compact; `rx daemon`
+prints objects. `PROTOCOL_VERSION` is unchanged — the rx↔rxd wire did not move —
+but the version bump means `ping` reports `up_to_date:false` for a 0.3.x rxd, so
+run `rx deploy` across the fleet after upgrading.
 
 Everything below is proposed, not committed. Ordered by agent-experience value.
 
@@ -300,9 +301,80 @@ get past — 18 commands where the daily path is three. Anything shaped like
 there. New *error codes* are held to the same test: `put`'s misclassification
 was fixed by reusing the mapping `get` already had, not by inventing a code.
 
+**Slice 5 — the release-candidate pass.** Found by walking the whole documented
+path against the podman hosts with 0.4.0 staged but untagged. Four of the five
+were on the list below; the fifth was not, and is the one that mattered most.
+
+- **A closed stdout was a panic.** `rx run HOST -- <big output> | head` printed
+  a Rust panic banner and exited **101** — a status the contract does not
+  define — because the Rust runtime ignores SIGPIPE and `println!` then panics
+  on EPIPE. It only appeared once the payload outgrew the 64 KB pipe buffer, so
+  `rx skill | head` looked fine: the same "depends on whether it fit in the
+  buffer" shape as the transport-fidelity bug in 0.3.0. `rxv` never panicked (it
+  reports a write failure), and `start --pipe` was already clean.
+
+  Fixed by making the emit path tolerate EPIPE, *not* by restoring the default
+  SIGPIPE disposition — which was tried first and broke the daemon. `rx daemon
+  start` forks, so the child inherited the disposition, and `start`'s own
+  liveness probe (connect, then close) killed the daemon it had just started
+  when the reply hit the closed socket. It presented as "the daemon will not
+  stay up", several layers away from the one-line change that caused it. Two
+  other paths would have gone the same way: `pipe_local_stdin_to_remote` and
+  `run_pipe_mode` both treat EPIPE as a routine end (that is what makes `… |
+  head` work through the pipe) and still owe the caller an object afterwards.
+  A process-wide signal disposition is the wrong granularity for a tool that is
+  a filter on one path, a server on another, and a reporter on all of them.
+  Both halves are tested now, including the daemon surviving a client hang-up.
+- **Exit 2 now means what the contract always said it meant.** `--mode 9999`, a
+  destination that is not `HOST:PATH`, `bad_host`, `invalid_process_id` and
+  rxv's `invalid_path` exited 1 while a mistyped *flag* exited 2 — so the status
+  depended on whether clap or the tool's own validation noticed, which is an
+  implementation seam a caller must not be able to see (`--mode` is hand-parsed
+  today and could be a clap `value_parser` tomorrow). Both tools derive the
+  status from the error code now — `ErrorCode::exit_code()` beside the existing
+  `retryable()` — so a new code has to be classified deliberately and a call
+  site cannot get it wrong. The line is *usable*, not *permanent*: `not_found`,
+  `empty_stream`, `secret_not_found` stay exit 1, and a test asserts nothing is
+  ever both exit 2 and retryable. `docs/CONTRACT.md` gained the part it was
+  missing: the exit code and the *stream* are two axes, and only the parser's
+  own rejections are forced to stderr, because there the subcommand is not known
+  yet. 0.4.0 had claimed this change in its release notes without shipping it,
+  and `tests/cli_contract.rs` froze the gap by asserting exit 1.
+- **`cache fetch` reported a 404 as `internal`, retryable.** `--version v9.9.9`
+  told the caller to retry forever. curl's exit 22 (an HTTP error under `-f`)
+  now separates a missing asset from an unreachable source, and the missing one
+  answers `deploy_failed` + not retryable — the code whose own doc comment
+  already described exactly this case. No new code, per the scope guard above.
+- **`daemon status` reported `changed:false`** on a query that changes nothing.
+  The idempotence rule is about verbs that *ensure* a state; a structurally
+  constant field invites a caller to branch on something that cannot happen. The
+  field is gone from `status` and kept on `start`/`stop`.
+- **The error envelope now leads `type, code, message`** in both tools, which is
+  what `docs/CONTRACT.md` always showed and what rxv always emitted. `code` is
+  the field callers are told to branch on, so it belongs beside the
+  discriminant.
+- **Parser rejections stopped flattening a help page into `message`.** clap's
+  diagnosis is the message, clap's `tip:` becomes the `hint` — which is the
+  field that means "here is a different command" — and the `Usage:` block and
+  "For more information…" are dropped, since the hint already points at
+  `--help`.
+
+Breaking: the five codes above exit 2 where they exited 1, `rx daemon status` no
+longer carries `changed`, and the error envelope's key order changed (a
+positional reader would notice; nothing branching on names does).
+
+**Found in passing, not fixed:** the forked daemon keeps the stderr it
+inherited ("keep stderr for logging", but nothing reads it), so a caller that
+reads to EOF — `Command::output()`, `subprocess.run(capture_output=True)`, most
+agent harnesses — blocks on `rx daemon start` until the daemon *exits*, not
+until start returns. It is behind `RX_DAEMON` and cost the new test an explicit
+`Stdio::null()`, which is the shape of the workaround a caller would need.
+Redirect it to `/dev/null` (or a real log file) after the fork, next time the
+daemon is touched.
+
 **Still open, roughly in the order they are worth doing:**
 
-1. **Presentation — the external review's findings, all verified.**
+1. **Presentation — the external review's findings.**
    ~~The `--auto-deploy` enum dumped into every subcommand help~~ — **done**:
    the flag is gone and `RX_AUTO_DEPLOY` is the only knob. Top-level-only was
    the other candidate and was rejected: it makes flag *position* load-bearing
@@ -311,20 +383,17 @@ was fixed by reusing the mapping `get` already had, not by inventing a code.
    a harness decision, not a per-call one — and it removes a flag that was
    accepted-but-inert on `skill`, `cache`, `daemon` and `deploy`. It cost 8 of
    the 21 lines of `rx skill --help`.
-   Parser rejections carry clap prose inside `message`, with
-   `Usage:` duplicated into a field meant for one short sentence — the `code` is
-   right, the text is not. The skill needs a choose-your-path table (`run` vs
-   `start`+`wait` vs `start --pipe` vs `put`/`get`) near the top, and should say
-   outright that most work is `run` + `put`/`get` and the nine process verbs are
-   the advanced section. `daemon` should be demoted in both help and skill: it is
-   opt-in behind `RX_DAEMON`, does not handle ping/put/get, and sitting beside
-   `run` overstates it.
-2. **`rx daemon status` reports `changed:false` on a pure query**, where the
-   field means nothing.
-3. **The error envelope's key order differs between the tools** — rx emits
-   `type,message,code,…`, rxv `type,code,message,…`, and `docs/CONTRACT.md`
-   shows rxv's. `preserve_order` was adopted precisely so the same error reads
-   the same way in both; it does not yet.
+   ~~Parser rejections carry clap prose inside `message`~~ — **done** in slice 5.
+   ~~The skill needs a choose-your-path table~~ and ~~`daemon` should be
+   demoted~~ — **done**: the guide opens with "Which command", says outright
+   that most work is `run` + `put`/`get`, and puts the daemon in a note that
+   states it is opt-in and handles no ping/deploy/put/get. Nothing is left open
+   under this item; it stays here until the next external read confirms the feel
+   changed.
+2. ~~**`rx daemon status` reports `changed:false` on a pure query**~~ — done in
+   slice 5.
+3. ~~**The error envelope's key order differs between the tools**~~ — done in
+   slice 5.
 
 **Deliberately not doing:** renaming `get`/`status`/`list` for symmetry between
 the tools (natural in each domain, and the collision is documented at the top of
@@ -345,6 +414,15 @@ exercised for real. rx shells out to bare `ssh`/`scp` with no `-F` and no option
 escape hatch, so point it at non-default ports with a PATH shim (`bin/ssh`,
 `bin/scp` execing the real binary with `-F <test config>`) rather than editing
 `~/.ssh/config`. Leaves no residue.
+
+One thing to know when placing that shim: the base directory holds the
+ControlMaster sockets, so a long `XDG_RUNTIME_DIR` (a scratch path under
+`/tmp/…`, say) can push `ControlPath` past the 108-byte `sockaddr_un` limit, and
+every operation then fails with ssh's own "ControlPath too long" rather than
+falling back to an unmultiplexed connection. The real runtime dir is short
+(`/run/user/<uid>`, or `/tmp/rem-exec-<uid>`), so this is a test-rig hazard
+today — but dropping multiplexing instead of failing the command would be the
+better answer, alongside the permission check that already degrades that way.
 
 ## Next
 

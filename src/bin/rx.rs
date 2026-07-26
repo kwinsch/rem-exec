@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 
 use rem_exec::daemon;
 use rem_exec::daemon::server;
+use rem_exec::error::RemExecError;
 use rem_exec::protocol::{DaemonRequest, DaemonResponse, ErrorCode, Request, Response};
 use rem_exec::ssh::{
     REMOTE_BIN, RemoteArgs, serve_request_auto_deploy, ssh_command, ssh_spawn_piped_stdin,
@@ -350,11 +351,7 @@ fn main() -> ExitCode {
     // OpenSSH message about invalid hostname characters.
     for host in command_hosts(&cli.command) {
         if let Err(e) = rem_exec::ssh::validate_host(host) {
-            print_json_response(&Response::error_code(
-                rem_exec::protocol::ErrorCode::BadHost,
-                e.to_string(),
-            ));
-            return ExitCode::FAILURE;
+            return fail(rem_exec::protocol::ErrorCode::BadHost, e.to_string());
         }
     }
 
@@ -369,11 +366,10 @@ fn main() -> ExitCode {
     if let Some(id) = command_process_id(&cli.command)
         && !rem_exec::process::is_valid_process_id(id)
     {
-        print_json_response(&Response::error_code(
+        return fail(
             rem_exec::protocol::ErrorCode::InvalidProcessId,
             format!("invalid process ID: {id}"),
-        ));
-        return ExitCode::FAILURE;
+        );
     }
 
     // Handle daemon subcommands directly
@@ -470,6 +466,16 @@ fn main() -> ExitCode {
                 }));
                 ExitCode::SUCCESS
             }
+            // A release that answers 404 is not an internal failure and does not
+            // appear on a second attempt, so it must not arrive as the one code
+            // that means "retry": `--version v9.9.9` would loop forever. Same
+            // answer `deploy` already gives for the same condition.
+            Err(RemExecError::AssetNotFound(message)) => fail_hint(
+                ErrorCode::DeployFailed,
+                message,
+                "check the tag with `gh release list` (or the releases page); \
+                 `--version vX.Y.Z` selects another one",
+            ),
             Err(e) => fail(ErrorCode::Internal, e.to_string()),
         };
     }
@@ -477,10 +483,13 @@ fn main() -> ExitCode {
     if matches!(cli.command, Command::Skill) {
         // Stamped with the version that shipped it: a guide read from anywhere
         // else can then be recognised as describing a different binary.
-        print!(
-            "{}",
-            include_str!("../../docs/llm.txt").replace("{{VERSION}}", env!("CARGO_PKG_VERSION"))
-        );
+        //
+        // Written through the same EPIPE-tolerant path as the objects: piping
+        // the guide into a pager and quitting early is the normal way to read
+        // it, and that must not end in a panic.
+        let guide =
+            include_str!("../../docs/llm.txt").replace("{{VERSION}}", env!("CARGO_PKG_VERSION"));
+        write_all(&mut std::io::stdout(), &guide);
         return ExitCode::SUCCESS;
     }
 
@@ -727,8 +736,9 @@ fn route_via_ssh(command: &Command) -> ExitCode {
             let response = match serve_request_auto_deploy(host, &request, &[]) {
                 Ok(r) => r,
                 Err(e) => {
-                    print_json_response(&transport_error_json(host, &e));
-                    return ExitCode::FAILURE;
+                    let response = transport_error_json(host, &e);
+                    print_json_response(&response);
+                    return exit_for(&response);
                 }
             };
             match &response {
@@ -831,8 +841,9 @@ fn dispatch_simple(host: &str, request: &Request, body: &[u8]) -> ExitCode {
             exit_for(&resp)
         }
         Err(e) => {
-            print_json_response(&transport_error_json(host, &e));
-            ExitCode::FAILURE
+            let response = transport_error_json(host, &e);
+            print_json_response(&response);
+            exit_for(&response)
         }
     }
 }
@@ -846,8 +857,9 @@ fn dispatch_run(host: &str, request: &Request, body: &[u8]) -> ExitCode {
             run_exit(&resp)
         }
         Err(e) => {
-            print_json_response(&transport_error_json(host, &e));
-            ExitCode::FAILURE
+            let response = transport_error_json(host, &e);
+            print_json_response(&response);
+            exit_for(&response)
         }
     }
 }
@@ -912,7 +924,7 @@ fn do_deploy(
                 // recognize.
                 if hosts.len() == 1 {
                     print_json_response(&response);
-                    return ExitCode::FAILURE;
+                    return exit_for(&response);
                 }
 
                 // A batch keeps the per-host aggregate (some hosts succeeded),
@@ -992,8 +1004,9 @@ fn do_ping(host: &str) -> ExitCode {
             exit_for(&resp)
         }
         Err(e) => {
-            print_json_response(&transport_error_json(host, &e));
-            ExitCode::FAILURE
+            let response = transport_error_json(host, &e);
+            print_json_response(&response);
+            exit_for(&response)
         }
     }
 }
@@ -1038,8 +1051,9 @@ fn do_put(
             exit_for(&resp)
         }
         Err(e) => {
-            print_json_response(&transport_error_json(host, &e));
-            ExitCode::FAILURE
+            let response = transport_error_json(host, &e);
+            print_json_response(&response);
+            exit_for(&response)
         }
     }
 }
@@ -1440,8 +1454,9 @@ fn do_get(remote: &str, local: &str, mode: Option<&str>) -> ExitCode {
             exit_for(&resp)
         }
         Err(e) => {
-            print_json_response(&transport_error_json(host, &e));
-            ExitCode::FAILURE
+            let response = transport_error_json(host, &e);
+            print_json_response(&response);
+            exit_for(&response)
         }
     }
 }
@@ -1484,8 +1499,9 @@ fn route_via_daemon(command: &Command) -> ExitCode {
                     pipe_local_stdin_to_remote(host, id, *no_close_stdin)
                 }
                 Ok(DaemonResponse::Error { message }) => {
-                    print_json_response(&daemon_error_json(message));
-                    ExitCode::FAILURE
+                    let response = daemon_error_json(message);
+                    print_json_response(&response);
+                    exit_for(&response)
                 }
                 Err(e) => fail(ErrorCode::Internal, format!("local daemon: {e}")),
             };
@@ -1622,7 +1638,7 @@ fn route_via_daemon(command: &Command) -> ExitCode {
         Ok(DaemonResponse::Ok { data }) => {
             print_json(&data);
             if data.get("type").and_then(|v| v.as_str()) == Some("error") {
-                ExitCode::FAILURE
+                error_exit_from_value(&data)
             } else if is_run {
                 run_exit_from_value(&data)
             } else {
@@ -1630,8 +1646,9 @@ fn route_via_daemon(command: &Command) -> ExitCode {
             }
         }
         Ok(DaemonResponse::Error { message }) => {
-            print_json_response(&daemon_error_json(message));
-            ExitCode::FAILURE
+            let response = daemon_error_json(message);
+            print_json_response(&response);
+            exit_for(&response)
         }
         Err(e) => fail(ErrorCode::Internal, format!("local daemon: {e}")),
     }
@@ -1700,12 +1717,32 @@ fn command_hosts(command: &Command) -> Vec<&str> {
     }
 }
 
+/// Map a response to the process exit code, deriving a failure's status from its
+/// own `code` so exit 2 means "this call is unusable as written" wherever the
+/// rejection came from — rx's own checks, clap, or rxd on the far side.
 fn exit_for(response: &Response) -> ExitCode {
-    if matches!(response, Response::Error { .. }) {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
+    match response {
+        Response::Error { code, .. } => error_exit(*code),
+        _ => ExitCode::SUCCESS,
     }
+}
+
+/// Exit status for a typed error. An error that reached here without a code is
+/// exit 1: `internal` is what an unclassified failure means, and that is a
+/// failed operation, not a malformed call.
+fn error_exit(code: Option<ErrorCode>) -> ExitCode {
+    ExitCode::from(code.map_or(1, ErrorCode::exit_code))
+}
+
+/// [`error_exit`] for an error that arrived as an opaque value — what the local
+/// daemon hands back. Routing through the daemon must not change the exit
+/// status, the same reason `run` reads its remote status out of the value here
+/// rather than defaulting to success.
+fn error_exit_from_value(data: &serde_json::Value) -> ExitCode {
+    let code = data
+        .get("code")
+        .and_then(|c| serde_json::from_value::<ErrorCode>(c.clone()).ok());
+    error_exit(code)
 }
 
 /// Exit status for a command that never started, following the shell
@@ -1738,7 +1775,7 @@ fn run_exit(response: &Response) -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
-        Response::Error { .. } => ExitCode::FAILURE,
+        Response::Error { code, .. } => error_exit(*code),
         _ => ExitCode::SUCCESS,
     }
 }
@@ -1827,9 +1864,42 @@ fn object_goes_to_stdout(command: &Command) -> bool {
 /// Print one JSON object to the stream [`object_goes_to_stdout`] assigns it.
 fn emit_json(text: &str) {
     if OBJECT_TO_STDERR.load(Ordering::Relaxed) {
-        eprintln!("{text}");
+        write_line(&mut std::io::stderr(), text);
     } else {
-        println!("{text}");
+        write_line(&mut std::io::stdout(), text);
+    }
+}
+
+/// Write a line, treating a closed consumer as an ordinary end rather than a
+/// crash.
+///
+/// The Rust runtime ignores SIGPIPE, so a write to a closed stdout returns EPIPE
+/// and the `println!` family panics on it: `rx run HOST -- <big output> | head`
+/// printed a panic banner and exited **101**, a status the contract does not
+/// define — and only once the payload outgrew the pipe buffer, so small outputs
+/// hid it.
+///
+/// Restoring the default SIGPIPE disposition would be the usual fix for a
+/// filter, but it is wrong here: rx forks a daemon that must survive a client
+/// hanging up mid-response, and its own pipe paths handle EPIPE deliberately and
+/// still owe the caller an object afterwards. Both would have died silently.
+/// Dropping the write keeps every one of those paths intact, and the exit status
+/// still describes the operation rather than the consumer.
+fn write_line(stream: &mut impl std::io::Write, text: &str) {
+    write_out(stream, format_args!("{text}\n"));
+}
+
+/// [`write_line`] without the newline, for the guide.
+fn write_all(stream: &mut impl std::io::Write, text: &str) {
+    write_out(stream, format_args!("{text}"));
+}
+
+fn write_out(stream: &mut impl std::io::Write, args: std::fmt::Arguments<'_>) {
+    use std::io::ErrorKind;
+    match stream.write_fmt(args) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::BrokenPipe => {}
+        Err(e) => eprintln!("rx: cannot write output: {e}"),
     }
 }
 
@@ -1840,6 +1910,36 @@ fn print_json_response(response: &Response) {
 /// Collapse a multi-line rendering into one line for a JSON string field.
 fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Split clap's rendering into a one-sentence `message` and, when clap offers
+/// one, the `hint` that names the fix.
+///
+/// clap renders up to four blocks: the error line, an optional `tip:`, a
+/// `Usage:` block, and "For more information, try '--help'". Flattening all four
+/// into `message` produced a 200-character run-on in a field `docs/CONTRACT.md`
+/// describes as one short sentence, and duplicated a usage block into a place
+/// nothing can act on. The first line is the diagnosis; clap's tip is a concrete
+/// different command, which is exactly what `hint` is for; the remainder is help
+/// text the hint already points at.
+fn clap_parts(rendered: &str) -> (String, Option<String>) {
+    let mut message = String::new();
+    let mut tip = None;
+    for line in rendered.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if let Some(rest) = line.strip_prefix("error: ") {
+            if message.is_empty() {
+                message = one_line(rest);
+            }
+        } else if let Some(rest) = line.strip_prefix("tip: ") {
+            tip.get_or_insert_with(|| one_line(rest));
+        } else if message.is_empty() && !line.starts_with("Usage:") {
+            message = one_line(line);
+        }
+    }
+    if message.is_empty() {
+        message = one_line(rendered);
+    }
+    (message, tip)
 }
 
 /// Whether the parse-failure object should be compact.
@@ -1893,14 +1993,19 @@ fn parse_failure(err: clap::Error) -> ExitCode {
         }
         // The object is the *whole* of stderr here, never prose alongside it:
         // the contract promises a typed object on exit 2, and a caller doing
-        // `JSON.parse(stderr)` must not trip over a usage block. clap's own
-        // wording (including its "tip: …" suggestions) is preserved inside
-        // `message`, so nothing is lost for a person reading it.
+        // `JSON.parse(stderr)` must not trip over a usage block. clap's
+        // diagnosis becomes `message` and its suggestion becomes `hint`, so
+        // nothing an agent can act on is lost and neither field carries a page
+        // of help text.
         _ => {
             COMPACT_JSON.store(compact_for_stderr(), Ordering::Relaxed);
             let rendered = strip_ansi(&err.render().to_string());
-            let response = Response::error_code(ErrorCode::BadRequest, one_line(&rendered))
-                .with_hint("run `rx --help`, or `rx skill` for the full guide");
+            let (message, tip) = clap_parts(&rendered);
+            let hint = tip.map_or_else(
+                || "run `rx --help`, or `rx skill` for the full guide".to_string(),
+                |t| format!("{t}; `rx --help` for the full usage"),
+            );
+            let response = Response::error_code(ErrorCode::BadRequest, message).with_hint(hint);
             eprintln!("{}", render_json(&response));
             ExitCode::from(2)
         }
@@ -1929,24 +2034,31 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// Report a client-side failure as a typed error object on stdout and exit 1.
+/// Report a client-side failure as a typed error object, exiting per its code.
 ///
 /// The single place an argument rx cannot use becomes a response. The contract
 /// promises exactly one JSON object per invocation, so a bad `--mode` has to
 /// arrive in the same shape as an unreachable host: an agent that parses stdout
 /// and branches on `code` never has to fall back to reading prose off stderr,
 /// which is what it does right before it gives up on the tool.
+///
+/// The object still goes to the command's normal object stream — stdout for
+/// almost everything, stderr under `start --pipe`, where stdout is the process's
+/// bytes. Only the parser's own rejections are forced to stderr, and only
+/// because the subcommand is not known yet at that point.
 fn fail(code: ErrorCode, message: impl Into<String>) -> ExitCode {
-    print_json_response(&Response::error_code(code, message));
-    ExitCode::FAILURE
+    let response = Response::error_code(code, message);
+    print_json_response(&response);
+    exit_for(&response)
 }
 
 /// [`fail`] with a `hint` naming the fix. Use it when the fix is a *different*
 /// command or flag; when the message already states the expected form, the hint
 /// would only repeat it.
 fn fail_hint(code: ErrorCode, message: impl Into<String>, hint: impl Into<String>) -> ExitCode {
-    print_json_response(&Response::error_code(code, message).with_hint(hint));
-    ExitCode::FAILURE
+    let response = Response::error_code(code, message).with_hint(hint);
+    print_json_response(&response);
+    exit_for(&response)
 }
 
 fn print_json(value: &serde_json::Value) {
@@ -1979,6 +2091,32 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::os::unix::fs::PermissionsExt;
+
+    /// A consumer that hung up, the way `| head` does.
+    struct ClosedPipe;
+
+    impl std::io::Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    /// A closed consumer ends the write, not the process.
+    ///
+    /// SIGPIPE is ignored by the Rust runtime, so this arrives as EPIPE and the
+    /// `println!` family panics on it — which exited 101 with a panic banner,
+    /// outside the 0/1/2 the contract defines. Restoring the default signal
+    /// disposition was the other candidate and is wrong here: rx forks a daemon
+    /// that must outlive a client hanging up, and its pipe paths handle EPIPE
+    /// deliberately and still owe the caller an object.
+    #[test]
+    fn a_closed_consumer_does_not_panic_the_writer() {
+        write_line(&mut ClosedPipe, "{\"type\":\"ping\"}");
+        write_all(&mut ClosedPipe, "the guide, unread");
+    }
 
     fn completed(
         exit_code: Option<i32>,

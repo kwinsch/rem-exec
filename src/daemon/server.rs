@@ -27,6 +27,21 @@ fn outcome(action: &str, running: bool, changed: bool) -> serde_json::Value {
     })
 }
 
+/// The object a daemon *query* produced.
+///
+/// No `changed`: the contract's idempotence rule is about verbs that ensure a
+/// state — `start`, `stop`, `deploy`, `unlock` — where `changed` reports whether
+/// this call was the one that did it. `status` changes nothing, so the field
+/// could only ever be `false`, and a field that is structurally constant invites
+/// a caller to branch on something that can never happen.
+fn query_outcome(action: &str, running: bool) -> serde_json::Value {
+    serde_json::json!({
+        "type": "daemon",
+        "action": action,
+        "running": running,
+    })
+}
+
 /// Read the recorded daemon pid, if the file is there and parses.
 fn recorded_pid() -> Option<u32> {
     fs::read_to_string(super::pid_path())
@@ -132,13 +147,13 @@ pub fn daemon_status() -> Result<serde_json::Value> {
     let request = DaemonRequest::DaemonStatus;
     match super::send_request(&request) {
         Ok(resp) => {
-            let mut value = outcome("status", true, false);
+            let mut value = query_outcome("status", true);
             if let (Some(obj), DaemonResponse::Ok { data }) = (value.as_object_mut(), resp) {
                 obj.insert("detail".into(), data);
             }
             Ok(value)
         }
-        Err(crate::error::RemExecError::DaemonNotRunning) => Ok(outcome("status", false, false)),
+        Err(crate::error::RemExecError::DaemonNotRunning) => Ok(query_outcome("status", false)),
         Err(e) => Err(e),
     }
 }

@@ -383,6 +383,22 @@ fn checksum_for_asset(sums: &str, asset: &str) -> Option<String> {
     })
 }
 
+/// curl's exit status for "the server answered, with an HTTP error" (what `-f`
+/// turns a 404 into). Every other non-zero status is a failure to reach the
+/// server at all — DNS, connect, timeout — which is the retryable kind.
+const CURL_HTTP_ERROR: i32 = 22;
+
+/// Classify a failed `curl` run: a missing asset is permanent, anything else is
+/// a transport failure worth retrying.
+fn download_failure(url: &str, status: Option<i32>, stderr: &str) -> RemExecError {
+    let message = format!("failed to download {url}: {stderr}");
+    if status == Some(CURL_HTTP_ERROR) {
+        RemExecError::AssetNotFound(message)
+    } else {
+        RemExecError::Other(message)
+    }
+}
+
 fn download_text(url: &str) -> Result<String> {
     let output = Command::new("curl")
         .args(["-fsSL", url])
@@ -391,9 +407,7 @@ fn download_text(url: &str) -> Result<String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(RemExecError::Other(format!(
-            "failed to download {url}: {stderr}"
-        )));
+        return Err(download_failure(url, output.status.code(), &stderr));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -410,9 +424,7 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(RemExecError::Other(format!(
-            "failed to download {url}: {stderr}"
-        )));
+        return Err(download_failure(url, output.status.code(), &stderr));
     }
 
     Ok(())
@@ -760,6 +772,37 @@ pub fn deploy_error_response(host: &str, err: &RemExecError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 404 and an unreachable download source need opposite answers, and
+    /// curl's exit status is what separates them: `-f` turns an HTTP error into
+    /// 22, while DNS and connect failures have their own statuses. Reporting
+    /// both as `internal` told a caller to retry `--version v9.9.9` forever.
+    #[test]
+    fn a_missing_asset_is_distinguished_from_an_unreachable_source() {
+        let missing = download_failure("https://example/SHA256SUMS", Some(22), "curl: (22) 404");
+        assert!(
+            matches!(missing, RemExecError::AssetNotFound(_)),
+            "an HTTP error is a missing asset, not a transport failure"
+        );
+
+        for status in [Some(6), Some(7), Some(28), None] {
+            let transient = download_failure("https://example/SHA256SUMS", status, "curl: (6)");
+            assert!(
+                matches!(transient, RemExecError::Other(_)),
+                "curl status {status:?} is a failure to reach the source"
+            );
+        }
+    }
+
+    /// A missing asset still reads as `deploy_failed` on the deploy path, which
+    /// is what the code has always documented for it.
+    #[test]
+    fn a_missing_asset_reports_deploy_failed() {
+        let err = RemExecError::AssetNotFound("failed to download …: 404".into());
+        let json = serde_json::to_value(deploy_error_response("host1", &err)).expect("serializes");
+        assert_eq!(json["code"], "deploy_failed");
+        assert_eq!(json["retryable"], false);
+    }
 
     #[test]
     fn deploy_failure_is_a_typed_error_not_a_deployed_object() {

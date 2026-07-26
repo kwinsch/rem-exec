@@ -63,11 +63,19 @@ over that substrate, and one to block on what you started:
 - Discovery is not an operation and prints plain text, no object: `--help`, `-h`,
   `help`, `--version`, `skill` (this guide), and a bare `rx` with no subcommand.
   None of them has side effects.
-- Exit 0 = success · 1 = the call was understood and failed · 2 = the call was
-  malformed. On exit 2 stdout stays EMPTY and the typed object goes to stderr —
-  a mistyped flag and a rejected argument value are one class of failure, and
-  stdout is kept clean because the subcommand is not yet known when the parser
-  rejects a call. The one exit-2 case with NO object is a bare `rx`: it named no
+- Exit 0 = success · 1 = the call was usable and the operation failed · 2 = the
+  call itself is unusable, so nothing was attempted. Exit 2 is a mistyped flag
+  AND a rejected argument value — `--mode 9999`, a destination that is not
+  HOST:PATH, a process ID that is not 8 hex digits — because both mean "fix the
+  command line", and re-sending it unchanged cannot help. The test is *usable*,
+  not *permanent*: `not_found` and `empty_stream` are permanent too, but the
+  call was well-formed, so they are exit 1. Nothing is both exit 2 and
+  retryable.
+  Where the object goes is a separate question, answered by the command, not by
+  the exit code: stdout, except `start --pipe` (stdout is the process stream).
+  The one forced case is a rejection by the argument PARSER — the subcommand is
+  not known yet, so the object is the whole of stderr and stdout stays EMPTY.
+  The one exit-2 case with NO object is a bare `rx`: it named no
   operation, so it prints help to stderr like the rest of discovery.
   `run`/`wait` also propagate the remote command's status:
   `rx run HOST -- false` → exit 1, killed by signal N → 128+N, and a command
@@ -230,8 +238,12 @@ stdout/stderr/data fields pair with an `encoding`:
   ping      {version, protocol, arch, os, kernel, hostname,
              distro_id?, distro_version?,
              local_version, up_to_date, hint?}
-  daemon    {action, running, changed, pid?, detail?}   # daemon start|stop|status
-  error     {message, code, retryable, hint?}   # code and retryable are always
+  daemon    {action, running, changed, pid?}    # start|stop — changed says
+                                                # whether this call did it
+  daemon    {action, running, detail?}          # status — a query changes
+                                                # nothing, so it reports no
+                                                # `changed`
+  error     {code, message, retryable, hint?}   # code and retryable are always
                                                 # present; see Error codes below
 
 - run and wait yield completed or running. exit_code is null when signal is set.
@@ -271,7 +283,11 @@ a missing target directory or a path the SSH user cannot write answers
 `not_found` / `bad_request` with a hint (not `internal`), and a malformed process
 ID answers `invalid_process_id` locally, without contacting the host at all — so
 a typo cannot come back as a retryable `ssh_unreachable` from a host that happens
-to be down.
+to be down. A release tag that 404s answers `deploy_failed`, not `internal`:
+`cache fetch --version v9.9.9` is a typo, not a blip.
+
+Three of these mean the command line is unusable and exit 2 rather than 1:
+`bad_request`, `bad_host`, `invalid_process_id`. Everything else is exit 1.
 
 ## HOST argument
 

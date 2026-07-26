@@ -9,6 +9,7 @@
 //! Every case here is a client-side rejection: no host is contacted, so these
 //! run anywhere, with no network and no rxd.
 
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Output, Stdio};
 
 /// Run rx with `args` and closed stdin.
@@ -23,6 +24,18 @@ fn rx(args: &[&str]) -> Output {
         .expect("rx should be runnable")
 }
 
+/// The exit status a given error code answers with: 2 when the *call* is
+/// unusable as written, 1 when a usable call failed.
+///
+/// Spelled out here rather than imported so the test states the rule
+/// independently of the implementation it is checking.
+fn expected_exit(code: &str) -> i32 {
+    match code {
+        "bad_request" | "bad_host" | "invalid_process_id" => 2,
+        _ => 1,
+    }
+}
+
 /// Assert the invocation failed with a typed error object on stdout, and return
 /// the parsed object.
 fn expect_error(args: &[&str], code: &str) -> serde_json::Value {
@@ -31,8 +44,9 @@ fn expect_error(args: &[&str], code: &str) -> serde_json::Value {
 
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "expected exit 1 for {args:?}\nstdout: {stdout}\nstderr: {}",
+        Some(expected_exit(code)),
+        "expected exit {} for {args:?}\nstdout: {stdout}\nstderr: {}",
+        expected_exit(code),
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -42,6 +56,43 @@ fn expect_error(args: &[&str], code: &str) -> serde_json::Value {
     assert_eq!(value["type"], "error", "for {args:?}");
     assert_eq!(value["code"], code, "for {args:?}: {value}");
     value
+}
+
+/// A value rx refuses is exit 2, exactly like a flag clap refuses.
+///
+/// The two are one class of mistake — the command line cannot be used — and
+/// which of them notices is an implementation seam: `--mode` is parsed by hand
+/// today and could be a clap `value_parser` tomorrow. Deriving the status from
+/// the code is what keeps that refactor invisible to a caller, the same rule
+/// `invalid_process_id` already follows across rx and rxd.
+#[test]
+fn an_unusable_argument_exits_two_wherever_it_was_caught() {
+    for args in [
+        vec!["put", "/etc/hostname", "somehost"],
+        vec!["run", "h", "--env", "NOEQUALS", "--", "true"],
+        vec!["put", "/etc/hostname", "h:/tmp/x", "--mode", "9999"],
+        vec!["run", "-oProxyCommand=touch /tmp/pwn", "--", "true"],
+        vec!["status", "h", "NOTANID"],
+    ] {
+        let out = rx(&args);
+        assert_eq!(out.status.code(), Some(2), "for {args:?}");
+    }
+
+    // …and a usable call that failed stays exit 1. `deploy --offline` against an
+    // empty cache needs no host and no network, so this runs anywhere.
+    let out = rx(&[
+        "deploy",
+        "h",
+        "--offline",
+        "--binary",
+        "/nonexistent/rxd-build",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a well-formed call that failed is exit 1: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 }
 
 #[test]
@@ -98,7 +149,7 @@ fn arguments_are_rejected_before_stdin_is_read() {
             panic!("rx blocked on stdin for a call it was going to reject");
         }
     };
-    assert_eq!(status.code(), Some(1));
+    assert_eq!(status.code(), Some(2));
 }
 
 /// clap rejects what rx never sees. The contract calls that exit 2, and stdout
@@ -134,6 +185,13 @@ fn daemon_control_answers_with_an_object() {
     assert_eq!(value["type"], "daemon");
     assert_eq!(value["action"], "status");
     assert!(value["running"].is_boolean());
+    // No `changed` on a query. The idempotence rule is about verbs that ensure
+    // a state; `status` changes nothing, so the field could only ever be false
+    // and would invite a caller to branch on something that cannot happen.
+    assert!(
+        value.get("changed").is_none(),
+        "a query must not report `changed`: {value}"
+    );
 
     // Stopping a daemon that is not running is the requested state.
     let out = rx(&["--compact", "daemon", "stop"]);
@@ -203,7 +261,10 @@ fn a_piped_start_never_writes_an_object_to_stdout() {
         vec!["start", "--pipe", "h", "--env", "NOEQUALS", "--", "true"],
     ] {
         let out = rx(&args);
-        assert_eq!(out.status.code(), Some(1), "expected exit 1 for {args:?}");
+        // Both are unusable calls, so both exit 2 — but the routing here is what
+        // the test is about, and it is independent of the status: the object
+        // goes to stderr because stdout is this command's byte stream.
+        assert_eq!(out.status.code(), Some(2), "expected exit 2 for {args:?}");
         assert!(
             out.stdout.is_empty(),
             "stdout carries the process stream and must stay byte-empty for \
@@ -267,8 +328,8 @@ fn parser_rejections_are_typed_objects_on_stderr() {
 
 #[test]
 fn the_parser_object_keeps_claps_own_wording() {
-    // clap's message (including its "tip: …" suggestions) survives inside
-    // `message`, so nothing is lost by not printing its prose separately.
+    // clap's diagnosis survives inside `message`, so nothing is lost by not
+    // printing its prose separately.
     let value = expect_parse_error(&["setup"]);
     let message = value["message"].as_str().expect("message is a string");
     assert!(message.contains("unrecognized subcommand"), "{message}");
@@ -281,6 +342,134 @@ fn the_parser_object_keeps_claps_own_wording() {
     assert!(
         !message.contains('\u{1b}'),
         "message must be unstyled: {message}"
+    );
+}
+
+/// `message` is one sentence and `hint` names a command — the shapes
+/// `docs/CONTRACT.md` describes, not a flattened help page.
+///
+/// Flattening clap's whole rendering put a `Usage:` block and "For more
+/// information, try '--help'" inside a field meant for one short sentence, on
+/// the most-hit failure in the tool. The diagnosis and the suggestion are two
+/// different things and the contract already has a field for each.
+#[test]
+fn the_parser_object_splits_the_diagnosis_from_the_fix() {
+    // clap offers a tip here: '--nope' could have been meant as a value.
+    let value = expect_parse_error(&["run", "h", "--nope", "--", "true"]);
+    let message = value["message"].as_str().expect("message is a string");
+    let hint = value["hint"].as_str().expect("hint is a string");
+
+    assert!(message.contains("unexpected argument"), "{message}");
+    for noise in ["Usage:", "For more information", "tip:"] {
+        assert!(
+            !message.contains(noise),
+            "message must not carry {noise:?}: {message}"
+        );
+    }
+    // The suggestion is not dropped — it moves to the field that means "here is
+    // a different command to run".
+    assert!(
+        hint.contains("-- --nope"),
+        "the tip belongs in hint: {hint}"
+    );
+
+    // With no tip to offer, the hint still points somewhere useful.
+    let value = expect_parse_error(&["setup"]);
+    let hint = value["hint"].as_str().expect("hint is a string");
+    assert!(hint.contains("rx --help"), "{hint}");
+}
+
+/// The local daemon survives a client that hangs up on it.
+///
+/// This is the regression the first attempt at the SIGPIPE fix caused: restoring
+/// the default disposition process-wide meant the forked daemon inherited it,
+/// and `daemon start`'s own liveness probe — connect, then close — killed the
+/// daemon it had just started with SIGPIPE on the reply. It looked like a
+/// daemon that would not stay up, several layers from the change that did it.
+///
+/// Runs against an isolated `XDG_RUNTIME_DIR`, so it never touches a daemon the
+/// developer is using.
+#[test]
+fn the_daemon_outlives_a_client_that_hangs_up() {
+    let runtime = std::env::temp_dir().join(format!("rx-daemon-test-{}", std::process::id()));
+    std::fs::create_dir_all(&runtime).expect("runtime dir");
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
+        .expect("0700 on the runtime dir");
+
+    // stderr goes to /dev/null, not a pipe: the forked daemon keeps the stderr
+    // it inherited, so a caller that reads to EOF — `Command::output()`, and
+    // most harnesses — would block until the daemon exits rather than until
+    // `daemon start` returns.
+    let daemon = |args: &[&str]| -> Output {
+        Command::new(env!("CARGO_BIN_EXE_rx"))
+            .args(args)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .expect("rx should be runnable")
+    };
+
+    let started = daemon(&["--compact", "daemon", "start"]);
+    let value: serde_json::Value =
+        serde_json::from_slice(&started.stdout).expect("one object from daemon start");
+    assert_eq!(value["running"], true, "{value}");
+
+    // A second start is the probe that used to be fatal: it connects to the
+    // daemon and closes. If the daemon died, this reports `changed:true` with a
+    // new pid instead of the idempotent answer.
+    let again = daemon(&["--compact", "daemon", "start"]);
+    let value: serde_json::Value =
+        serde_json::from_slice(&again.stdout).expect("one object from the second start");
+    assert_eq!(
+        value["changed"], false,
+        "the daemon did not survive the first client: {value}"
+    );
+
+    let status = daemon(&["--compact", "daemon", "status"]);
+    let value: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("one object from daemon status");
+    assert_eq!(value["running"], true, "{value}");
+
+    daemon(&["daemon", "stop"]);
+    let _ = std::fs::remove_dir_all(&runtime);
+}
+
+/// A closed stdout is an ordinary end to a pipeline, not a crash.
+///
+/// `rx run HOST -- <big output> | head` used to print a Rust panic banner and
+/// exit 101 — outside the 0/1/2 the contract documents — but only once the
+/// payload outgrew the pipe buffer, so small outputs hid it. The deterministic
+/// half of this lives in rx's own unit tests, which drive the writer against a
+/// consumer that is already gone; this one checks the real binary.
+#[test]
+fn a_closed_stdout_is_not_a_panic() {
+    use std::io::Read;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rx"))
+        .args(["skill"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("rx should be runnable");
+
+    // Read one short chunk, then drop the pipe while rx is still writing.
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut head = [0u8; 64];
+    let _ = stdout.read(&mut head).expect("first chunk");
+    drop(stdout);
+
+    let out = child.wait_with_output().expect("rx should exit");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "a closed stdout must not panic: {stderr}"
+    );
+    assert_ne!(
+        out.status.code(),
+        Some(101),
+        "101 is a panic exit, and is not in the contract"
     );
 }
 
