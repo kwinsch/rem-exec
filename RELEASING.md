@@ -143,10 +143,15 @@ those assets, so they must already exist.
 1. Bump `version` in `Cargo.toml`; commit. (Bump `PROTOCOL_VERSION` only on a
    breaking wire change — a mismatch triggers redeploy via the version check.)
 2. Push commits: `git push origin master`.
-3. Tag the release commit and push it: `git tag -a v0.3.0 -m v0.3.0 && git push origin v0.3.0`.
+3. Tag the release commit and push it (derive the tag from Cargo.toml — do not
+   copy a stale version from an earlier release):
+   ```bash
+   VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+   git tag -a "v$VERSION" -m "v$VERSION" && git push origin "v$VERSION"
+   ```
 4. Create the release with all 9 assets (4 arches × 2 binaries + SHA256SUMS):
-   `gh release create v0.3.0 dist/rx-* dist/rxd-* dist/SHA256SUMS --title ... --notes ...`
+   `gh release create "v$VERSION" dist/rx-* dist/rxd-* dist/SHA256SUMS --title ... --notes ...`
 5. Verify the hashed release resolves and auto-deploy works:
-   `rx cache fetch --version v0.3.0 --force` (downloads + checksum-verifies), then
-   `rx deploy <host>` against a test host (version/protocol check must pass).
+   `rx cache fetch --version "v$VERSION" --force` (downloads + checksum-verifies),
+   then `rx deploy <host>` against a test host (version/protocol check must pass).
 6. Publish to crates.io: `cargo publish` (dry-run first: `cargo publish --dry-run`).

@@ -476,7 +476,16 @@ fn main() -> ExitCode {
                 "check the tag with `gh release list` (or the releases page); \
                  `--version vX.Y.Z` selects another one",
             ),
-            Err(e) => fail(ErrorCode::Internal, e.to_string()),
+            // Unsupported `--arch` is a permanent client mistake, same class as
+            // a missing release: never `internal`/`retryable:true`.
+            Err(e) => {
+                let message = e.to_string();
+                if message.starts_with("unsupported architecture") {
+                    fail(ErrorCode::BadRequest, message)
+                } else {
+                    fail(ErrorCode::Internal, message)
+                }
+            }
         };
     }
 
@@ -1069,8 +1078,18 @@ fn put_file(
     group: Option<String>,
 ) -> rem_exec::error::Result<Response> {
     let send = || -> rem_exec::error::Result<Response> {
-        let mut f = std::fs::File::open(local)?;
-        let size = f.metadata()?.len();
+        // Local open/stat failures are caller mistakes on this machine. Return a
+        // typed response so they never reach `transport_error_json` (which would
+        // probe the host and can mislabel a missing local path as
+        // `not_deployed`). Same class as local `get` write failures.
+        let mut f = match std::fs::File::open(local) {
+            Ok(f) => f,
+            Err(e) => return Ok(local_put_source_error_json(local, &e)),
+        };
+        let size = match f.metadata() {
+            Ok(m) => m.len(),
+            Err(e) => return Ok(local_put_source_error_json(local, &e)),
+        };
         let request = Request::Put {
             path: path.to_string(),
             size: Some(size),
@@ -1114,10 +1133,15 @@ fn put_stdin(
     allow_empty: bool,
 ) -> rem_exec::error::Result<Response> {
     if std::io::stdin().is_terminal() {
-        return Err(rem_exec::error::RemExecError::Other(
+        // Caller mistake, not a transport failure: answer here as `bad_request`
+        // so we never open SSH / mislabel this as `not_deployed`.
+        return Ok(Response::error_code(
+            rem_exec::protocol::ErrorCode::BadRequest,
             "`rx put -` reads the file from stdin, but stdin is a terminal — pipe something \
-             into it, or pass a path instead of `-` (./- for a file named `-`)"
-                .to_string(),
+             into it, or pass a path instead of `-` (./- for a file named `-`)",
+        )
+        .with_hint(
+            "pipe a producer into `rx put -`, e.g. `rxv get host/secret | rx put - host:/path`",
         ));
     }
 
@@ -1299,6 +1323,26 @@ fn local_io_error_json(local: &str, e: &std::io::Error) -> Response {
     }
 }
 
+/// Local source failure for `put` (open/stat of the file being uploaded).
+///
+/// Same reason as [`local_io_error_json`]: never route through the transport
+/// classifier. A missing local path is `not_found`, not `not_deployed`.
+fn local_put_source_error_json(local: &str, e: &std::io::Error) -> Response {
+    let resp = Response::error_code(
+        rem_exec::protocol::io_error_code(e),
+        format!("cannot read {local}: {e}"),
+    );
+    match e.kind() {
+        std::io::ErrorKind::NotFound => resp.with_hint(
+            "the local source path does not exist — check the path, or use `-` to read stdin",
+        ),
+        std::io::ErrorKind::PermissionDenied => {
+            resp.with_hint("no read permission for that local path")
+        }
+        _ => resp,
+    }
+}
+
 /// Download HOST:PATH to a local file, streaming and atomic, with the same
 /// completeness guarantee as `cp`. Honors auto-deploy like other commands.
 fn do_get(remote: &str, local: &str, mode: Option<&str>) -> ExitCode {
@@ -1438,7 +1482,10 @@ fn do_get(remote: &str, local: &str, mode: Option<&str>) -> ExitCode {
             if rem_exec::deploy::auto_deploy_enabled()
                 && rem_exec::deploy::should_auto_deploy(&e) =>
         {
-            match rem_exec::deploy::deploy_to_host(host) {
+            // Honor RX_AUTO_DEPLOY=local the same way put/serve do: repair from
+            // the cache without downloading. deploy_to_host() always allows fetch.
+            let opts = rem_exec::deploy::DeployOpts::for_policy(rem_exec::deploy::policy());
+            match rem_exec::deploy::deploy_to_host_with(host, &opts) {
                 Ok(_) => fetch(),
                 Err(de) => Err(rem_exec::error::RemExecError::Ssh(format!(
                     "auto-deploy to {host} failed: {de} (original: {e})"
@@ -1800,29 +1847,12 @@ fn run_exit_from_value(data: &serde_json::Value) -> ExitCode {
 /// failures classify into typed codes (`ssh_unreachable` / `ssh_auth`); an
 /// ambiguous failure triggers a `version` probe so a missing/outdated rxd
 /// surfaces as an actionable `not_deployed` (with a `rx deploy` /
-/// REM_EXEC_AUTO_DEPLOY hint) instead of a cryptic error an agent would give up
+/// `RX_AUTO_DEPLOY` hint) instead of a cryptic error an agent would give up
 /// on and fall back to raw ssh. Always a JSON object on stdout.
 fn transport_error_json(host: &str, e: &rem_exec::error::RemExecError) -> Response {
     let message = e.to_string();
-    if let Some(code) = rem_exec::ssh::classify_ssh_failure(&message) {
-        let response = Response::error_code(code, message);
-        // rx runs ssh with BatchMode=yes, so this is now always a refusal rather
-        // than a prompt nobody answered. Name the fix: the credential has to be
-        // one ssh can use unattended.
-        return if code == rem_exec::protocol::ErrorCode::SshAuth {
-            response.with_hint(
-                "rx never prompts — load the key into ssh-agent (`ssh-add`), or use a key \
-                 usable without a passphrase; verify with `ssh -o BatchMode=yes HOST true`",
-            )
-        } else {
-            response
-        };
-    }
-    // A failed auto-deploy already carries the precise reason (e.g. a missing
-    // local cache → "run `rx cache fetch` first"); surface it verbatim instead of
-    // re-probing into a generic not_deployed.
-    if message.contains("auto-deploy to ") {
-        return Response::error_code(rem_exec::protocol::ErrorCode::NotDeployed, message);
+    if let Some(response) = classify_transport_message(&message) {
+        return response;
     }
     let status = rem_exec::deploy::remote_deploy_status(host);
     if matches!(
@@ -1839,13 +1869,46 @@ fn transport_error_json(host: &str, e: &rem_exec::error::RemExecError) -> Respon
 }
 
 /// Classify a daemon-relayed error message. The daemon already forwarded the
-/// request and this path has no host to probe, so this is SSH-classify or
-/// untyped — no deploy probe.
+/// request and this path has no host to probe, so SSH-classify and auto-deploy
+/// prefix only — no deploy probe. Auto-deploy failures must stay `not_deployed`
+/// here too, or `RX_DAEMON=1` silently changes the codes an agent branches on.
 fn daemon_error_json(message: String) -> Response {
-    match rem_exec::ssh::classify_ssh_failure(&message) {
-        Some(code) => Response::error_code(code, message),
-        None => Response::error_code(rem_exec::protocol::ErrorCode::Internal, message),
+    if let Some(response) = classify_transport_message(&message) {
+        return response;
     }
+    Response::error_code(rem_exec::protocol::ErrorCode::Internal, message)
+}
+
+/// Shared transport-message classification for the direct-SSH and daemon paths.
+///
+/// Returns `Some` when the message alone is enough (SSH phrases, auto-deploy
+/// prefix). Returns `None` when the direct path should still probe deploy
+/// status; the daemon path treats that as `internal` (no host to probe).
+fn classify_transport_message(message: &str) -> Option<Response> {
+    if let Some(code) = rem_exec::ssh::classify_ssh_failure(message) {
+        let response = Response::error_code(code, message.to_string());
+        // rx runs ssh with BatchMode=yes, so this is now always a refusal rather
+        // than a prompt nobody answered. Name the fix: the credential has to be
+        // one ssh can use unattended.
+        return Some(if code == rem_exec::protocol::ErrorCode::SshAuth {
+            response.with_hint(
+                "rx never prompts — load the key into ssh-agent (`ssh-add`), or use a key \
+                 usable without a passphrase; verify with `ssh -o BatchMode=yes HOST true`",
+            )
+        } else {
+            response
+        });
+    }
+    // A failed auto-deploy already carries the precise reason (e.g. a missing
+    // local cache → "run `rx cache fetch` first"); surface it verbatim instead of
+    // re-probing into a generic not_deployed.
+    if message.contains("auto-deploy to ") {
+        return Some(Response::error_code(
+            rem_exec::protocol::ErrorCode::NotDeployed,
+            message.to_string(),
+        ));
+    }
+    None
 }
 
 /// Which stream this command's JSON object goes to.
@@ -2211,6 +2274,21 @@ mod tests {
         assert_eq!(value["retryable"], false, "{value}");
     }
 
+    /// A local source failure during `put` is the same class: never a transport
+    /// code, never a host probe.
+    #[test]
+    fn a_local_put_source_failure_is_typed_and_names_the_local_path() {
+        use std::io::{Error, ErrorKind};
+
+        let missing =
+            local_put_source_error_json("/no/such/file", &Error::from(ErrorKind::NotFound));
+        let value = serde_json::to_value(&missing).unwrap();
+        assert_eq!(value["code"], "not_found", "{value}");
+        assert_eq!(value["retryable"], false, "{value}");
+        assert!(value["message"].as_str().unwrap().contains("/no/such/file"));
+        assert!(value["hint"].is_string(), "{value}");
+    }
+
     /// The contract advertises `code` unconditionally. `Response::error()` — the
     /// only constructor that could omit it — is gone, so this pins the one path
     /// that used it: a transport failure nothing else could classify.
@@ -2221,6 +2299,17 @@ mod tests {
         assert_eq!(value["type"], "error", "{value}");
         assert_eq!(value["code"], "internal", "{value}");
         assert!(value.get("retryable").is_some(), "{value}");
+    }
+
+    /// A failed auto-deploy message must stay `not_deployed` on the daemon path
+    /// too: the codes an agent branches on must not depend on RX_DAEMON.
+    #[test]
+    fn a_daemon_auto_deploy_failure_is_not_deployed() {
+        let response = daemon_error_json(
+            "auto-deploy to host1 failed: run `rx cache fetch` first (original: …)".into(),
+        );
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["code"], "not_deployed", "{value}");
     }
 
     /// A real exit 127 and a failed exec share an exit status but stay
