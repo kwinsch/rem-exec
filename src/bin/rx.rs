@@ -373,6 +373,24 @@ fn main() -> ExitCode {
         }
     }
 
+    // A process ID that is not the 8-hex form can name no process on any host,
+    // so answer without a round trip. rxd still checks — an older rx reaching a
+    // current rxd must not lose the guard — and both emit the same code, so the
+    // answer does not depend on which side caught it.
+    //
+    // The round trip was not merely slow: against an unreachable host the reply
+    // was `ssh_unreachable` with `retryable:true`, so a typo'd ID looked like a
+    // transient network problem and an agent would retry it forever.
+    if let Some(id) = command_process_id(&cli.command)
+        && !rem_exec::process::is_valid_process_id(id)
+    {
+        print_json_response(&Response::error_code(
+            rem_exec::protocol::ErrorCode::InvalidProcessId,
+            format!("invalid process ID: {id}"),
+        ));
+        return ExitCode::FAILURE;
+    }
+
     // Handle daemon subcommands directly
     if let Command::Daemon { action } = &cli.command {
         return match action {
@@ -1633,6 +1651,34 @@ fn route_via_daemon(command: &Command) -> ExitCode {
 /// to compile until it is listed here rather than silently skipping validation.
 /// For the `HOST:PATH` forms an unsplittable argument yields nothing; the
 /// command's own "must be HOST:PATH" error is the better message there.
+/// The process ID a command carries, if it takes one.
+///
+/// Kept beside [`command_hosts`] and exhaustive for the same reason: a new
+/// ID-taking command must not silently skip validation, so this matches every
+/// variant rather than ending in a wildcard.
+fn command_process_id(command: &Command) -> Option<&str> {
+    match command {
+        Command::Wait { id, .. }
+        | Command::Status { id, .. }
+        | Command::Stdout { id, .. }
+        | Command::Stderr { id, .. }
+        | Command::Write { id, .. }
+        | Command::CloseStdin { id, .. }
+        | Command::Kill { id, .. } => Some(id.as_str()),
+        Command::Run { .. }
+        | Command::Start { .. }
+        | Command::List { .. }
+        | Command::Clean { .. }
+        | Command::Ping { .. }
+        | Command::Deploy { .. }
+        | Command::Put { .. }
+        | Command::Get { .. }
+        | Command::Daemon { .. }
+        | Command::Cache { .. }
+        | Command::Skill => None,
+    }
+}
+
 fn command_hosts(command: &Command) -> Vec<&str> {
     fn host_of(spec: &str) -> Option<&str> {
         match spec.split_once(':') {
@@ -1945,6 +1991,32 @@ mod tests {
         assert_eq!(
             format!("{:?}", run_exit(&response)),
             format!("{:?}", ExitCode::from(127u8))
+        );
+    }
+
+    /// Every ID-taking command must be covered. The match in
+    /// [`command_process_id`] is exhaustive, so a new one is a compile error
+    /// rather than a silently unvalidated path — this pins the current set.
+    #[test]
+    fn every_id_taking_command_is_validated_locally() {
+        let with_id = |id: &str| Command::Status {
+            host: "h".into(),
+            id: id.into(),
+        };
+        assert_eq!(command_process_id(&with_id("deadbeef")), Some("deadbeef"));
+        assert!(rem_exec::process::is_valid_process_id("deadbeef"));
+        for bad in ["NOTANID", "deadbee", "deadbeef0", "", "dead beef", "ZZZZZZZZ"] {
+            assert_eq!(command_process_id(&with_id(bad)), Some(bad));
+            assert!(
+                !rem_exec::process::is_valid_process_id(bad),
+                "{bad:?} must be rejected"
+            );
+        }
+        // Commands that take no ID must not be caught by the guard.
+        assert_eq!(command_process_id(&Command::Skill), None);
+        assert_eq!(
+            command_process_id(&Command::List { host: "h".into() }),
+            None
         );
     }
 
