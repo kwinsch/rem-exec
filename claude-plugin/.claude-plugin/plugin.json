@@ -1,0 +1,10 @@
+{
+  "name": "rem-exec",
+  "description": "Teaches Claude the rx CLI: remote command execution and file transfer over SSH with structured JSON results.",
+  "version": "0.1.0",
+  "author": { "name": "Kevin Bortis" },
+  "homepage": "https://github.com/kwinsch/rem-exec",
+  "repository": "https://github.com/kwinsch/rem-exec",
+  "license": "MIT",
+  "skills": ["./skills/rx"]
+}

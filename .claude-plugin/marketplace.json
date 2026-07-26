@@ -1,0 +1,12 @@
+{
+  "name": "rem-exec",
+  "description": "Claude Code plugin for the rx CLI, distributed from the rem-exec source repository.",
+  "owner": { "name": "Kevin Bortis" },
+  "plugins": [
+    {
+      "name": "rem-exec",
+      "source": "./claude-plugin",
+      "description": "Teaches Claude the rx CLI: remote command execution and file transfer over SSH with structured JSON results."
+    }
+  ]
+}

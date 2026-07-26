@@ -10,6 +10,8 @@ keywords = ["ssh", "remote", "execution", "cli", "automation"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = [
     ".cargo/",
+    ".claude-plugin/",
+    "claude-plugin/",
     "SENSITIVE.md",
     "test-confirm.sh",
 ]
