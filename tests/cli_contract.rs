@@ -180,3 +180,103 @@ fn skill_prints_the_guide_stamped_with_its_version() {
         "the version placeholder must be substituted"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Discovery vs. operations.
+//
+// The contract governs commands that DO something. Discovery — --help, -h,
+// help, --version, skill, and a bare invocation — prints for a reader and emits
+// no object, so a person's first keystroke is not answered with JSON. Anything
+// else the parser rejects is an operation the caller got wrong and gets the
+// typed object every other failure produces, on stderr with stdout left empty.
+// ---------------------------------------------------------------------------
+
+/// Assert a parser rejection: exit 2, stdout byte-empty, one typed object that
+/// is the WHOLE of stderr (a caller doing `JSON.parse(stderr)` must not trip
+/// over a usage block printed beside it).
+fn expect_parse_error(args: &[&str]) -> serde_json::Value {
+    let out = rx(args);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(out.status.code(), Some(2), "expected exit 2 for {args:?}");
+    assert!(
+        out.stdout.is_empty(),
+        "stdout must stay byte-empty on exit 2 for {args:?}, got {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap_or_else(|e| {
+        panic!("stderr must be exactly one JSON object for {args:?}: {e}\nstderr: {stderr}")
+    });
+    assert_eq!(value["type"], "error", "for {args:?}");
+    assert_eq!(value["code"], "bad_request", "for {args:?}: {value}");
+    assert_eq!(value["retryable"], false, "for {args:?}");
+    assert!(value["hint"].is_string(), "for {args:?}: {value}");
+    value
+}
+
+#[test]
+fn parser_rejections_are_typed_objects_on_stderr() {
+    // An unknown subcommand, a missing required argument, a bad enum value and
+    // a surplus positional are one class of mistake and answer the same way.
+    expect_parse_error(&["nosuchcommand"]);
+    expect_parse_error(&["run"]);
+    expect_parse_error(&["--auto-deploy", "bogus", "ping", "h"]);
+    expect_parse_error(&["ping", "h1", "h2"]);
+    expect_parse_error(&["--nosuchflag"]);
+}
+
+#[test]
+fn the_parser_object_keeps_claps_own_wording() {
+    // clap's message (including its "tip: …" suggestions) survives inside
+    // `message`, so nothing is lost by not printing its prose separately.
+    let value = expect_parse_error(&["setup"]);
+    let message = value["message"].as_str().expect("message is a string");
+    assert!(message.contains("unrecognized subcommand"), "{message}");
+    // One line: a compact object is what a caller reads.
+    assert!(!message.contains('\n'), "message must be one line: {message}");
+    // No ANSI escapes leaked into the JSON string.
+    assert!(!message.contains('\u{1b}'), "message must be unstyled: {message}");
+}
+
+#[test]
+fn discovery_prints_for_a_reader_and_emits_no_object() {
+    for args in [&["--help"][..], &["-h"][..], &["help"][..], &["--version"][..]] {
+        let out = rx(args);
+        assert_eq!(out.status.code(), Some(0), "expected exit 0 for {args:?}");
+        assert!(!out.stdout.is_empty(), "{args:?} must print to stdout");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&out.stdout).is_err(),
+            "{args:?} must not emit a JSON object"
+        );
+    }
+}
+
+#[test]
+fn skill_is_discovery_too() {
+    let out = rx(&["skill"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!out.stdout.is_empty(), "the guide goes to stdout");
+    assert!(
+        out.stderr.is_empty(),
+        "skill emits no object: stderr must be empty, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A bare invocation is discovery — help, not an object — but it named no
+/// operation, so it still fails. Answering a human's first keystroke with a
+/// JSON blob is exactly what the discovery split exists to prevent.
+#[test]
+fn a_bare_invocation_prints_help_without_an_object() {
+    let out = rx(&[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty(), "exit 2 keeps stdout empty");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Usage:"), "help text expected: {stderr}");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(stderr.trim()).is_err(),
+        "a bare invocation must not emit a JSON object: {stderr}"
+    );
+}

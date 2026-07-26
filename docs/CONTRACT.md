@@ -17,18 +17,29 @@ other.
 
 ## The rules
 
-**One object, always.** Every invocation of `rx` or `rxv` emits exactly one JSON
-object with a `type` field — success or failure, no exceptions.
+**One object per operation.** Every invocation of `rx` or `rxv` that *does
+something* emits exactly one JSON object with a `type` field — success or
+failure, no exceptions.
 
-**stdout carries the product.** For almost every command the product *is* the
-object, so that is where it goes. The exceptions are the commands whose product
-is raw bytes:
+**Discovery prints for a reader.** `--help`, `-h`, `help`, `--version`, `skill`
+and a bare invocation with no subcommand are not operations: they answer in
+plain text, following ordinary CLI convention, and emit no object. They also
+have no side effects — finding out what a tool is must not change anything,
+which is why a bare `rxv` does not unlock the vault.
+
+That line is what keeps the rule above absolute rather than nearly-absolute.
+An earlier version of this contract said "no exceptions" and then carved out
+two, while `--version` quietly printed `rx 0.4.0` to an agent the guide had
+just told to call it. One honest boundary beats three silent ones.
+
+**stdout carries the product.** For almost every operation the product *is* the
+object, so that is where it goes. The exceptions are the ones whose product is
+raw bytes:
 
 | command | stdout | the object goes to |
 |---|---|---|
 | `rxv get` | the decrypted secret | stderr |
 | `rx start --pipe` | the process stream | stderr |
-| `rx skill` / `rxv skill` | this guide | stderr |
 | everything else | the object | stdout |
 
 That exception is not cosmetic. `rxv get` must write **zero bytes** to stdout
@@ -36,7 +47,8 @@ when it fails, or `rxv get … | rx put -` would pipe an error message into a
 remote file. Everything downstream of that pipe depends on it.
 
 **stderr carries human notes only** — progress lines, warnings, the private key
-from `rxv rekey --generate`. Never a result a caller has to parse.
+from `rxv rekey --generate`. Never a result a caller has to parse. The one
+exception is the argument-parser rejection below, which has nowhere else to go.
 
 **Exit codes.**
 
@@ -44,11 +56,19 @@ from `rxv rekey --generate`. Never a result a caller has to parse.
 |---|---|
 | 0 | success |
 | 1 | the call was understood and failed |
-| 2 | the call was malformed — rejected by the argument parser, stdout empty |
+| 2 | the call was malformed — typed object on **stderr**, stdout stays empty |
+
+A malformed call answers with the same `{"type":"error","code":…}` shape as
+everything else, so a mistyped flag and a rejected argument value are one class
+of failure rather than two. It goes to stderr because stdout must stay
+byte-empty on exit 2: at the moment the parser rejects a call, the subcommand is
+not yet known, and if it were `rxv get` then anything on stdout would land in
+whatever the pipe feeds.
 
 `rx run` and `rx wait` additionally propagate the remote command's exit status
-(`rx run HOST -- false` exits 1; killed by signal N exits 128+N). The JSON is
-the source of truth; the process exit is a convenience.
+(`rx run HOST -- false` exits 1; killed by signal N exits 128+N; a command that
+never started exits 127). The JSON is the source of truth; the process exit is a
+convenience.
 
 **Errors are typed.**
 
@@ -59,17 +79,18 @@ the source of truth; the process exit is a convenience.
 
 - `code` is the stable part. **Branch on it, never on message text** — messages
   get rewritten, codes do not.
-- `retryable: true` means the identical call could plausibly succeed on a retry
-  (a transient network failure, a host that just got its rxd deployed). It never
-  means "the caller should change something" — that is what `hint` is for.
+- `retryable` is always present. `true` means the identical call could plausibly
+  succeed on a retry (a transient network failure, a host that just got its rxd
+  deployed). It never means "the caller should change something" — that is what
+  `hint` is for.
 - `hint`, when present, names a concrete different command.
 
 **Idempotence.** Asking for a state that already holds is success, not failure:
-`rxv unlock` on an unlocked vault, `rxv lock` on a locked one and
-`rx daemon start` on a running daemon all exit 0 and report `"changed": false`.
-"Ensure X" is what a caller actually wants, and making it cost an error plus a
-string match is what turns a usable tool into one an agent has to be taught
-around.
+`rxv unlock` on an unlocked vault, `rxv lock` on a locked one, `rx daemon start`
+on a running daemon and `rx deploy` on a host already running this exact rxd all
+exit 0 and report `"changed": false`. "Ensure X" is what a caller actually
+wants, and making it cost an error plus a string match is what turns a usable
+tool into one an agent has to be taught around.
 
 **JSON shape follows the destination.** Pretty when stdout is a terminal,
 compact otherwise — so a person reading gets indentation and a pipe does not pay

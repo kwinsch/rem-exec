@@ -333,7 +333,10 @@ enum DaemonAction {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => return parse_failure(err),
+    };
 
     if compact_requested(cli.compact, cli.pretty) {
         COMPACT_JSON.store(true, Ordering::Relaxed);
@@ -1724,6 +1727,98 @@ fn daemon_error_json(message: String) -> Response {
 
 fn print_json_response(response: &Response) {
     println!("{}", render_json(response));
+}
+
+/// Collapse a multi-line rendering into one line for a JSON string field.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether the parse-failure object should be compact.
+///
+/// It goes to stderr, so stderr is what "follows the destination" means here —
+/// [`compact_requested`] asks about stdout, which is empty on this path. The
+/// parsed flags are unavailable because parsing is what failed, so an explicit
+/// choice is read straight off the raw argv.
+fn compact_for_stderr() -> bool {
+    let explicit = std::env::args().find(|a| a == "--compact" || a == "--pretty");
+    match explicit.as_deref() {
+        Some("--compact") => return true,
+        Some("--pretty") => return false,
+        _ => {}
+    }
+    match json_env().as_deref() {
+        Some("compact") => true,
+        Some("pretty") => false,
+        _ => !std::io::stderr().is_terminal(),
+    }
+}
+
+/// Answer a clap rejection, splitting discovery from a mis-made call.
+///
+/// `--help`, `-h`, `help`, `--version` and a bare `rx` are discovery: they print
+/// for a reader and emit no object, because a person's first keystroke should
+/// not be answered with a JSON blob. Everything else — an unknown flag, a
+/// missing argument, a bad enum value — is an operation the caller got wrong,
+/// and gets the same typed object every other failure produces. 0.4.0 typed the
+/// argument errors rx checks itself but left the parser's own rejections as
+/// prose; they are the same class of mistake and the parser's are hit more
+/// often.
+///
+/// The object goes to **stderr**: exit 2 promises an empty stdout, and at this
+/// point the subcommand is not yet known — if it were `rxv get`, anything on
+/// stdout would land in whatever the pipe feeds.
+fn parse_failure(err: clap::Error) -> ExitCode {
+    use clap::error::ErrorKind;
+
+    match err.kind() {
+        // clap routes help and version to stdout itself.
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+            let _ = err.print();
+            ExitCode::SUCCESS
+        }
+        // A bare invocation is discovery too — it prints help, not an object —
+        // but it named no operation, so it still fails.
+        ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            let _ = err.print();
+            ExitCode::from(2)
+        }
+        // The object is the *whole* of stderr here, never prose alongside it:
+        // the contract promises a typed object on exit 2, and a caller doing
+        // `JSON.parse(stderr)` must not trip over a usage block. clap's own
+        // wording (including its "tip: …" suggestions) is preserved inside
+        // `message`, so nothing is lost for a person reading it.
+        _ => {
+            COMPACT_JSON.store(compact_for_stderr(), Ordering::Relaxed);
+            let rendered = strip_ansi(&err.render().to_string());
+            let response = Response::error_code(ErrorCode::BadRequest, one_line(&rendered))
+                .with_hint("run `rx --help`, or `rx skill` for the full guide");
+            eprintln!("{}", render_json(&response));
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Drop ANSI SGR sequences so clap's styled rendering does not end up as escape
+/// codes inside a JSON string when stderr happens to be a terminal.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // ESC [ ... <final byte in @..~>
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Report a client-side failure as a typed error object on stdout and exit 1.

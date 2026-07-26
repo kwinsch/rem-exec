@@ -38,14 +38,20 @@ same way — use it if you want that, or keep whatever you already have.
 
 ## Invariants
 
-- Every command prints exactly one JSON object on stdout (type field), errors
-  included. The exceptions are the commands whose product is bytes: `start
-  --pipe` (data on stdout, JSON handle on stderr) and `skill` (this guide).
+- Every command that DOES something prints exactly one JSON object on stdout
+  (type field), errors included. The exception is `start --pipe`, whose product
+  is bytes (data on stdout, JSON handle on stderr).
+- Discovery is not an operation and prints plain text, no object: `--help`, `-h`,
+  `help`, `--version`, `skill` (this guide), and a bare `rx` with no subcommand.
+  None of them has side effects.
 - Exit 0 = success · 1 = the call was understood and failed · 2 = the call was
-  malformed (rejected by the argument parser, stdout empty). `run`/`wait` also
-  propagate the remote command's status: `rx run HOST -- false` → exit 1, killed
-  by signal N → 128+N, and a command that never started (see exec_error) → 127,
-  so `rx run HOST -- missing-tool && next` does not run `next`. The JSON is the
+  malformed. On exit 2 stdout stays EMPTY and the typed object goes to stderr —
+  a mistyped flag and a rejected argument value are one class of failure, and
+  stdout is kept clean because the subcommand is not yet known when the parser
+  rejects a call. `run`/`wait` also propagate the remote command's status:
+  `rx run HOST -- false` → exit 1, killed by signal N → 128+N, and a command
+  that never started (see exec_error) → 127, so
+  `rx run HOST -- missing-tool && next` does not run `next`. The JSON is the
   source of truth.
 - A transport failure (unreachable host, auth) is the one case where the command
   never ran — it still prints a JSON `error` with a `code` on stdout and exits 1.
