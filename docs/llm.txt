@@ -53,9 +53,9 @@ same way — use it if you want that, or keep whatever you already have.
   that never started (see exec_error) → 127, so
   `rx run HOST -- missing-tool && next` does not run `next`. The JSON is the
   source of truth.
-- A transport failure (unreachable host, auth) is the one case where the command
-  never ran — it still prints a JSON `error` with a `code` on stdout and exits 1.
-  Always read stdout JSON.
+- A transport failure (unreachable host, auth) still prints a JSON `error` with a
+  `code` on stdout and exits 1. The command never ran, and the object is how you
+  learn that — not a bare line on stderr. Always read stdout JSON.
 - Command arguments and stdin bytes are transported verbatim over the SSH
   channel — no remote shell parses them. There is nothing to escape/quote.
 - Process IDs are 8 lowercase hex characters.
@@ -81,12 +81,14 @@ same way — use it if you want that, or keep whatever you already have.
 Commands run detached on the remote under a private per-user state dir; stdout
 and stderr are captured to files that survive disconnect. Two entry points over
 that substrate:
-- run   — synchronous. Blocks up to a timeout; if the command outlives it, the
-          process keeps running and a `running` handle is returned instead.
+- run   — synchronous. Blocks up to a timeout (--timeout, default 30s); if the
+          command outlives it, the process keeps running and a `running` handle
+          is returned instead.
 - start — returns a handle immediately. For long-lived, streaming, or
           interactive processes you read/write later.
-- wait  — block on an already-started process until it exits or a timeout,
-          returning the same completed/running shapes as run (no polling).
+- wait  — block on an already-started process until it exits or a timeout
+          (--timeout, default 30s), returning the same completed/running shapes
+          as run (no polling).
 
 ## Commands
 
@@ -157,11 +159,12 @@ Notes:
   Scope: put guarantees "exactly what rx read landed, or nothing landed". It
   cannot tell a producer that finished from one that died mid-output — a pipe
   carries no exit status. Where that matters, write a file first and put that.
-- `put -` cannot be retried (stdin does not rewind), so it settles deployment
-  before reading a byte: under --auto-deploy=local|on it probes the host and
-  deploys first. Under the default (off) a mismatched host fails with
-  `not_deployed` and nothing is consumed downstream — re-run the pipeline after
-  deploying.
+- `put -` cannot be retried (stdin does not rewind). Under --auto-deploy=local|on
+  it settles that before reading a byte: it probes the host and deploys first.
+  Under the default (off) there is no probe — the transfer runs once and a
+  mismatched host answers `not_deployed` afterwards. Nothing is installed
+  remotely either way, but the producer HAS been read by then, so re-run the
+  whole pipeline after deploying rather than expecting rx to resume it.
 - `cp` still works as an alias for `put`; prefer `put`, which pairs with `get`.
 - get vs `run -- cat`: use `run cat` to read small contents inline; use get to
   materialize a large or binary remote file as a real local path efficiently.
@@ -174,6 +177,8 @@ Notes:
   that, or when backgrounded (`running`) — so bigger output stays re-pageable via
   stdout/stderr --offset instead of forcing a re-run. Pass --keep to always
   retain the dir after a completed run.
+- stdout/stderr read from --offset and return at most --limit bytes (default
+  1 MiB), so draining a large stream is a loop over --offset, not one call.
 - write TEXT appends a newline unless --raw. With TEXT omitted and stdin piped,
   the stream is forwarded raw and unbounded (binary-safe). close-stdin sends EOF.
 - start --pipe: local stdin → remote stdin and remote stdout → local stdout as
@@ -181,8 +186,8 @@ Notes:
 - The local daemon (daemon start|stop|status) is an optional accelerator that
   caches repeated reads of long-running processes locally. It is used only when
   you opt in with RX_DAEMON=1; direct SSH is the default and canonical
-  path, and it does not handle ping/put/get. A daemon that merely happens to be
-  running never changes how a command is transported.
+  path, and it does not handle ping/deploy/put/get. A daemon that merely happens
+  to be running never changes how a command is transported.
 
 ## Text encoding
 
@@ -208,17 +213,19 @@ stdout/stderr/data fields pair with an `encoding`:
   list      {processes:[{id, state, cmd}]}
   cleaned   {removed:[id...]}
   deployed  {host, arch, version, status, changed}   # one host
-            {hosts:[{host, status, changed?, code?, message?, retryable?,
-                     hint?}]}                        # several hosts
+            {hosts:[...]}                            # several hosts (see below)
   cache     {action, version, binaries:[{arch, path, sha256, status}]}
-  version   {version, protocol}
   ping      {version, protocol, arch, os, kernel, hostname,
              distro_id?, distro_version?,
              local_version, up_to_date, hint?}
   daemon    {action, running, changed, pid?, detail?}   # daemon start|stop|status
-  error     {message, code?, retryable, hint?}   # retryable is always present
+  error     {message, code, retryable, hint?}   # code and retryable are always
+                                                # present; see Error codes below
 
 - run and wait yield completed or running. exit_code is null when signal is set.
+- deployed: one host is a flat object. Several become `hosts:[…]`, where an entry
+  that succeeded carries that same {host, arch, version, status, changed} and one
+  that failed carries {host, status:"failed", code, message, retryable, hint?}.
 - exec_error is present only when the command never started (the binary wasn't
   found or wasn't executable) — then exit_code and signal are both null and
   stderr carries a `rx: exec …` line. Values: command_not_found · permission_denied

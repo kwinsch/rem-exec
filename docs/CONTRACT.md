@@ -18,8 +18,10 @@ other.
 ## The rules
 
 **One object per operation.** Every invocation of `rx` or `rxv` that *does
-something* emits exactly one JSON object with a `type` field — success or
-failure, no exceptions.
+something* emits exactly one JSON object with a `type` field, success or
+failure. One boundary, drawn where the object would carry nothing a caller does
+not already have: a successful `rxv get` is the plaintext alone. Every *failure*
+is an object, everywhere, without exception.
 
 **Discovery prints for a reader.** `--help`, `-h`, `help`, `--version`, `skill`
 and a bare invocation with no subcommand are not operations: they answer in
@@ -38,13 +40,21 @@ raw bytes:
 
 | command | stdout | the object goes to |
 |---|---|---|
-| `rxv get` | the decrypted secret | stderr |
-| `rx start --pipe` | the process stream | stderr |
+| `rxv get` | the decrypted secret | stderr, **on failure only** — a successful read is the plaintext alone |
+| `rx start --pipe` | the process stream | stderr, on success *and* failure — it carries the process `id` |
 | everything else | the object | stdout |
 
-That exception is not cosmetic. `rxv get` must write **zero bytes** to stdout
-when it fails, or `rxv get … | rx put -` would pipe an error message into a
-remote file. Everything downstream of that pipe depends on it.
+The two byte-stream rows differ on success for a reason: `start --pipe`'s object
+is the handle you need to `status`, `write` to or `kill` the process afterwards,
+while a successful `get` has nothing to add to the bytes it just wrote.
+
+That exception is not cosmetic. A command whose stdout is a byte stream must
+write **zero bytes** there when it fails, or `rxv get … | rx put -` pipes an
+error message into a remote file and `rx start --pipe … | consumer` feeds one to
+the consumer as data. Everything downstream of those pipes depends on it — so in
+both tools the routing is one switch, set before the first thing that can print,
+rather than a decision repeated at each call site. `rx` learned that the hard
+way: in 0.4.0 the success path was right and all three failure paths were not.
 
 **stderr carries human notes only** — progress lines, warnings, the private key
 from `rxv rekey --generate`. Never a result a caller has to parse. The one
