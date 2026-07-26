@@ -82,17 +82,24 @@ impl From<AutoDeployArg> for rem_exec::deploy::DeployPolicy {
 #[command(name = "rx")]
 #[command(version)]
 #[command(about = "Agent-friendly remote process execution")]
-#[command(after_help = "\
-Start here:  rx skill        the complete agent guide (commands, response
-                             shapes, error codes) — read it once.
+#[command(after_help = concat!("\
+Start here:  rx skill        the full guide — commands, response shapes, error
+                             codes. Agent-oriented; pipe it to a pager to read.
 First contact with a host:   rx ping HOST  →  if it answers not_deployed,
                              rx deploy HOST  (one static binary, no remote deps)
 
-Every command answers with one JSON object on stdout. Exit 0 = success,
-1 = the call failed, 2 = the call was malformed.
+Every command that does something answers with one JSON object. Exit 0 =
+success, 1 = the call failed, 2 = the call was malformed. --help, --version and
+skill are discovery: plain text, no object, no side effects.
 
-Secrets live in rxv, the companion vault:
-  rxv get SCOPE/NAME | rx put - HOST:/run/secrets/name --mode 0600")]
+Placing a secret? Pipe any producer into `put -` — the value never touches a
+local file or an argument, and the mode is applied before the file is visible:
+
+  <producer> | rx put - HOST:/run/secrets/name --mode 0600
+
+rxv, pass, op read and sops -d all work; rx needs none of them.
+
+Docs and releases: ", env!("CARGO_PKG_REPOSITORY")))]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -109,11 +116,36 @@ struct Cli {
     auto_deploy: Option<AutoDeployArg>,
 }
 
-// Declaration order is what `--help` shows, so it runs from the commands an
-// agent reaches for first down to the ones it rarely needs. `daemon` used to
-// lead the list purely because it was declared first.
+// Declaration order is what `--help` shows. It runs in the order an agent
+// meets them: the guide, first contact with a host, then execute, observe,
+// control, move files, and finally local machinery. `ping` and `deploy` are
+// what the help text tells you to run first, so they are no longer twelfth
+// and thirteenth, below `close-stdin`.
 #[derive(Subcommand)]
 enum Command {
+    /// The full guide: commands, response shapes, error codes (agent-oriented,
+    /// ~350 lines — pipe it to a pager)
+    Skill,
+    /// Probe reachability + host identity (rxd version, OS, kernel, arch, distro)
+    Ping {
+        /// Remote host (SSH destination)
+        host: String,
+    },
+    /// Install the matching rxd on one or more hosts (detects architecture automatically)
+    Deploy {
+        /// Remote hosts (SSH destinations)
+        #[arg(required = true)]
+        hosts: Vec<String>,
+        /// Deploy this local rxd build instead of a cached release asset
+        #[arg(long, value_name = "PATH")]
+        binary: Option<std::path::PathBuf>,
+        /// Never download; deploy only what the local cache already has
+        #[arg(long)]
+        offline: bool,
+        /// Allow replacing an rxd that speaks a newer protocol than this rx
+        #[arg(long)]
+        allow_downgrade: bool,
+    },
     /// Run a command to completion (blocks up to --timeout, then backgrounds)
     Run {
         /// Remote host (SSH destination)
@@ -201,6 +233,16 @@ enum Command {
         #[arg(long)]
         limit: Option<u64>,
     },
+    /// List all processes on a host
+    List {
+        /// Remote host
+        host: String,
+    },
+    /// Clean up exited processes
+    Clean {
+        /// Remote host
+        host: String,
+    },
     /// Write to process stdin (if input omitted, reads from piped stdin)
     Write {
         /// Remote host
@@ -226,36 +268,6 @@ enum Command {
         host: String,
         /// Process ID
         id: String,
-    },
-    /// List all processes on a host
-    List {
-        /// Remote host
-        host: String,
-    },
-    /// Clean up exited processes
-    Clean {
-        /// Remote host
-        host: String,
-    },
-    /// Deploy rem-execd to one or more hosts (detects architecture automatically)
-    Deploy {
-        /// Remote hosts (SSH destinations)
-        #[arg(required = true)]
-        hosts: Vec<String>,
-        /// Deploy this local rxd build instead of a cached release asset
-        #[arg(long, value_name = "PATH")]
-        binary: Option<std::path::PathBuf>,
-        /// Never download; deploy only what the local cache already has
-        #[arg(long)]
-        offline: bool,
-        /// Allow replacing an rxd that speaks a newer protocol than this rx
-        #[arg(long)]
-        allow_downgrade: bool,
-    },
-    /// Probe reachability + host identity (rxd version, OS, kernel, arch, distro)
-    Ping {
-        /// Remote host (SSH destination)
-        host: String,
     },
     /// Write a local file — or stdin, with `-` — to a remote path (atomic;
     /// optional mode/owner/group)
@@ -294,8 +306,6 @@ enum Command {
         #[command(subcommand)]
         action: CacheAction,
     },
-    /// Print skill file (machine-readable usage guide)
-    Skill,
     /// Manage the local daemon (an opt-in read cache; direct SSH is the default)
     Daemon {
         #[command(subcommand)]

@@ -212,7 +212,7 @@ pub fn detect_arch(host: &str) -> Result<String> {
     }
 }
 
-/// Return the local directory where arch-specific rem-execd binaries are stored.
+/// Return the local directory where arch-specific rxd binaries are stored.
 /// Default: ~/.local/share/rem-exec/bin/
 pub fn binary_store_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
@@ -464,13 +464,13 @@ fn downgrade_refusal(host: &str, status: &DeployStatus) -> Option<String> {
     }
 }
 
-/// Deploy rem-execd to a remote host with default options (fetch if needed,
+/// Deploy rxd to a remote host with default options (fetch if needed,
 /// never downgrade).
 pub fn deploy_to_host(host: &str) -> Result<DeployResult> {
     deploy_to_host_with(host, &DeployOpts::default())
 }
 
-/// Deploy rem-execd to a remote host.
+/// Deploy rxd to a remote host.
 ///
 /// 1. Refuse to move a host backwards unless told to
 /// 2. Detect remote architecture via `uname -m`
@@ -592,7 +592,7 @@ pub fn deploy_to_host_with(host: &str, opts: &DeployOpts) -> Result<DeployResult
     })
 }
 
-/// Check the remote rem-execd version. Returns the version string on success.
+/// Check the remote rxd version. Returns the version string on success.
 fn verify_remote_version(host: &str) -> Result<String> {
     let args = RemoteArgs::version();
     let resp = ssh_exec(host, &args.as_str_slice())?;

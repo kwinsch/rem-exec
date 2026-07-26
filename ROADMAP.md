@@ -129,7 +129,10 @@ public, so breaking changes are still free here. Findings came from walking the
 documented first-contact path (`ping` → `deploy` → `run`) against real hosts —
 rootless podman containers, see the note at the end of this section.
 
-**Landed (uncommitted at time of writing):**
+All of it landed across three commits; what follows is the record of what
+changed and why, not a plan.
+
+**Slice 1 — response shapes:**
 - Deploy failures are typed. A single-host failure is a plain `error` object
   with `deploy_failed` (or `ssh_unreachable`/`ssh_auth` when the transport is
   what broke); a batch keeps the aggregate with typed per-host entries. It used
@@ -146,7 +149,7 @@ rootless podman containers, see the note at the end of this section.
 - `retryable` is always serialized. It was omitted when false, so most errors
   lacked a field `docs/CONTRACT.md` advertises unconditionally.
 
-**Landed — breaking, all three in one commit:**
+**Slice 2 — breaking, all three in one commit:**
 - `rx run HOST -- /nonexistent` exited **0** with `exec_error:"command_not_found"`,
   so `rx run … && next-step` proceeded after a command that never ran. Now exits
   **127**. A real exit 127 and a failed exec share the status but stay
@@ -201,38 +204,39 @@ existing `skill` noun rather than a new `rx plugin` / `rx install` top-level:
   whether `--harness auto` refusing on an unrecognized harness is a typed error
   with a hint naming the explicit flag (yes).
 
-**Open — no decision needed, just work:**
-- Scope the contract to *operations, not discovery*. `CONTRACT.md:20` claims
-  "no exceptions", then the document itself carves out two (exit-2 has empty
-  stdout; `skill` prints bytes) and a third exists unwritten (`--version`
-  prints `rx 0.4.0` while `llm.txt` tells agents to call it). Naming the
-  discovery surface — `--help`, `-h`, `help`, `--version`, `skill`, bare
-  invocation — makes the agent-facing invariant genuinely absolute instead of
-  nominally absolute with silent carve-outs. Contract text is shared verbatim
-  with rem-exec-vault; change both in the same release.
-- Type the parser's own rejections. 0.4.0 typed the 19 argument errors rx checks
-  itself but left clap's (unknown flag, missing arg) as prose — same class of
-  mistake, two shapes, and the untyped one is hit more often. Split by clap
-  error kind: `DisplayHelpOnMissingArgumentOrSubcommand` (bare `rx`) stays plain
-  help with no JSON, so a human's first keystroke is not answered with a JSON
-  blob; everything else gets a typed object **on stderr**, keeping stdout
-  byte-empty so `rxv get | rx put -` safety holds unconditionally.
-- `--help` command order contradicts its own "Start here": `ping`/`deploy` are
-  13th and 12th, below `close-stdin` and `clean`. Suggested:
-  `skill · ping deploy · run start wait · status stdout stderr list clean ·
-  write close-stdin kill · put get · setup daemon`.
-- `--help`'s after_help says "Secrets live in rxv, the companion vault", which
-  overstates a coupling `CONTRACT.md:3` is at pains to deny. `--help` is the
-  highest-traffic surface making the strongest dependency claim. Match
-  `llm.txt`: any producer works, rx needs none of them.
-- `deploy`'s help still says "rem-execd" (`bin/rx.rs`), as do doc comments in
-  `deploy.rs` and `daemon/stream.rs`. Everything else says `rxd`.
-- `skill`'s command description ("Print skill file") is jargon to a human
-  admin. Name the audience and the size; add the repo URL to after_help, since
+**Slice 3 — the contract's scope, and the text:**
+- The contract governs *operations, not discovery*. It used to claim "no
+  exceptions" and then carve out two (exit-2 had empty stdout; `skill` printed
+  bytes), with a third unwritten: `--version` printed plain text to an agent the
+  guide told to call it. Discovery — `--help`, `-h`, `help`, `--version`,
+  `skill`, bare invocation — now prints for a reader and emits no object, which
+  makes the agent-facing invariant genuinely absolute. Shared verbatim with
+  rem-exec-vault.
+- The parser's own rejections are typed. 0.4.0 typed the 19 argument errors rx
+  checks itself but left clap's as prose. Split by clap error kind:
+  `DisplayHelpOnMissingArgumentOrSubcommand` (bare `rx`) stays plain help with
+  no JSON, so a human's first keystroke is not answered with a JSON blob;
+  everything else emits a typed object that is the WHOLE of stderr, with stdout
+  byte-empty. That last part is load-bearing: at parse time the subcommand is
+  unknown, so every parse failure has to hold the line `rxv get | rx put -`
+  depends on, not just the ones that turn out to be `get`.
+- `--help` order now matches its own "Start here": `skill · ping deploy · run
+  start wait · status stdout stderr list clean · write close-stdin kill ·
+  put get · cache daemon`. `ping`/`deploy` were 13th and 12th, below
+  `close-stdin`.
+- after_help no longer says "Secrets live in rxv, the companion vault" — it
+  overstated a coupling `CONTRACT.md` is at pains to deny, on the
+  highest-traffic surface. It now shows `<producer> | rx put -` with rxv, pass,
+  op and sops as interchangeable, and states rx needs none of them.
+- `rem-execd` is gone; everything says `rxd`.
+- `skill`'s description names its audience and size instead of saying "Print
+  skill file", and both tools' after_help ends with the repository URL —
   someone who unpacked a release tarball has no README beside it.
-- Minor: `rx status HOST <malformed-id>` validates remotely, so the error
-  depends on host reachability — deterministic locally would cost one round
-  trip less. `rx daemon status` reports `changed:false` on a pure query.
+
+**Still open (minor):** `rx status HOST <malformed-id>` validates remotely, so
+the error depends on host reachability; validating the 8-hex form locally would
+be deterministic and save a round trip. `rx daemon status` reports
+`changed:false` on a pure query, where the field means nothing.
 
 **Release hygiene:** `dist/rxd-x86_64` is stale — it deploys **0.3.0** against
 0.4.0 source. Rebuild before any release.

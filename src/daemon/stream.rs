@@ -8,7 +8,7 @@ use crate::ssh::{REMOTE_BIN, ssh_command};
 
 /// Spawn a background thread that streams remote output to a local file.
 ///
-/// Runs `ssh host rem-execd follow <id> <stream> --offset N` and pipes the raw
+/// Runs `ssh host rxd follow <id> <stream> --offset N` and pipes the raw
 /// bytes into `local_path`. Retries with exponential backoff on SSH failure,
 /// using the current local file size as the resume offset to prevent duplication.
 pub fn spawn_stream_thread(

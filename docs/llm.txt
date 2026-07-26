@@ -90,23 +90,26 @@ that substrate:
 
 ## Commands
 
+Listed in the order `rx --help` shows them: the guide, first contact, execute,
+observe, control, move files, local machinery.
+
+  skill
+  ping  HOST
+  deploy HOST... [--binary PATH] [--offline] [--allow-downgrade]
   run   HOST [--cwd DIR] [--env K=V]... [--timeout SECS] [--keep-stdin-open] [--keep] -- CMD...
   start HOST [--cwd DIR] [--env K=V]... [--pipe] [--no-close-stdin] -- CMD...
   wait  HOST ID [--timeout SECS]
   status HOST ID
   stdout HOST ID [--offset N] [--limit N]
   stderr HOST ID [--offset N] [--limit N]
+  list HOST
+  clean HOST
   write HOST ID [TEXT] [--raw]
   close-stdin HOST ID
   kill HOST ID
-  list HOST
-  clean HOST
   put   LOCAL|- HOST:PATH [--mode OCTAL] [--owner USER] [--group GRP] [--allow-empty]
   get   HOST:PATH LOCAL [--mode OCTAL]
-  ping  HOST
-  deploy HOST... [--binary PATH] [--offline] [--allow-downgrade]
   cache fetch [--version V] [--arch ARCH]... [--force]
-  skill
   daemon start|stop|status
 
 Global: --compact, --pretty, --auto-deploy off|local|on
