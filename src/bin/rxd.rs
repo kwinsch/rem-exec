@@ -23,8 +23,6 @@ enum Action {
     Serve,
     /// Print version and protocol information (bootstrap handshake).
     Version,
-    /// Print skill file (machine-readable usage guide).
-    Skill,
     /// Pipe stdin to a process's stdin — raw byte channel (used by rx).
     PipeStdin {
         /// Process ID
@@ -50,10 +48,6 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.action {
-        Action::Skill => {
-            print!("{}", include_str!("../../docs/llm.txt"));
-            ExitCode::SUCCESS
-        }
         Action::Version => {
             let resp = Response::Version {
                 version: env!("CARGO_PKG_VERSION").to_string(),
