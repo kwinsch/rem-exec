@@ -138,9 +138,7 @@ pub fn daemon_status() -> Result<serde_json::Value> {
             }
             Ok(value)
         }
-        Err(crate::error::RemExecError::DaemonNotRunning) => {
-            Ok(outcome("status", false, false))
-        }
+        Err(crate::error::RemExecError::DaemonNotRunning) => Ok(outcome("status", false, false)),
         Err(e) => Err(e),
     }
 }
@@ -280,11 +278,7 @@ fn dispatch(
             offset,
             limit,
         } => handle_read(&host, &id, "stderr", offset, limit, state),
-        DaemonRequest::Write {
-            host,
-            id,
-            data_b64,
-        } => {
+        DaemonRequest::Write { host, id, data_b64 } => {
             let body = match base64_decode(&data_b64) {
                 Ok(b) => b,
                 Err(e) => {
@@ -296,9 +290,7 @@ fn dispatch(
             };
             forward(&host, &Request::Write { id }, &body)
         }
-        DaemonRequest::CloseStdin { host, id } => {
-            forward(&host, &Request::CloseStdin { id }, &[])
-        }
+        DaemonRequest::CloseStdin { host, id } => forward(&host, &Request::CloseStdin { id }, &[]),
         DaemonRequest::Kill { host, id } => forward(&host, &Request::Kill { id }, &[]),
         DaemonRequest::List { host } => forward(&host, &Request::List, &[]),
         DaemonRequest::Clean { host } => {
@@ -509,7 +501,10 @@ mod tests {
         match dispatch(req, &state, &stop) {
             DaemonResponse::Ok { data } => {
                 assert_eq!(data.get("type").and_then(|v| v.as_str()), Some("error"));
-                assert_eq!(data.get("code").and_then(|v| v.as_str()), Some("bad_request"));
+                assert_eq!(
+                    data.get("code").and_then(|v| v.as_str()),
+                    Some("bad_request")
+                );
             }
             other => panic!("expected a wrapped error response, got {other:?}"),
         }

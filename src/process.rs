@@ -259,7 +259,9 @@ impl ProcessState {
             "exited(killed)" => ProcessState::ExitedKilled,
             "exited(unknown)" => ProcessState::ExitedUnknown,
             _ if s.starts_with("signaled(") && s.ends_with(')') => {
-                let sig = s["signaled(".len()..s.len() - 1].parse::<i32>().unwrap_or(-1);
+                let sig = s["signaled(".len()..s.len() - 1]
+                    .parse::<i32>()
+                    .unwrap_or(-1);
                 ProcessState::Signaled(sig)
             }
             _ if s.starts_with("exited(") && s.ends_with(')') => {

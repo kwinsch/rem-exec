@@ -93,8 +93,14 @@ fn parse_os_release(content: &str) -> (Option<String>, Option<String>) {
 /// Strip surrounding whitespace and shell quotes from an os-release value.
 fn unquote(value: &str) -> String {
     let v = value.trim();
-    let v = v.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(v);
-    let v = v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')).unwrap_or(v);
+    let v = v
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(v);
+    let v = v
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .unwrap_or(v);
     v.to_string()
 }
 

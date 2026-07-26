@@ -56,7 +56,10 @@ fn malformed_arguments_answer_with_a_typed_object_on_stdout() {
     expect_error(&["get", "somehost", "/tmp/x"], "bad_request");
 
     // Option values rx parses itself.
-    expect_error(&["run", "h", "--env", "NOEQUALS", "--", "true"], "bad_request");
+    expect_error(
+        &["run", "h", "--env", "NOEQUALS", "--", "true"],
+        "bad_request",
+    );
     expect_error(
         &["put", "/etc/hostname", "h:/tmp/x", "--mode", "9999"],
         "bad_request",
@@ -105,10 +108,10 @@ fn arguments_are_rejected_before_stdin_is_read() {
 fn unparseable_invocations_exit_two_with_empty_stdout() {
     for args in [
         vec!["bogus-subcommand"],
-        vec!["run"],                        // missing HOST and COMMAND
-        vec!["stdout", "host"],             // missing ID
-        vec!["put", "--mode", "0644"],      // missing both positionals
-        vec!["--auto-deploy=bogus", "ping", "h"], // not one of the three choices
+        vec!["run"],                                // missing HOST and COMMAND
+        vec!["stdout", "host"],                     // missing ID
+        vec!["put", "--mode", "0644"],              // missing both positionals
+        vec!["--auto-deploy=bogus", "ping", "h"],   // not one of the three choices
         vec!["--compact", "--pretty", "ping", "h"], // mutually exclusive
     ] {
         let out = rx(&args);
@@ -137,7 +140,8 @@ fn daemon_control_answers_with_an_object() {
     let value: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("daemon stop must print one JSON object");
     assert_eq!(value["type"], "daemon");
-    if value["running"] == serde_json::json!(false) && value["changed"] == serde_json::json!(false) {
+    if value["running"] == serde_json::json!(false) && value["changed"] == serde_json::json!(false)
+    {
         assert_eq!(out.status.code(), Some(0), "no-op stop must succeed");
     }
 }
@@ -268,14 +272,25 @@ fn the_parser_object_keeps_claps_own_wording() {
     let message = value["message"].as_str().expect("message is a string");
     assert!(message.contains("unrecognized subcommand"), "{message}");
     // One line: a compact object is what a caller reads.
-    assert!(!message.contains('\n'), "message must be one line: {message}");
+    assert!(
+        !message.contains('\n'),
+        "message must be one line: {message}"
+    );
     // No ANSI escapes leaked into the JSON string.
-    assert!(!message.contains('\u{1b}'), "message must be unstyled: {message}");
+    assert!(
+        !message.contains('\u{1b}'),
+        "message must be unstyled: {message}"
+    );
 }
 
 #[test]
 fn discovery_prints_for_a_reader_and_emits_no_object() {
-    for args in [&["--help"][..], &["-h"][..], &["help"][..], &["--version"][..]] {
+    for args in [
+        &["--help"][..],
+        &["-h"][..],
+        &["help"][..],
+        &["--version"][..],
+    ] {
         let out = rx(args);
         assert_eq!(out.status.code(), Some(0), "expected exit 0 for {args:?}");
         assert!(!out.stdout.is_empty(), "{args:?} must print to stdout");

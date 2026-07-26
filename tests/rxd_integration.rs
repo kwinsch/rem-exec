@@ -181,10 +181,7 @@ fn run_returns_exit_code_and_text_output_in_one_call() {
 #[test]
 fn run_ephemeral_by_default_removes_process_dir() {
     let runtime = Runtime::new("run-ephemeral");
-    let resp = runtime.serve(
-        json!({"action": "run", "command": ["printf", "ok\n"]}),
-        &[],
-    );
+    let resp = runtime.serve(json!({"action": "run", "command": ["printf", "ok\n"]}), &[]);
     assert_eq!(resp["type"], "completed", "{resp}");
     let id = resp["id"].as_str().unwrap();
 
@@ -304,7 +301,10 @@ fn run_applies_cwd() {
 
     assert_eq!(resp["type"], "completed", "{resp}");
     assert_eq!(resp["exit_code"], 0);
-    assert_eq!(resp["stdout"].as_str().unwrap().trim_end(), expected.to_str().unwrap());
+    assert_eq!(
+        resp["stdout"].as_str().unwrap().trim_end(),
+        expected.to_str().unwrap()
+    );
 }
 
 #[test]
@@ -345,7 +345,10 @@ fn run_reports_missing_command_as_typed_exec_error() {
     let id = resp["id"].as_str().unwrap();
     let status = runtime.status(id);
     assert_eq!(status["type"], "status", "{status}");
-    assert_eq!(status["state"], "exec_failed(command_not_found)", "{status}");
+    assert_eq!(
+        status["state"], "exec_failed(command_not_found)",
+        "{status}"
+    );
     assert!(status["exit_code"].is_null(), "{status}");
 }
 
@@ -359,7 +362,10 @@ fn start_reports_missing_command_via_status() {
     let id = started_id(&start);
 
     let status = wait_for_exit(&runtime, &id);
-    assert_eq!(status["state"], "exec_failed(command_not_found)", "{status}");
+    assert_eq!(
+        status["state"], "exec_failed(command_not_found)",
+        "{status}"
+    );
     assert!(status["exit_code"].is_null(), "{status}");
 }
 
@@ -378,7 +384,10 @@ fn ping_reports_identity_without_creating_state() {
     assert!(resp.get("hostname").is_some(), "{resp}");
 
     // Ping is a pure probe: it answers before any state dir is created.
-    assert!(!runtime.remote_base().exists(), "ping must not create state dir");
+    assert!(
+        !runtime.remote_base().exists(),
+        "ping must not create state dir"
+    );
 }
 
 #[test]
@@ -681,7 +690,10 @@ fn put_stream_rejects_a_stream_cut_before_its_end_marker() {
         assert_eq!(resp["type"], "error", "{label}: {resp}");
         assert_eq!(resp["code"], "incomplete_transfer", "{label}: {resp}");
         assert_eq!(resp["retryable"], true, "{label}: {resp}");
-        assert!(!target.exists(), "{label}: a truncated stream must install nothing");
+        assert!(
+            !target.exists(),
+            "{label}: a truncated stream must install nothing"
+        );
     }
     assert!(leftover_temps(&runtime.dir).is_empty());
 }
@@ -1069,8 +1081,7 @@ fn list_ignores_directories_that_are_not_process_ids() {
 fn rx_reports_unreachable_host_as_typed_json_error() {
     // `.invalid` is reserved (RFC 2606) and never resolves, so `ssh` fails fast
     // with "Could not resolve hostname" — deterministic, no network needed.
-    let dir =
-        std::env::temp_dir().join(format!("rem-exec-rx-unreachable-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("rem-exec-rx-unreachable-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 
@@ -1083,7 +1094,10 @@ fn rx_reports_unreachable_host_as_typed_json_error() {
         .output()
         .unwrap();
 
-    assert!(!out.status.success(), "expected a non-zero exit on transport failure");
+    assert!(
+        !out.status.success(),
+        "expected a non-zero exit on transport failure"
+    );
     // The contract: even a transport failure yields a JSON error object on
     // stdout with a typed code — not just a bare stderr line.
     let resp: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {

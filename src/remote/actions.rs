@@ -33,7 +33,10 @@ pub const RUN_EPHEMERAL_CAP: u64 = 16 * 1024;
 pub const RUN_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
 fn invalid_process_id(id: &str) -> Response {
-    Response::error_code(ErrorCode::InvalidProcessId, format!("invalid process ID: {id}"))
+    Response::error_code(
+        ErrorCode::InvalidProcessId,
+        format!("invalid process ID: {id}"),
+    )
 }
 
 /// Structured (exit_code, signal) from a terminal process state.
@@ -135,7 +138,12 @@ pub fn read_output(id: &str, stream: &str, offset: Option<u64>, limit: Option<u6
     let path = match stream {
         "stdout" => pdir.stdout_path(),
         "stderr" => pdir.stderr_path(),
-        _ => return Response::error_code(ErrorCode::BadRequest, format!("invalid stream: {stream}")),
+        _ => {
+            return Response::error_code(
+                ErrorCode::BadRequest,
+                format!("invalid stream: {stream}"),
+            );
+        }
     };
 
     let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -202,7 +210,10 @@ pub fn write_stdin(id: &str, data: &[u8]) -> Response {
     let pdir = ProcessDir::new(&base, id);
 
     if !pdir.dir.exists() {
-        return Response::error_code(ErrorCode::ProcessNotFound, format!("process not found: {id}"));
+        return Response::error_code(
+            ErrorCode::ProcessNotFound,
+            format!("process not found: {id}"),
+        );
     }
 
     if let Ok(state) = pdir.read_status()
@@ -216,9 +227,10 @@ pub fn write_stdin(id: &str, data: &[u8]) -> Response {
 
     match feed_fifo(&pdir, data) {
         Ok(bytes) => Response::Written { bytes },
-        Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
-            Response::error_code(ErrorCode::Timeout, format!("write to stdin timed out: {err}"))
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::TimedOut => Response::error_code(
+            ErrorCode::Timeout,
+            format!("write to stdin timed out: {err}"),
+        ),
         Err(err) => Response::error_code(ErrorCode::Internal, format!("write failed: {err}")),
     }
 }
@@ -282,12 +294,8 @@ pub fn run(
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(RUN_DEFAULT_TIMEOUT_MS));
     match await_exit_or_timeout(&pdir, timeout) {
         Some(state) => {
-            let resp = completed_response(
-                &id,
-                &pdir,
-                &state,
-                run_started.elapsed().as_millis() as u64,
-            );
+            let resp =
+                completed_response(&id, &pdir, &state, run_started.elapsed().as_millis() as u64);
             maybe_ephemeral_clean(&pdir, &resp, ephemeral);
             resp
         }
@@ -346,7 +354,10 @@ pub fn wait(id: &str, timeout_ms: Option<u64>) -> Response {
     let base = remote_base();
     let pdir = ProcessDir::new(&base, id);
     if resolve_state(&pdir).is_none() {
-        return Response::error_code(ErrorCode::ProcessNotFound, format!("process not found: {id}"));
+        return Response::error_code(
+            ErrorCode::ProcessNotFound,
+            format!("process not found: {id}"),
+        );
     }
 
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(RUN_DEFAULT_TIMEOUT_MS));
@@ -467,7 +478,10 @@ fn install_file(
 ) -> Response {
     let target = Path::new(path);
     if target.file_name().is_none() {
-        return Response::error_code(ErrorCode::BadRequest, format!("invalid target path: {path}"));
+        return Response::error_code(
+            ErrorCode::BadRequest,
+            format!("invalid target path: {path}"),
+        );
     }
     let dir = match target.parent() {
         Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
@@ -620,9 +634,10 @@ pub fn put_stream<R: Read>(
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 Err(incomplete_stream(path, bytes))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err(
-                Response::error_code(ErrorCode::IncompleteTransfer, format!("{path}: {e}")),
-            ),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err(Response::error_code(
+                ErrorCode::IncompleteTransfer,
+                format!("{path}: {e}"),
+            )),
             Err(e) => Err(Response::error_code(
                 ErrorCode::Internal,
                 format!("write failed: {e}"),
@@ -664,7 +679,13 @@ fn apply_chown(path: &Path, owner: Option<&str>, group: Option<&str>) -> Result<
     let cpath = std::ffi::CString::new(path.to_str().unwrap_or(""))
         .map_err(|e| format!("invalid path: {e}"))?;
     // (uid_t)-1 / (gid_t)-1 means "do not change".
-    let rc = unsafe { libc::chown(cpath.as_ptr(), uid.unwrap_or(u32::MAX), gid.unwrap_or(u32::MAX)) };
+    let rc = unsafe {
+        libc::chown(
+            cpath.as_ptr(),
+            uid.unwrap_or(u32::MAX),
+            gid.unwrap_or(u32::MAX),
+        )
+    };
     if rc != 0 {
         return Err(format!("chown failed: {}", std::io::Error::last_os_error()));
     }
@@ -767,7 +788,10 @@ pub fn close_stdin(id: &str) -> Response {
     let pdir = ProcessDir::new(&base, id);
 
     if !pdir.dir.exists() {
-        return Response::error_code(ErrorCode::ProcessNotFound, format!("process not found: {id}"));
+        return Response::error_code(
+            ErrorCode::ProcessNotFound,
+            format!("process not found: {id}"),
+        );
     }
 
     // Don't touch exited processes
@@ -910,7 +934,10 @@ pub fn kill(id: &str) -> Response {
     let pdir = ProcessDir::new(&base, id);
 
     if !pdir.dir.exists() {
-        return Response::error_code(ErrorCode::ProcessNotFound, format!("process not found: {id}"));
+        return Response::error_code(
+            ErrorCode::ProcessNotFound,
+            format!("process not found: {id}"),
+        );
     }
 
     // Don't overwrite a real exit code with "exited(killed)"

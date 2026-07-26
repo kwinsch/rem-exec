@@ -16,7 +16,11 @@ use crate::protocol::{ErrorCode, Response};
 ///
 /// EOF support: killing the Holder closes the last writer on the FIFO,
 /// so the command sees EOF on stdin.
-pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, String>) -> Result<Response> {
+pub fn start(
+    command: &[String],
+    cwd: Option<&str>,
+    env: &BTreeMap<String, String>,
+) -> Result<Response> {
     assert!(!command.is_empty(), "command must not be empty");
 
     // Reject NUL bytes up front: an argv NUL would make CString::new().unwrap()
@@ -235,11 +239,7 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
                         // so it never blocks waiting for a stdin-ready byte.
                         let msg = b"rxd: failed to open stdin FIFO\n";
                         unsafe {
-                            libc::write(
-                                stderr_fd,
-                                msg.as_ptr() as *const libc::c_void,
-                                msg.len(),
-                            );
+                            libc::write(stderr_fd, msg.as_ptr() as *const libc::c_void, msg.len());
                         }
                         let _ = pdir.write_status("exited(127)");
                         unsafe { libc::_exit(127) };
@@ -410,8 +410,7 @@ fn path_cstring(path: &std::path::Path) -> Result<CString> {
     let s = path.to_str().ok_or_else(|| {
         RemExecError::Other(format!("path is not valid UTF-8: {}", path.display()))
     })?;
-    CString::new(s)
-        .map_err(|e| RemExecError::Other(format!("path is not a valid C string: {e}")))
+    CString::new(s).map_err(|e| RemExecError::Other(format!("path is not a valid C string: {e}")))
 }
 
 /// Returns `-1` on failure. Called after `fork()`, where the caller must handle

@@ -142,7 +142,10 @@ fn control_path() -> Option<std::path::PathBuf> {
     let dir = base.join("ssh");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         WARNED.call_once(|| {
-            eprintln!("rx: connection multiplexing disabled: {}: {e}", dir.display());
+            eprintln!(
+                "rx: connection multiplexing disabled: {}: {e}",
+                dir.display()
+            );
         });
         return None;
     }
@@ -459,7 +462,11 @@ mod tests {
         for bad in ["0", "", "abc", "-5"] {
             // SAFETY: single-threaded assertion on process env, restored below.
             unsafe { std::env::set_var("RX_CONNECT_TIMEOUT", bad) };
-            assert_eq!(connect_timeout(), DEFAULT_CONNECT_TIMEOUT_SECS, "for {bad:?}");
+            assert_eq!(
+                connect_timeout(),
+                DEFAULT_CONNECT_TIMEOUT_SECS,
+                "for {bad:?}"
+            );
         }
         unsafe { std::env::set_var("RX_CONNECT_TIMEOUT", "3") };
         assert_eq!(connect_timeout(), 3);

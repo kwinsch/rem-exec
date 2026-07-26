@@ -465,11 +465,12 @@ fn main() -> ExitCode {
 
     // Cache is always local: it populates the rxd binary cache deploy reads.
     if let Command::Cache {
-        action: CacheAction::Fetch {
-            version,
-            arch,
-            force,
-        },
+        action:
+            CacheAction::Fetch {
+                version,
+                arch,
+                force,
+            },
     } = &cli.command
     {
         return match rem_exec::deploy::setup_release_binaries(version.as_deref(), arch, *force) {
@@ -1001,8 +1002,7 @@ fn do_ping(host: &str) -> ExitCode {
                 && let Some(obj) = value.as_object_mut()
             {
                 let local = env!("CARGO_PKG_VERSION");
-                let matched =
-                    *protocol == rem_exec::protocol::PROTOCOL_VERSION && version == local;
+                let matched = *protocol == rem_exec::protocol::PROTOCOL_VERSION && version == local;
                 obj.insert("local_version".into(), serde_json::json!(local));
                 obj.insert("up_to_date".into(), serde_json::json!(matched));
                 if !matched {
@@ -1279,11 +1279,7 @@ fn receive_to_temp<R: std::io::Read>(
 
 /// Apply `mode` and rename the staged file into place. A failure leaves nothing
 /// behind, so the destination is either the old file or the complete new one.
-fn commit_temp(
-    staged: StagedFile,
-    dest: &std::path::Path,
-    mode: u32,
-) -> Result<(), ReceiveError> {
+fn commit_temp(staged: StagedFile, dest: &std::path::Path, mode: u32) -> Result<(), ReceiveError> {
     use std::os::unix::fs::PermissionsExt;
 
     let install = || -> std::io::Result<()> {
@@ -1354,7 +1350,9 @@ fn do_get(remote: &str, local: &str, mode: Option<&str>) -> ExitCode {
         let mut reader = std::io::BufReader::new(stdout);
 
         let mut line = Vec::new();
-        reader.read_until(b'\n', &mut line).map_err(rem_exec::error::RemExecError::Io)?;
+        reader
+            .read_until(b'\n', &mut line)
+            .map_err(rem_exec::error::RemExecError::Io)?;
         if line.is_empty() {
             // No response — likely a missing/old rxd; surface ssh stderr so the
             // auto-deploy classifier can see "No such file".
@@ -1369,15 +1367,19 @@ fn do_get(remote: &str, local: &str, mode: Option<&str>) -> ExitCode {
         if line.last() == Some(&b'\n') {
             line.pop();
         }
-        let header: Response = serde_json::from_slice(&line)
-            .map_err(|e| rem_exec::error::RemExecError::Protocol(format!("invalid header from remote: {e}")))?;
+        let header: Response = serde_json::from_slice(&line).map_err(|e| {
+            rem_exec::error::RemExecError::Protocol(format!("invalid header from remote: {e}"))
+        })?;
 
         match header {
             Response::Error { .. } => {
                 let _ = child.wait();
                 Ok(header) // typed error (not_found, etc.) — print as-is
             }
-            Response::GetStream { size, mode: src_mode } => {
+            Response::GetStream {
+                size,
+                mode: src_mode,
+            } => {
                 let src_mode = rem_exec::protocol::parse_octal_mode(&src_mode)
                     .map_err(rem_exec::error::RemExecError::Protocol)?;
                 let applied = mode_override.unwrap_or(src_mode);
@@ -1388,7 +1390,9 @@ fn do_get(remote: &str, local: &str, mode: Option<&str>) -> ExitCode {
                         let _ = child.wait();
                         return Ok(Response::error_code(
                             ErrorCode::IncompleteTransfer,
-                            format!("incomplete transfer from {path}: expected {expected} bytes, received {got}"),
+                            format!(
+                                "incomplete transfer from {path}: expected {expected} bytes, received {got}"
+                            ),
                         ));
                     }
                     Err(ReceiveError::Io(e)) => {
@@ -1409,9 +1413,8 @@ fn do_get(remote: &str, local: &str, mode: Option<&str>) -> ExitCode {
                 // trusting the count or reading forever, then close the pipe so
                 // a still-writing remote gets EPIPE and terminates.
                 const DRAIN_CAP: u64 = 64 * 1024;
-                let extra =
-                    std::io::copy(&mut (&mut reader).take(DRAIN_CAP), &mut std::io::sink())
-                        .unwrap_or(0);
+                let extra = std::io::copy(&mut (&mut reader).take(DRAIN_CAP), &mut std::io::sink())
+                    .unwrap_or(0);
                 drop(reader);
                 drop(stderr);
 
@@ -1448,7 +1451,10 @@ fn do_get(remote: &str, local: &str, mode: Option<&str>) -> ExitCode {
     };
 
     let result = match fetch() {
-        Err(e) if rem_exec::deploy::auto_deploy_enabled() && rem_exec::deploy::should_auto_deploy(&e) => {
+        Err(e)
+            if rem_exec::deploy::auto_deploy_enabled()
+                && rem_exec::deploy::should_auto_deploy(&e) =>
+        {
             match rem_exec::deploy::deploy_to_host(host) {
                 Ok(_) => fetch(),
                 Err(de) => Err(rem_exec::error::RemExecError::Ssh(format!(
@@ -2005,7 +2011,11 @@ mod tests {
     use std::io::Cursor;
     use std::os::unix::fs::PermissionsExt;
 
-    fn completed(exit_code: Option<i32>, signal: Option<i32>, exec_error: Option<&str>) -> Response {
+    fn completed(
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        exec_error: Option<&str>,
+    ) -> Response {
         Response::Completed {
             id: "abcdef01".into(),
             exit_code,
@@ -2045,7 +2055,14 @@ mod tests {
         };
         assert_eq!(command_process_id(&with_id("deadbeef")), Some("deadbeef"));
         assert!(rem_exec::process::is_valid_process_id("deadbeef"));
-        for bad in ["NOTANID", "deadbee", "deadbeef0", "", "dead beef", "ZZZZZZZZ"] {
+        for bad in [
+            "NOTANID",
+            "deadbee",
+            "deadbeef0",
+            "",
+            "dead beef",
+            "ZZZZZZZZ",
+        ] {
             assert_eq!(command_process_id(&with_id(bad)), Some(bad));
             assert!(
                 !rem_exec::process::is_valid_process_id(bad),
@@ -2073,7 +2090,12 @@ mod tests {
         let value = serde_json::to_value(&missing).unwrap();
         assert_eq!(value["code"], "not_found", "{value}");
         assert_eq!(value["retryable"], false, "{value}");
-        assert!(value["message"].as_str().unwrap().contains("/no/such/dir/f"));
+        assert!(
+            value["message"]
+                .as_str()
+                .unwrap()
+                .contains("/no/such/dir/f")
+        );
         assert!(value["hint"].is_string(), "{value}");
 
         let denied = local_io_error_json("/etc/f", &Error::from(ErrorKind::PermissionDenied));
@@ -2107,8 +2129,11 @@ mod tests {
 
     #[test]
     fn ordinary_statuses_are_unaffected_by_the_exec_failure_path() {
-        for (code, signal, want) in [(Some(0), None, 0u8), (Some(1), None, 1), (None, Some(9), 137)]
-        {
+        for (code, signal, want) in [
+            (Some(0), None, 0u8),
+            (Some(1), None, 1),
+            (None, Some(9), 137),
+        ] {
             assert_eq!(
                 format!("{:?}", run_exit(&completed(code, signal, None))),
                 format!("{:?}", ExitCode::from(want)),
@@ -2182,7 +2207,11 @@ mod tests {
 
         assert_eq!(n, data.len() as u64);
         assert_eq!(std::fs::read(&dest).unwrap(), data);
-        let mode = std::fs::symlink_metadata(&dest).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::symlink_metadata(&dest)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o640);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -2204,7 +2233,10 @@ mod tests {
             }
             ReceiveError::Io(e) => panic!("expected Incomplete, got Io({e})"),
         }
-        assert!(!dest.exists(), "no file must be installed after a short stream");
+        assert!(
+            !dest.exists(),
+            "no file must be installed after a short stream"
+        );
         let tmp = dir.join(format!(".rxd-get-{}.tmp", std::process::id()));
         assert!(!tmp.exists(), "temp must be cleaned up");
         std::fs::remove_dir_all(&dir).unwrap();

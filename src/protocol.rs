@@ -354,7 +354,8 @@ pub fn octal_mode(mode: u32) -> String {
 /// Parse permission bits from `0644`, `644`, or `0o644`.
 pub fn parse_octal_mode(s: &str) -> Result<u32, String> {
     let digits = s.strip_prefix("0o").unwrap_or(s);
-    u32::from_str_radix(digits, 8).map_err(|_| format!("invalid mode '{s}' (expected octal like 0644)"))
+    u32::from_str_radix(digits, 8)
+        .map_err(|_| format!("invalid mode '{s}' (expected octal like 0644)"))
 }
 
 fn default_true() -> bool {

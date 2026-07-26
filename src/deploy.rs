@@ -115,7 +115,10 @@ pub fn compare_to_own_version(remote: &str) -> Option<std::cmp::Ordering> {
 /// being wrong is a needless deploy, so an unorderable version means "leave it
 /// alone".
 pub fn is_older_than_own(remote: &str) -> bool {
-    matches!(compare_to_own_version(remote), Some(std::cmp::Ordering::Less))
+    matches!(
+        compare_to_own_version(remote),
+        Some(std::cmp::Ordering::Less)
+    )
 }
 
 /// Whether a remote rxd is *provably* ahead of this rx.
@@ -545,7 +548,10 @@ pub fn deploy_to_host_with(host: &str, opts: &DeployOpts) -> Result<DeployResult
     // The temp name carries our pid so two concurrent deploys to one host
     // cannot overwrite each other's upload.
     let binary_arg = local_binary.to_str().ok_or_else(|| {
-        RemExecError::Other(format!("binary path is not valid UTF-8: {}", local_binary.display()))
+        RemExecError::Other(format!(
+            "binary path is not valid UTF-8: {}",
+            local_binary.display()
+        ))
     })?;
     let staged = format!(".local/bin/.rxd-deploy.{}.tmp", std::process::id());
     let scp = crate::ssh::scp_command()
@@ -565,7 +571,10 @@ pub fn deploy_to_host_with(host: &str, opts: &DeployOpts) -> Result<DeployResult
     // Every word here is a literal or the staged name (only [.a-z/-] plus our
     // own pid), which passes through that shell unchanged.
     let install = |args: &[&str]| -> Result<()> {
-        let out = ssh_command(host).args(args).output().map_err(RemExecError::Io)?;
+        let out = ssh_command(host)
+            .args(args)
+            .output()
+            .map_err(RemExecError::Io)?;
         if out.status.success() {
             return Ok(());
         }
@@ -728,7 +737,10 @@ pub fn deploy_error_response(host: &str, err: &RemExecError) -> Response {
     if let RemExecError::Ssh(detail) = err
         && let Some(code) = crate::ssh::classify_ssh_failure(detail)
     {
-        return Response::error_code(code, one_line(&format!("deploy to {host} failed: {detail}")));
+        return Response::error_code(
+            code,
+            one_line(&format!("deploy to {host} failed: {detail}")),
+        );
     }
     Response::error_code(
         ErrorCode::DeployFailed,
@@ -766,7 +778,10 @@ mod tests {
         let json = serde_json::to_value(&response).expect("serializes");
 
         let message = json["message"].as_str().expect("message");
-        assert!(!message.contains('\n'), "message must be one line: {message:?}");
+        assert!(
+            !message.contains('\n'),
+            "message must be one line: {message:?}"
+        );
     }
 
     /// An unreachable host is not a deploy problem, and saying `deploy_failed`

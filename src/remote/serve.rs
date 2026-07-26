@@ -108,7 +108,14 @@ pub fn serve() -> ExitCode {
             mode,
             owner,
             group,
-        } => actions::put(&mut reader, &path, size, mode, owner.as_deref(), group.as_deref()),
+        } => actions::put(
+            &mut reader,
+            &path,
+            size,
+            mode,
+            owner.as_deref(),
+            group.as_deref(),
+        ),
         Request::PutStream {
             path,
             mode,
