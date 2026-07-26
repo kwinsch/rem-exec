@@ -10,25 +10,87 @@ use crate::protocol::{ErrorCode, Request, Response};
 /// non-login SSH PATH.
 pub const REMOTE_BIN: &str = ".local/bin/rxd";
 
+/// Reject destinations OpenSSH would read as options rather than as a host.
+///
+/// `ssh -oProxyCommand=…` runs an arbitrary local command, so a host string
+/// that reaches argv unchecked is local code execution on the controller — the
+/// machine holding the SSH keys and (with rxv) an unlocked age identity. Every
+/// invocation also passes `--` before the destination, which is the actual
+/// boundary; this check exists so an agent gets a typed `bad_host` instead of
+/// an opaque OpenSSH message.
+///
+/// Deliberately permissive about shape: `user@host`, `ssh://user@host:port`,
+/// bracketed IPv6 and ssh_config aliases all pass. It only rules out the forms
+/// that are never a host.
+pub fn validate_host(host: &str) -> Result<()> {
+    let reject = |why: &str| {
+        Err(RemExecError::BadHost(format!(
+            "invalid host {host:?}: {why}"
+        )))
+    };
+    if host.is_empty() {
+        return reject("empty");
+    }
+    if host.starts_with('-') {
+        return reject("starts with '-', which OpenSSH parses as an option");
+    }
+    if let Some(c) = host.chars().find(|c| c.is_control()) {
+        return reject(&format!("contains a control character ({:?})", c));
+    }
+    if let Some(c) = host.chars().find(|c| c.is_whitespace()) {
+        return reject(&format!("contains whitespace ({:?})", c));
+    }
+    Ok(())
+}
+
 /// Build an `ssh` command to `host` with connection multiplexing enabled.
 ///
 /// ControlMaster reuses one SSH connection across every rx operation to a host
 /// (the poll-heavy background path especially), so only the first call pays the
 /// handshake. `auto` falls back to a fresh connection if the master can't be
 /// created, so this never makes rx fail.
+///
+/// The destination is always preceded by `--`. That is the injection boundary
+/// and it lives here, in the one place every SSH invocation goes through, so a
+/// caller that forgets [`validate_host`] is still safe.
+///
+/// Multiplexing is dropped — not fatal, just slower — when the base directory
+/// cannot be made private. The ControlPath name is predictable, so an
+/// attacker-controlled base would mean an attacker-controlled socket.
 pub fn ssh_command(host: &str) -> Command {
     let mut cmd = Command::new("ssh");
-    let dir = remote_base().join("ssh");
-    let _ = std::fs::create_dir_all(&dir);
-    let control_path = dir.join("cm-%C");
-    cmd.arg("-o")
-        .arg("ControlMaster=auto")
-        .arg("-o")
-        .arg(format!("ControlPath={}", control_path.display()))
-        .arg("-o")
-        .arg("ControlPersist=30")
-        .arg(host);
+    if let Some(control_path) = control_path() {
+        cmd.arg("-o")
+            .arg("ControlMaster=auto")
+            .arg("-o")
+            .arg(format!("ControlPath={}", control_path.display()))
+            .arg("-o")
+            .arg("ControlPersist=30");
+    }
+    cmd.arg("--").arg(host);
     cmd
+}
+
+/// Private directory for ControlMaster sockets, or `None` when the base cannot
+/// be secured (warned about once, then silently degraded for the rest of the
+/// run so a poll loop can't spam stderr).
+fn control_path() -> Option<std::path::PathBuf> {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let base = remote_base();
+    if let Err(e) = crate::process::ensure_base_dir(&base) {
+        WARNED.call_once(|| {
+            eprintln!("rx: connection multiplexing disabled: {e}");
+        });
+        return None;
+    }
+    let dir = base.join("ssh");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        WARNED.call_once(|| {
+            eprintln!("rx: connection multiplexing disabled: {}: {e}", dir.display());
+        });
+        return None;
+    }
+    Some(dir.join("cm-%C"))
 }
 
 /// Send one framed request to `rxd serve` and return the decoded response.
@@ -155,9 +217,12 @@ pub fn serve_stream_download(host: &str, request: &Request) -> Result<Child> {
 /// untyped transport error rather than mislabeling them.
 pub fn classify_ssh_failure(stderr: &str) -> Option<ErrorCode> {
     let s = stderr.to_ascii_lowercase();
-    // Authentication is unambiguous when present, so check it first.
+    // Authentication is unambiguous when present, so check it first. Matching
+    // is on whole phrases only: a bare "publickey" would also fire on a remote
+    // command's own output (the ssh channel merges it into this stderr), and a
+    // false positive here suppresses auto-deploy in `serve_request_auto_deploy`.
+    // "Permission denied (publickey)." already matches on "permission denied".
     if s.contains("permission denied")
-        || s.contains("publickey")
         || s.contains("too many authentication failures")
         || s.contains("no supported authentication methods")
     {
@@ -334,5 +399,72 @@ mod tests {
         // Host-key mismatch and unknown text stay untyped rather than mislabeled.
         assert_eq!(classify_ssh_failure("Host key verification failed."), None);
         assert_eq!(classify_ssh_failure("some unrelated failure"), None);
+    }
+
+    // A remote command's own stdout/stderr is merged into the ssh channel's
+    // stderr. Bare "publickey" in that text must not be read as an auth
+    // failure, because that return path suppresses auto-deploy.
+    #[test]
+    fn classify_ssh_failure_ignores_bare_publickey_in_command_output() {
+        assert_eq!(
+            classify_ssh_failure("ssh-keygen: writing new key: publickey saved"),
+            None
+        );
+    }
+
+    #[test]
+    fn validate_host_accepts_real_destinations() {
+        for h in [
+            "example.com",
+            "user@example.com",
+            "10.0.0.1",
+            "ssh://user@example.com:2222",
+            "[2001:db8::1]",
+            "site-router1",
+            "host_with_underscores",
+        ] {
+            assert!(validate_host(h).is_ok(), "{h} must be accepted");
+        }
+    }
+
+    #[test]
+    fn validate_host_rejects_option_shaped_and_malformed_destinations() {
+        for h in [
+            "",
+            "-oProxyCommand=touch /tmp/pwn",
+            "-vvv",
+            "--",
+            "host with space",
+            "host\nProxyCommand=x",
+            "host\0evil",
+            "host\tx",
+        ] {
+            assert!(validate_host(h).is_err(), "{h:?} must be rejected");
+        }
+    }
+
+    // `--` is the boundary that makes an unvalidated host harmless, so assert
+    // its position rather than trusting that every call site validates first.
+    #[test]
+    fn ssh_command_terminates_options_before_the_destination() {
+        let cmd = ssh_command("example.com");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        let dash = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("ssh argv must contain '--'");
+        assert_eq!(
+            args.get(dash + 1).map(String::as_str),
+            Some("example.com"),
+            "the destination must come directly after '--': {args:?}"
+        );
+        assert!(
+            !args[..dash].iter().any(|a| a == "example.com"),
+            "nothing may place the destination before '--': {args:?}"
+        );
     }
 }

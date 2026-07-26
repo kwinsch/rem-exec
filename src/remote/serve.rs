@@ -185,6 +185,14 @@ fn write_line<W: Write>(out: &mut W, response: Response) -> ExitCode {
 /// exactly `size` raw bytes. On open/stat failure, a single `Error` line and no
 /// body. A read error mid-stream simply ends the body short — the client's
 /// received-vs-declared check rejects the partial file.
+///
+/// `get` copies a live file; it is not a snapshot. The size is fixed in the
+/// header before the body starts, so a file that changes underneath us cannot
+/// be delivered coherently. The body is therefore bounded to the declared size
+/// and the file is re-stat'd afterwards: any disagreement exits non-zero, which
+/// is the only channel left once the header has gone out. The client turns that
+/// into `file_changed` and installs nothing. Use this for regular static files;
+/// for a live database, snapshot it remotely first.
 fn serve_get(path: &str) -> ExitCode {
     use std::os::unix::fs::PermissionsExt;
 
@@ -211,20 +219,32 @@ fn serve_get(path: &str) -> ExitCode {
         }
     };
 
+    let declared = meta.len();
     let header = Response::GetStream {
-        size: meta.len(),
+        size: declared,
         mode: crate::protocol::octal_mode(meta.permissions().mode()),
     };
     let json = serde_json::to_string(&header).unwrap_or_default();
     if out.write_all(json.as_bytes()).is_err() || out.write_all(b"\n").is_err() {
         return ExitCode::FAILURE;
     }
-    match std::io::copy(&mut f, &mut out) {
-        Ok(_) => {
-            let _ = out.flush();
-            ExitCode::SUCCESS
-        }
-        Err(_) => ExitCode::FAILURE,
+
+    // Bounded to the declared size: a file that grew must not push extra bytes
+    // the client will never read, and a file that shrank must be caught here
+    // rather than showing up as a mystery short read.
+    let sent = match std::io::copy(&mut std::io::Read::take(&mut f, declared), &mut out) {
+        Ok(n) => n,
+        Err(_) => return ExitCode::FAILURE,
+    };
+    if out.flush().is_err() || sent != declared {
+        return ExitCode::FAILURE;
+    }
+
+    // Re-stat: if the length moved while we were reading, the bytes just sent
+    // are not a coherent copy of any version of the file.
+    match f.metadata() {
+        Ok(after) if after.len() == declared => ExitCode::SUCCESS,
+        _ => ExitCode::FAILURE,
     }
 }
 

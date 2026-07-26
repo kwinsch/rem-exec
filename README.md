@@ -8,8 +8,27 @@ transport layer for AI agents: the request travels through the SSH channel's
 stdin as framed JSON, so command arguments and input bytes reach the remote
 verbatim — there is no remote shell to escape or inject into.
 
+`rx put -` reads stdin, so it composes with whatever secret store you already
+use — no dependency, no opinion:
+
+```bash
+pass show infra/db_password | rx put - host1:/run/secrets/db_pass --mode 0600
+op read op://vault/item/f   | rx put - host1:/run/secrets/db_pass --mode 0600
+rxv get host1/db_password   | rx put - host1:/run/secrets/db_pass --mode 0600
+```
+
+[rem-exec-vault](https://github.com/kwinsch/rem-exec-vault) (`rxv`) is a separate
+tool built to the same contract — one JSON object per invocation, typed error
+codes, the same exit codes ([docs/CONTRACT.md](docs/CONTRACT.md), duplicated
+verbatim in both repositories) — so an agent that has learned `rx` can read it
+without being taught twice. Using either tool commits you to nothing about the
+other.
+
 ## Features
 
+- **One contract** — every command emits exactly one JSON object with a `type`,
+  on stdout, errors included; `code` is machine-branchable and `hint` names the
+  fix. Exit 0/1/2 = succeeded / failed / malformed call
 - **Run-to-completion** — `rx run` blocks up to a timeout, returns exit code +
   stdout + stderr in one response; long commands auto-background into a handle
 - **Persistent processes** — `rx start` a command, disconnect, read output later
@@ -58,7 +77,7 @@ rx deploy host --offline                # refuse to download; use the cache only
 rx deploy host --binary ./target/…/rxd  # push a local build (no release needed)
 ```
 
-Cached assets are stored per version (`rxd-v0.3.0-x86_64`), so upgrading `rx`
+Cached assets are stored per version (`rxd-v0.4.0-x86_64`), so upgrading `rx`
 can never deploy the previous version's binary.
 
 `rx` runs locally. `rxd` is the binary copied to remote hosts by `rx deploy` and
@@ -95,7 +114,7 @@ rx get host:/var/backups/appdb.dump ./appdb.dump
 # Pipe straight into a remote file — the plaintext never hits local disk,
 # and the mode is applied before the file becomes visible
 set -o pipefail
-secret-store get db_password | rx put - host:/run/secrets/db_pass --mode 0600
+rxv get host1/db_password | rx put - host:/run/secrets/db_pass --mode 0600
 ```
 
 ## Agent usage
@@ -113,13 +132,41 @@ By default `rx` never changes a host you did not point it at: a missing or
 mismatched `rxd` is reported as a typed `not_deployed` error naming the command
 that fixes it. `--auto-deploy=local` allows that repair from the local cache
 without any download; `=on` allows fetching too. The env var
-`REM_EXEC_AUTO_DEPLOY` sets the same policy.
+`RX_AUTO_DEPLOY` sets the same policy (`REM_EXEC_AUTO_DEPLOY` still works).
+
+## Security notes
+
+The trust boundary is the controller — the machine `rx` runs on, holding the SSH
+keys and, when paired with [rem-exec-vault](https://github.com/kwinsch/rem-exec-vault),
+an unlocked age identity.
+
+- **HOST is validated, and never reaches `ssh` unterminated.** OpenSSH reads a
+  destination beginning with `-` as an option, so `-oProxyCommand=...` would run
+  an arbitrary command locally. `rx` rejects such destinations with a typed
+  `bad_host` error, and every `ssh`/`scp` invocation passes `--` before the
+  destination so the boundary holds even if a code path skips the check. This
+  matters most when the host string comes from an inventory file, a ticket, or a
+  model's output rather than from you.
+- **Command, env, cwd and stdin never touch a remote shell.** They ride as JSON
+  over the SSH channel; the remote login shell only ever starts `rxd serve`.
+- **Deploy is atomic.** The binary is uploaded to a temp name and renamed into
+  place, so a failed transfer cannot truncate the live `rxd` and a running one
+  does not block the install with `ETXTBSY`.
+- **Local state is private.** The base directory (`$XDG_RUNTIME_DIR/rem-exec`, or
+  `/tmp/rem-exec-$uid`) is verified to be a non-symlink directory you own at mode
+  0700 before it is used for ControlMaster sockets or the daemon socket. If it
+  cannot be secured, multiplexing is dropped rather than used unsafely.
+- **`get` never returns a torn file.** The body is bounded to the size announced
+  in the header and the remote re-stats afterwards; a file that changed mid-read
+  fails with `file_changed` and writes nothing locally.
+- **Trusted PATH assumed on the controller.** `ssh`, `scp`, `curl` and
+  `sha256sum` are resolved through `PATH`. This is a single-user-controller tool.
 
 ## Architecture
 
 Two binaries:
 - **rx** — local CLI, plus an optional local caching daemon (opt-in via
-  `REM_EXEC_DAEMON=1`; direct SSH is the default and canonical path)
+  `RX_DAEMON=1`; direct SSH is the default and canonical path)
 - **rxd** — remote binary (static, no dependencies, deployed via `rx deploy`)
 
 Communication flows over SSH. No custom ports, no daemons to manage on the remote.

@@ -84,6 +84,42 @@ Shipped in 0.3.0:
 - Modes are octal strings (`"0600"`) in `copied`/`got`/`get_stream`, matching
   what `--mode` accepts. A decimal `384` is the same number and unreadable.
 
+Shipped in 0.4.0 — the shared rx/rxv contract (`docs/CONTRACT.md`, duplicated
+verbatim in rem-exec-vault):
+- Every exit path answers with one typed JSON object on stdout. Nineteen call
+  sites still printed bare stderr text — a bad `--mode`, a destination that was
+  not `HOST:PATH`, an unparseable `--env` — so a documented invariant was false
+  for exactly the failures a caller hits first. `tests/cli_contract.rs` now
+  drives each one, because the invariant drifted for lack of anything checking.
+- `rx start` transport failures are classified like every other command's
+  (`ssh_unreachable` / `not_deployed`); it was the one path that bypassed
+  `transport_error_json` and reported an untyped line.
+- **Arguments are validated before stdin is read.** `rx run HOST --env BAD --
+  cmd` used to block forever on an idle pipe — an agent harness has no terminal,
+  so stdin is captured, and the call was rejected only after EOF that never
+  came. It also swallowed whatever a producer had written for a command that was
+  never going to run.
+- `rx daemon start|stop|status` emit objects instead of human text, and are
+  idempotent: a daemon already in the requested state reports `changed:false`
+  and exits 0 rather than failing.
+- JSON follows the destination — pretty on a terminal, compact otherwise, with
+  `--compact`/`--pretty` and `RX_JSON` to force it. Nobody should have to know a
+  flag exists to stop paying for indentation in a pipe.
+- `--auto-deploy` is a real enum: clap validates it, lists the three choices in
+  `--help`, and rejects a bad one as a usage error (exit 2, was 1).
+- Env vars are guessable from the binary name: `RX_JSON`, `RX_DAEMON`,
+  `RX_AUTO_DEPLOY`. The `REM_EXEC_*` names still work.
+- The guide is stamped with the version that shipped it, opens with the
+  first-contact sequence (`ping` → `deploy` → work), states the stdin/TTY
+  hazard, and names rxv — its secret-delivery example used to invoke a tool that
+  does not exist.
+
+Breaking, and deliberate before 1.0: argument errors moved from stderr text to
+stdout JSON; `--auto-deploy=bogus` now exits 2; piped JSON is compact; `rx
+daemon` prints objects. `PROTOCOL_VERSION` is unchanged — the rx↔rxd wire did
+not move — but the version bump means `ping` reports `up_to_date:false` for a
+0.3.x rxd, so run `rx deploy` across the fleet after upgrading.
+
 Everything below is proposed, not committed. Ordered by agent-experience value.
 
 ## Next
@@ -155,3 +191,22 @@ dropped connection reconciles to the same process instead of double-launching.
 - Live streaming for `run` (`--follow`): stream output while blocking, still
   ending with the structured result.
 - `rx skill --json`: machine-readable schema of requests/responses for discovery.
+
+## Deferred from the 0.3.1 security review
+
+Deliberately kept out of the 0.3.1 patch so it stayed reviewable.
+
+- **Split the monolithic sources.** `rx.rs` (~1.6k lines) and
+  `remote/actions.rs` (~1.1k) have natural seams: put/get/deploy CLI, process
+  lifecycle, transfer plumbing. Wanted, but as its own commit — never mixed
+  into a security change.
+- **`CloseStdin` deserves its own response type.** It currently answers
+  `Written { bytes: 0 }`, which works but reads as ambiguous. A new variant is a
+  wire change an older rx cannot parse, so it belongs to a protocol v3.
+- **End-to-end `rx` ↔ SSH ↔ `rxd` smoke test.** The local `rxd serve` harness is
+  strong and the injection boundary is unit-tested, but nothing exercises the
+  real ssh path in CI. An opt-in `ssh localhost` test would close it.
+- **Deterministic `file_changed` coverage.** The bound-and-re-stat logic is
+  verified by hand (a growing file is detected; stable and empty files exit
+  clean) and guarded against false positives in the suite, but racing a file
+  change inside a fast test is still unsolved.

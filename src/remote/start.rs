@@ -63,9 +63,25 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
     fs::set_permissions(pdir.stdout_path(), fs::Permissions::from_mode(0o600))?;
     fs::set_permissions(pdir.stderr_path(), fs::Permissions::from_mode(0o600))?;
 
-    // Create the FIFO for stdin
+    // Everything the forked child needs as a C string is built here, before the
+    // fork. After fork() the child may not allocate or panic safely — it can
+    // inherit locks the parent held — so a failure has to surface as an ordinary
+    // error on this side.
     let fifo_path = pdir.stdin_pipe_path();
-    let fifo_cstr = CString::new(fifo_path.to_str().unwrap()).unwrap();
+    let fifo_cstr = path_cstring(&fifo_path)?;
+    let stdout_cstr = path_cstring(&pdir.stdout_path())?;
+    let stderr_cstr = path_cstring(&pdir.stderr_path())?;
+    let prog_cstr = CString::new(command[0].as_str())
+        .map_err(|e| RemExecError::Other(format!("command is not a valid C string: {e}")))?;
+    let arg_cstrs: Vec<CString> = command
+        .iter()
+        .map(|a| {
+            CString::new(a.as_str())
+                .map_err(|e| RemExecError::Other(format!("argument is not a valid C string: {e}")))
+        })
+        .collect::<Result<_>>()?;
+
+    // Create the FIFO for stdin
     let rc = unsafe { libc::mkfifo(fifo_cstr.as_ptr(), 0o600) };
     if rc != 0 {
         return Err(RemExecError::Io(std::io::Error::last_os_error()));
@@ -108,8 +124,25 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
             // Set umask for private files
             unsafe { libc::umask(0o077) };
 
+            // Past this point we are in a forked child: no panicking, no
+            // allocation-heavy error paths. A setup failure takes the same exit
+            // route the fork-failure arms below use — record the status, release
+            // the parent from its read, and _exit. Panicking here would run the
+            // panic runtime against locks inherited from the parent, which can
+            // hang instead of aborting, and reaches an agent as a bare SIGABRT.
+            macro_rules! runner_failed {
+                () => {{
+                    let _ = pdir.write_status("exited(127)");
+                    write_pid_to_pipe(sync_write, 0);
+                    unsafe { libc::_exit(1) };
+                }};
+            }
+
             // Redirect own stdio to /dev/null so SSH can close
             let devnull = open_devnull(libc::O_RDWR);
+            if devnull < 0 {
+                runner_failed!();
+            }
             unsafe {
                 libc::dup2(devnull, 0);
                 libc::dup2(devnull, 1);
@@ -121,27 +154,28 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
 
             // Open FIFO O_RDWR (Linux: non-blocking open, prevents deadlock)
             let fifo_fd = unsafe { libc::open(fifo_cstr.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-            assert!(fifo_fd >= 0, "failed to open FIFO O_RDWR");
+            if fifo_fd < 0 {
+                runner_failed!();
+            }
 
             // Open stdout/stderr output files (0600 via umask)
-            let stdout_path = CString::new(pdir.stdout_path().to_str().unwrap()).unwrap();
-            let stderr_path = CString::new(pdir.stderr_path().to_str().unwrap()).unwrap();
             let stdout_fd = unsafe {
                 libc::open(
-                    stdout_path.as_ptr(),
+                    stdout_cstr.as_ptr(),
                     libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC,
                     0o600,
                 )
             };
             let stderr_fd = unsafe {
                 libc::open(
-                    stderr_path.as_ptr(),
+                    stderr_cstr.as_ptr(),
                     libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC,
                     0o600,
                 )
             };
-            assert!(stdout_fd >= 0, "failed to open stdout file");
-            assert!(stderr_fd >= 0, "failed to open stderr file");
+            if stdout_fd < 0 || stderr_fd < 0 {
+                runner_failed!();
+            }
 
             // --- Fork the FIFO holder ---
             // The holder keeps the FIFO write-end alive. Killing it sends EOF
@@ -195,7 +229,21 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
                     let stdin_fd = unsafe {
                         libc::open(fifo_cstr.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK)
                     };
-                    assert!(stdin_fd >= 0, "failed to open FIFO O_RDONLY for stdin");
+                    if stdin_fd < 0 {
+                        // Report on the captured stderr file (not yet dup2'd) and
+                        // exit. Dropping ready_write on exit gives the parent EOF,
+                        // so it never blocks waiting for a stdin-ready byte.
+                        let msg = b"rxd: failed to open stdin FIFO\n";
+                        unsafe {
+                            libc::write(
+                                stderr_fd,
+                                msg.as_ptr() as *const libc::c_void,
+                                msg.len(),
+                            );
+                        }
+                        let _ = pdir.write_status("exited(127)");
+                        unsafe { libc::_exit(127) };
+                    }
                     let flags = unsafe { libc::fcntl(stdin_fd, libc::F_GETFL) };
                     if flags >= 0 {
                         unsafe { libc::fcntl(stdin_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
@@ -246,12 +294,8 @@ pub fn start(command: &[String], cwd: Option<&str>, env: &BTreeMap<String, Strin
                         unsafe { libc::_exit(127) };
                     }
 
-                    let prog = CString::new(command[0].as_str()).unwrap();
-                    let args: Vec<CString> = command
-                        .iter()
-                        .map(|a| CString::new(a.as_str()).unwrap())
-                        .collect();
-                    let argv: Vec<*const libc::c_char> = args
+                    let prog = &prog_cstr;
+                    let argv: Vec<*const libc::c_char> = arg_cstrs
                         .iter()
                         .map(|a| a.as_ptr())
                         .chain(std::iter::once(std::ptr::null()))
@@ -361,9 +405,18 @@ fn read_pid_from_pipe(fd: RawFd) -> i32 {
     if n == 4 { i32::from_ne_bytes(buf) } else { 0 }
 }
 
+/// Build a C string from a path, failing here rather than in a forked child.
+fn path_cstring(path: &std::path::Path) -> Result<CString> {
+    let s = path.to_str().ok_or_else(|| {
+        RemExecError::Other(format!("path is not valid UTF-8: {}", path.display()))
+    })?;
+    CString::new(s)
+        .map_err(|e| RemExecError::Other(format!("path is not a valid C string: {e}")))
+}
+
+/// Returns `-1` on failure. Called after `fork()`, where the caller must handle
+/// the error itself rather than panic.
 fn open_devnull(flags: i32) -> RawFd {
-    let path = CString::new("/dev/null").unwrap();
-    let fd = unsafe { libc::open(path.as_ptr(), flags) };
-    assert!(fd >= 0, "failed to open /dev/null");
-    fd
+    let path = c"/dev/null";
+    unsafe { libc::open(path.as_ptr(), flags) }
 }

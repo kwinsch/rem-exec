@@ -17,6 +17,12 @@ pub enum RemExecError {
     #[error("SSH error: {0}")]
     Ssh(String),
 
+    /// The destination is not a usable SSH host. Kept distinct from
+    /// [`RemExecError::Ssh`] so it never reaches the auto-deploy classifier:
+    /// nothing was spawned, so there is nothing to deploy or retry.
+    #[error("{0}")]
+    BadHost(String),
+
     #[error("daemon not running")]
     DaemonNotRunning,
 

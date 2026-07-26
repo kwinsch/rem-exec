@@ -68,13 +68,14 @@ pub fn set_policy(policy: DeployPolicy) {
     let _ = POLICY.set(policy);
 }
 
-/// The effective policy: `--auto-deploy` if given, else `REM_EXEC_AUTO_DEPLOY`,
-/// else off.
+/// The effective policy: `--auto-deploy` if given, else `RX_AUTO_DEPLOY` (or
+/// the older `REM_EXEC_AUTO_DEPLOY`), else off.
 pub fn policy() -> DeployPolicy {
     if let Some(p) = POLICY.get() {
         return *p;
     }
-    std::env::var("REM_EXEC_AUTO_DEPLOY")
+    std::env::var("RX_AUTO_DEPLOY")
+        .or_else(|_| std::env::var("REM_EXEC_AUTO_DEPLOY"))
         .ok()
         .and_then(|v| parse_policy(&v))
         .unwrap_or_default()
@@ -507,13 +508,22 @@ pub fn deploy_to_host_with(host: &str, opts: &DeployOpts) -> Result<DeployResult
         )));
     }
 
-    // SCP binary to remote
+    // Copy to a temp name, then rename into place. Two reasons, both real:
+    // a failed mid-transfer scp must not leave a truncated binary at the live
+    // path, and scp opens its target O_TRUNC in place — which returns ETXTBSY
+    // when rxd is currently running, so an in-place deploy simply fails on a
+    // busy host. rename(2) over a busy text file is allowed.
+    //
+    // The temp name carries our pid so two concurrent deploys to one host
+    // cannot overwrite each other's upload.
     let binary_arg = local_binary.to_str().ok_or_else(|| {
         RemExecError::Other(format!("binary path is not valid UTF-8: {}", local_binary.display()))
     })?;
+    let staged = format!(".local/bin/.rxd-deploy.{}.tmp", std::process::id());
     let scp = Command::new("scp")
+        .arg("--")
         .arg(binary_arg)
-        .arg(format!("{host}:.local/bin/rxd"))
+        .arg(format!("{host}:{staged}"))
         .output()
         .map_err(RemExecError::Io)?;
 
@@ -521,6 +531,27 @@ pub fn deploy_to_host_with(host: &str, opts: &DeployOpts) -> Result<DeployResult
         let stderr = String::from_utf8_lossy(&scp.stderr);
         return Err(RemExecError::Ssh(format!("scp to {host} failed: {stderr}")));
     }
+
+    // Two plain argv commands rather than one `sh -c` string. ssh joins argv
+    // with spaces and hands the result to the remote login shell, so a quoted
+    // script would have to survive a round of shell parsing we do not control.
+    // Every word here is a literal or the staged name (only [.a-z/-] plus our
+    // own pid), which passes through that shell unchanged.
+    let install = |args: &[&str]| -> Result<()> {
+        let out = ssh_command(host).args(args).output().map_err(RemExecError::Io)?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Best effort: don't leave the upload behind on a failed install.
+        let _ = ssh_command(host).args(["rm", "-f", &staged]).output();
+        Err(RemExecError::Ssh(format!(
+            "installing rxd on {host} failed at `{}`: {stderr}",
+            args.join(" ")
+        )))
+    };
+    install(&["chmod", "755", &staged])?;
+    install(&["mv", "-f", &staged, ".local/bin/rxd"])?;
 
     // Verify deployment with version check
     let version = verify_remote_version(host)?;

@@ -1,5 +1,8 @@
 # rx — remote process execution over SSH (agent transport)
 
+This guide ships with rx {{VERSION}} and describes that binary. `rx --version`
+tells you what is installed; check it before reporting behaviour.
+
 Read this whole file once; it is short and complete. It describes capabilities,
 not a mandatory workflow — compose the commands as the task needs.
 
@@ -9,23 +12,59 @@ structured exit/signal/error results, or detach-and-reattach. For running a
 command and needing its exit code or clean output, rx beats ad-hoc `ssh host
 '…'`.
 
-Invariants:
-- Every command prints exactly one JSON object on stdout (type field). The only
-  exceptions are `start --pipe` (data on stdout, JSON handle on stderr) and the
-  raw streaming used internally.
+## Start here
+
+  rx ping HOST          # reachable? which rxd? which OS/distro?
+  rx deploy HOST        # only if ping answered not_deployed
+  rx run HOST -- CMD    # then work
+
+First contact with an unprepared host **fails on purpose**: rx does not install
+anything on a machine you merely pointed it at. `not_deployed` is that refusal,
+and its `hint` names the one command that fixes it. Deploy is a single static
+binary and needs nothing on the remote — no runtime, no package, no daemon to
+manage. Expect the sequence above once per host, then never again.
+
+`rx put -` reads its body from stdin, so any secret store that prints to stdout
+composes with it — pipe, never print the value into your own output:
+
+  <secret-store read …> | rx put - HOST:/run/secrets/name --mode 0600
+  rxv get SCOPE/NAME    | rx put - HOST:/run/secrets/name --mode 0600   # rxv
+  pass show infra/db    | rx put - HOST:/run/secrets/name --mode 0600   # pass
+  op read op://v/i/f    | rx put - HOST:/run/secrets/name --mode 0600   # 1Password
+
+rx has no secret store of its own and no dependency on one. rxv (`rxv skill`) is
+a separate tool built to the same contract, so its output and errors read the
+same way — use it if you want that, or keep whatever you already have.
+
+## Invariants
+
+- Every command prints exactly one JSON object on stdout (type field), errors
+  included. The exceptions are the commands whose product is bytes: `start
+  --pipe` (data on stdout, JSON handle on stderr) and `skill` (this guide).
+- Exit 0 = success · 1 = the call was understood and failed · 2 = the call was
+  malformed (rejected by the argument parser, stdout empty). `run`/`wait` also
+  propagate the remote command's status: `rx run HOST -- false` → exit 1, killed
+  by signal N → 128+N. The JSON is the source of truth.
+- A transport failure (unreachable host, auth) is the one case where the command
+  never ran — it still prints a JSON `error` with a `code` on stdout and exits 1.
+  Always read stdout JSON.
 - Command arguments and stdin bytes are transported verbatim over the SSH
   channel — no remote shell parses them. There is nothing to escape/quote.
 - Process IDs are 8 lowercase hex characters.
 - Trust model: rxd runs as the SSH user and is a transport, not a sandbox or
   privilege boundary. It can do anything that user can (write any path via put,
   elevate via `doas` in a command). Your SSH access is the whole trust boundary.
-- Process exit mirrors the remote command (`rx run HOST -- false` → exit 1;
-  killed by signal N → 128+N); the JSON is the source of truth, the process exit
-  is a convenience. A transport failure (unreachable host, auth) is the one case
-  the command never ran — it still prints a JSON `error` with a `code` (e.g.
-  ssh_unreachable) on stdout and exits 1. Always read stdout JSON.
-- JSON is pretty-printed by default; pass --compact (or REM_EXEC_JSON=compact)
-  for single-line objects.
+- **stdin is captured whenever it is not a terminal.** `run` reads it and feeds
+  it to the remote process; `start` pipes it. That is what makes `cat f | rx run
+  HOST -- sort` work — but an agent harness has no terminal, so if your stdin is
+  an open pipe nobody ever writes to or closes, these commands wait for EOF and
+  appear to hang. Redirect `</dev/null` whenever you do not mean to send input.
+  (Arguments are validated first, so a malformed call fails immediately instead
+  of blocking, and never swallows a pipeline's payload.)
+- JSON follows the destination: pretty on a terminal, compact otherwise. Force
+  it with --compact / --pretty, or RX_JSON=compact|pretty.
+- Idempotence: asking for a state that already holds succeeds with
+  `"changed": false` (`rx daemon start` on a running daemon).
 
 ## Model
 
@@ -60,7 +99,7 @@ that substrate:
   skill
   daemon start|stop|status
 
-Global: --compact, --auto-deploy off|local|on
+Global: --compact, --pretty, --auto-deploy off|local|on
 
 Notes:
 - Everything after `--` is the remote argv. `--` is optional but disambiguates a
@@ -79,6 +118,11 @@ Notes:
   privileged rxd); get writes to the local path and applies the source's mode
   unless --mode overrides. Both transport bytes faithfully but do NOT snapshot a
   live database — dump/checkpoint first (e.g. `sqlite3 .backup`, `pg_dump`).
+- get copies a live file and cannot freeze it: the byte count is fixed in the
+  header before the body starts. If the file changes while it is being read, get
+  fails with `file_changed` (retryable) and writes NOTHING locally — it never
+  silently returns a torn or truncated copy. Expect this on logs and databases;
+  snapshot them remotely first, then get the snapshot.
 - `put -` streams stdin, so a value can go from a pipeline straight to a remote
   file without ever being written to a local temp file or passed as an argument:
 
@@ -93,6 +137,10 @@ Notes:
   well-formed stream of zero bytes — installing it would blank an existing file
   and report success. Use `set -o pipefail` to catch the producer's exit status,
   or --allow-empty when an empty file is what you mean.
+  pipefail is a REPORTING requirement, not a safety one: the `empty_stream`
+  refusal already stops a failed producer from blanking the remote file with or
+  without it. What pipefail buys is that the shell — and therefore you — sees
+  the failure instead of reading the pipeline as successful.
   Scope: put guarantees "exactly what rx read landed, or nothing landed". It
   cannot tell a producer that finished from one that died mid-output — a pipe
   carries no exit status. Where that matters, write a file first and put that.
@@ -119,7 +167,7 @@ Notes:
   raw bytes; the JSON handle is written to stderr.
 - The local daemon (daemon start|stop|status) is an optional accelerator that
   caches repeated reads of long-running processes locally. It is used only when
-  you opt in with REM_EXEC_DAEMON=1; direct SSH is the default and canonical
+  you opt in with RX_DAEMON=1; direct SSH is the default and canonical
   path, and it does not handle ping/put/get. A daemon that merely happens to be
   running never changes how a command is transported.
 
@@ -150,6 +198,7 @@ stdout/stderr/data fields pair with an `encoding`:
   ping      {version, protocol, arch, os, kernel, hostname,
              distro_id?, distro_version?,
              local_version, up_to_date, hint?}
+  daemon    {action, running, changed, pid?, detail?}   # daemon start|stop|status
   error     {message, code?, retryable?, hint?}
 
 - run and wait yield completed or running. exit_code is null when signal is set.
@@ -172,10 +221,27 @@ stdout/stderr/data fields pair with an `encoding`:
 
   bad_request · invalid_process_id · process_not_found · process_exited ·
   timeout · not_deployed · unsupported · ssh_unreachable · ssh_auth ·
-  not_found · incomplete_transfer · empty_stream · internal
+  not_found · incomplete_transfer · empty_stream · bad_host · file_changed ·
+  internal
 
 Branch on code, not message text. `retryable:true` means the same call may
 succeed on retry (e.g. after an auto-deploy, or a transient ssh_unreachable).
+
+## HOST argument
+
+HOST is an ssh destination: `host`, `user@host`, an ssh_config alias, or an
+`ssh://` URI. rx rejects anything that is not one — empty, starting with `-`, or
+carrying whitespace or control characters — with `bad_host` before it spawns
+anything. A destination starting with `-` is the one that matters: ssh would
+read it as an option, and `-oProxyCommand=...` runs an arbitrary command on the
+CONTROLLER, which is the machine holding your SSH keys and any unlocked vault.
+rx also passes `--` ahead of every destination, so this holds even for a code
+path that skips the check.
+
+Practical consequence when a host comes from data you did not write (an
+inventory file, a ticket, a model's output): pass it through as one argument and
+let rx reject it. Do not paste it into a shell string, and do not strip a
+leading `-` to "fix" it.
 
 ## Deploy and connections
 
@@ -195,13 +261,20 @@ is what moves the pair. What --auto-deploy controls is when *hosts* change:
   on     may fetch and deploy during another command
 
 `rx deploy` is explicit and always allowed regardless of this setting. Env
-equivalent: REM_EXEC_AUTO_DEPLOY=off|local|on (1/true still mean on). rx never
+equivalent: RX_AUTO_DEPLOY=off|local|on (1/true still mean on; the older
+REM_EXEC_* names still work). rx never
 downgrades a host that is ahead of it — by protocol or by version — without
 --allow-downgrade; that host belongs to a newer rx.
 
 Only the controller (where rx runs) needs external tools — ssh for every
 operation, plus scp/curl/sha256sum for setup/deploy. The remote needs nothing
-preinstalled: rxd is a single static binary.
+preinstalled: rxd is a single static binary. Those tools are resolved through
+PATH, so rx assumes a trusted PATH on the controller; it is a single-user
+machine by design.
+
+deploy uploads to a temp name and renames over ~/.local/bin/rxd, so a failed
+transfer cannot leave a truncated binary and a currently-running rxd does not
+block the install (an in-place write would fail with ETXTBSY).
 
 `ping` is the preflight: one round trip tells you the host is reachable, what
 rxd version/protocol it runs, and what it is (os/kernel/arch/distro) — enough to
@@ -260,9 +333,10 @@ before it will read stdin (a host that is ahead already has what it needs).
   rx put ./app.conf HOST:/etc/app/app.conf --mode 0640
 
   # place a secret straight from a pipeline: no local temp file, no argv,
-  # never world-readable, and an empty stream is refused rather than installed
+  # never world-readable, and an empty stream is refused rather than installed.
+  # Any producer works — rxv, pass, op read, sops -d, a script.
   set -o pipefail
-  secret-store get db_password | rx put - HOST:/run/secrets/db_pass --mode 0600
+  rxv get host1/db_password | rx put - HOST:/run/secrets/db_pass --mode 0600
 
   # pull a file down atomically (size-verified); dump a live DB first
   rx run HOST -- doas -u postgres pg_dump -Fc appdb -f /tmp/appdb.dump

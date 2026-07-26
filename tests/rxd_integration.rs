@@ -74,6 +74,14 @@ impl Runtime {
     /// Drive a `get`: send the request, then split the raw stdout into the JSON
     /// header line and the raw body bytes that follow it.
     fn serve_get(&self, path: &str) -> (Value, Vec<u8>) {
+        let (header, body, _) = self.serve_get_status(path);
+        (header, body)
+    }
+
+    /// `serve_get` plus the exit status. rxd signals "the file changed while I
+    /// was reading it" through the status, because the header has already gone
+    /// out by then — so a test that cares about coherence has to look at it.
+    fn serve_get_status(&self, path: &str) -> (Value, Vec<u8>, std::process::ExitStatus) {
         let mut child = Command::new(env!("CARGO_BIN_EXE_rxd"))
             .arg("serve")
             .env("XDG_RUNTIME_DIR", &self.dir)
@@ -96,7 +104,7 @@ impl Runtime {
             .expect("get response had no header newline");
         let header: Value = serde_json::from_slice(&out.stdout[..nl]).unwrap();
         let body = out.stdout[nl + 1..].to_vec();
-        (header, body)
+        (header, body, out.status)
     }
 
     fn pipe_stdin(&self, id: &str, input: &[u8]) -> Output {
@@ -771,6 +779,42 @@ fn get_streams_file_with_header_and_bytes() {
     assert_eq!(header["size"].as_u64(), Some(content.len() as u64));
     assert_eq!(header["mode"], "0640");
     assert_eq!(body, content);
+}
+
+// rxd now bounds the body to the declared size and re-stats afterwards, using a
+// non-zero exit to tell rx "these bytes are not a coherent copy". An ordinary
+// static file must not trip that check — a false positive here would turn every
+// `rx get` into a file_changed error.
+#[test]
+fn get_of_an_unchanging_file_exits_clean() {
+    let runtime = Runtime::new("get-stable-status");
+    let src = runtime.dir.join("stable.bin");
+    let content: Vec<u8> = (0..=255u8).cycle().take(128 * 1024).collect();
+    fs::write(&src, &content).unwrap();
+
+    let (header, body, status) = runtime.serve_get_status(src.to_str().unwrap());
+
+    assert_eq!(header["size"].as_u64(), Some(content.len() as u64));
+    assert_eq!(body, content);
+    assert!(
+        status.success(),
+        "a file that did not change must exit 0, got {status}"
+    );
+}
+
+// An empty file is the degenerate case of the same check: declared 0, sent 0,
+// re-stat 0. It must read as clean, not as a shrink.
+#[test]
+fn get_of_an_empty_file_exits_clean() {
+    let runtime = Runtime::new("get-empty-status");
+    let src = runtime.dir.join("empty.bin");
+    fs::write(&src, b"").unwrap();
+
+    let (header, body, status) = runtime.serve_get_status(src.to_str().unwrap());
+
+    assert_eq!(header["size"].as_u64(), Some(0));
+    assert!(body.is_empty());
+    assert!(status.success(), "empty file must exit 0, got {status}");
 }
 
 #[test]

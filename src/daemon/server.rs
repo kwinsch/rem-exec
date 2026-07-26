@@ -12,8 +12,35 @@ use crate::protocol::{DaemonRequest, DaemonResponse, ErrorCode, Request, Respons
 use crate::ssh::serve_request_auto_deploy;
 use crate::{base64_decode, encode_bytes};
 
+/// The object a daemon control command produced.
+///
+/// Built here, printed by the CLI. The contract allows exactly one JSON object
+/// per invocation, and only the binary knows whether that object should be
+/// compact or pretty — so this module answers with data and never writes to a
+/// stream itself.
+fn outcome(action: &str, running: bool, changed: bool) -> serde_json::Value {
+    serde_json::json!({
+        "type": "daemon",
+        "action": action,
+        "running": running,
+        "changed": changed,
+    })
+}
+
+/// Read the recorded daemon pid, if the file is there and parses.
+fn recorded_pid() -> Option<u32> {
+    fs::read_to_string(super::pid_path())
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Start the daemon: fork, set up Unix socket, serve requests.
-pub fn start_daemon() -> Result<()> {
+///
+/// Idempotent: a daemon that is already running is the requested state, not an
+/// error — the caller asked for "running", and it is.
+pub fn start_daemon() -> Result<serde_json::Value> {
     let sock_path = super::socket_path();
     let pid_path = super::pid_path();
     let base = super::local_base();
@@ -21,8 +48,11 @@ pub fn start_daemon() -> Result<()> {
     // Check for stale socket
     if sock_path.exists() {
         if super::is_running() {
-            eprintln!("daemon already running");
-            std::process::exit(1);
+            let mut value = outcome("start", true, false);
+            if let (Some(obj), Some(pid)) = (value.as_object_mut(), recorded_pid()) {
+                obj.insert("pid".into(), serde_json::json!(pid));
+            }
+            return Ok(value);
         }
         // Stale socket — remove it
         let _ = fs::remove_file(&sock_path);
@@ -36,10 +66,10 @@ pub fn start_daemon() -> Result<()> {
     // Fork to daemonize
     let pid = unsafe { libc::fork() };
     match pid {
-        -1 => {
-            eprintln!("fork failed");
-            std::process::exit(1);
-        }
+        -1 => Err(crate::error::RemExecError::Other(format!(
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        ))),
         0 => {
             // Child: become the daemon
             unsafe { libc::setsid() };
@@ -67,51 +97,49 @@ pub fn start_daemon() -> Result<()> {
             let _ = fs::remove_file(&pid_path);
             std::process::exit(0);
         }
-        _child_pid => {
-            // Parent: wait briefly, verify daemon is up, exit
+        child_pid => {
+            // Parent: wait briefly, verify daemon is up, report.
             std::thread::sleep(std::time::Duration::from_millis(200));
-            if super::is_running() {
-                println!("daemon started (pid {_child_pid})");
-            } else {
-                eprintln!("daemon failed to start");
-                std::process::exit(1);
+            if !super::is_running() {
+                return Err(crate::error::RemExecError::Other(
+                    "daemon failed to start (socket never appeared)".to_string(),
+                ));
             }
+            let mut value = outcome("start", true, true);
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("pid".into(), serde_json::json!(child_pid));
+            }
+            Ok(value)
         }
     }
-
-    Ok(())
 }
 
 /// Stop the daemon by sending a stop request.
-pub fn stop_daemon() -> Result<()> {
+///
+/// Idempotent for the same reason as [`start_daemon`]: "not running" is the
+/// state the caller asked for.
+pub fn stop_daemon() -> Result<serde_json::Value> {
     let request = DaemonRequest::DaemonStop;
     match super::send_request(&request) {
-        Ok(_) => {
-            println!("daemon stopped");
-            Ok(())
-        }
-        Err(crate::error::RemExecError::DaemonNotRunning) => {
-            println!("daemon not running");
-            Ok(())
-        }
+        Ok(_) => Ok(outcome("stop", false, true)),
+        Err(crate::error::RemExecError::DaemonNotRunning) => Ok(outcome("stop", false, false)),
         Err(e) => Err(e),
     }
 }
 
-/// Show daemon status.
-pub fn daemon_status() -> Result<()> {
+/// Report whether the daemon is running, with its own status payload when it is.
+pub fn daemon_status() -> Result<serde_json::Value> {
     let request = DaemonRequest::DaemonStatus;
     match super::send_request(&request) {
         Ok(resp) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&resp).unwrap_or_default()
-            );
-            Ok(())
+            let mut value = outcome("status", true, false);
+            if let (Some(obj), DaemonResponse::Ok { data }) = (value.as_object_mut(), resp) {
+                obj.insert("detail".into(), data);
+            }
+            Ok(value)
         }
         Err(crate::error::RemExecError::DaemonNotRunning) => {
-            println!("daemon not running");
-            Ok(())
+            Ok(outcome("status", false, false))
         }
         Err(e) => Err(e),
     }
@@ -125,6 +153,18 @@ fn run_server(sock_path: &Path, base: std::path::PathBuf) {
             return;
         }
     };
+
+    // bind(2) applies the umask, so pin the mode explicitly. The parent dir is
+    // already 0700 via ensure_base_dir; this closes the window where the base
+    // was created by an earlier ssh_command call under a laxer umask.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fs::set_permissions(sock_path, fs::Permissions::from_mode(0o600)) {
+            eprintln!("failed to restrict socket permissions: {e}");
+            let _ = fs::remove_file(sock_path);
+            return;
+        }
+    }
 
     let state = Arc::new(Mutex::new(DaemonState::new(base)));
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));

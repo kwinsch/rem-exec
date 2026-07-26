@@ -167,6 +167,15 @@ pub enum ErrorCode {
     EmptyStream,
     /// A referenced path does not exist (e.g. `get` of a missing file).
     NotFound,
+    /// The destination string is not a usable SSH host (empty, option-shaped,
+    /// or containing control characters). Produced by rx before it spawns
+    /// anything — rxd never emits this.
+    BadHost,
+    /// The remote file changed while `get` was streaming it, so the bytes
+    /// received are not a coherent copy of any version of the file. Nothing was
+    /// installed locally. Synthesized by rx from the remote exit status; rxd
+    /// never emits this on the wire.
+    FileChanged,
     /// Unexpected internal failure.
     Internal,
 }
@@ -179,6 +188,7 @@ impl ErrorCode {
             ErrorCode::NotDeployed
                 | ErrorCode::SshUnreachable
                 | ErrorCode::IncompleteTransfer
+                | ErrorCode::FileChanged
                 | ErrorCode::Internal
         )
     }

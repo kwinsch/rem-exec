@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 
 use rem_exec::daemon;
 use rem_exec::daemon::server;
-use rem_exec::protocol::{DaemonRequest, DaemonResponse, Request, Response};
+use rem_exec::protocol::{DaemonRequest, DaemonResponse, ErrorCode, Request, Response};
 use rem_exec::ssh::{
     REMOTE_BIN, RemoteArgs, serve_request_auto_deploy, ssh_command, ssh_spawn_piped_stdin,
 };
@@ -18,39 +18,102 @@ use rem_exec::ssh::{
 const INLINE_STDIN_CAP: usize = 4 * 1024 * 1024;
 
 /// Process-wide switch: emit compact single-line JSON instead of pretty output.
-/// Set once from `--compact` / `REM_EXEC_JSON=compact` at startup.
+/// Set once at startup from [`compact_requested`].
 static COMPACT_JSON: AtomicBool = AtomicBool::new(false);
 
-/// Whether compact JSON was requested via the flag or `REM_EXEC_JSON=compact`.
-fn compact_requested(flag: bool) -> bool {
-    flag || std::env::var("REM_EXEC_JSON").ok().as_deref() == Some("compact")
+/// `RX_JSON`, or the older `REM_EXEC_JSON`, normalized.
+fn json_env() -> Option<String> {
+    std::env::var("RX_JSON")
+        .or_else(|_| std::env::var("REM_EXEC_JSON"))
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+}
+
+/// Whether to render JSON compact.
+///
+/// Pretty output is a courtesy to a person reading a terminal; a pipe, a file
+/// or an agent harness pays for it in bytes and gets nothing back. So the
+/// default follows the destination rather than a flag nobody remembers to pass
+/// — and either side can still be forced, because "is stdout a terminal" is not
+/// something a caller should have to reason about when it matters.
+///
+/// Precedence: explicit flag → `RX_JSON`/`REM_EXEC_JSON` → stdout is not a tty.
+fn compact_requested(compact: bool, pretty: bool) -> bool {
+    if compact {
+        return true;
+    }
+    if pretty {
+        return false;
+    }
+    match json_env().as_deref() {
+        Some("compact") => true,
+        Some("pretty") => false,
+        _ => !std::io::stdout().is_terminal(),
+    }
+}
+
+/// `--auto-deploy`, as the CLI accepts it.
+///
+/// A separate type from [`rem_exec::deploy::DeployPolicy`] so the library does
+/// not grow a clap dependency. Being an enum rather than a parsed string is what
+/// puts the three choices in `--help` and makes an invalid one a parser error
+/// (exit 2) instead of something rx has to hand-check.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum AutoDeployArg {
+    /// Never deploy as a side effect of another command (default).
+    Off,
+    /// May deploy during another command, from the local cache only.
+    Local,
+    /// May fetch and deploy during another command.
+    On,
+}
+
+impl From<AutoDeployArg> for rem_exec::deploy::DeployPolicy {
+    fn from(arg: AutoDeployArg) -> Self {
+        match arg {
+            AutoDeployArg::Off => rem_exec::deploy::DeployPolicy::Off,
+            AutoDeployArg::Local => rem_exec::deploy::DeployPolicy::Local,
+            AutoDeployArg::On => rem_exec::deploy::DeployPolicy::On,
+        }
+    }
 }
 
 #[derive(Parser)]
 #[command(name = "rx")]
 #[command(version)]
 #[command(about = "Agent-friendly remote process execution")]
+#[command(after_help = "\
+Start here:  rx skill        the complete agent guide (commands, response
+                             shapes, error codes) — read it once.
+First contact with a host:   rx ping HOST  →  if it answers not_deployed,
+                             rx deploy HOST  (one static binary, no remote deps)
+
+Every command answers with one JSON object on stdout. Exit 0 = success,
+1 = the call failed, 2 = the call was malformed.
+
+Secrets live in rxv, the companion vault:
+  rxv get SCOPE/NAME | rx put - HOST:/run/secrets/name --mode 0600")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
-    /// Emit single-line JSON instead of pretty-printed (or REM_EXEC_JSON=compact)
-    #[arg(long, global = true)]
+    /// Emit single-line JSON (the default when stdout is not a terminal)
+    #[arg(long, global = true, conflicts_with = "pretty")]
     compact: bool,
-    /// When rx may deploy rxd during another command: off (default, never),
-    /// local (from the cache only), on (fetch + deploy). Env:
-    /// REM_EXEC_AUTO_DEPLOY. `rx deploy` is always allowed — this governs
+    /// Emit pretty-printed JSON (the default when stdout is a terminal)
+    #[arg(long, global = true)]
+    pretty: bool,
+    /// When rx may deploy rxd during another command. Env: RX_AUTO_DEPLOY (or
+    /// REM_EXEC_AUTO_DEPLOY). `rx deploy` is always allowed — this governs
     /// whether a host can change as a side effect of something else.
-    #[arg(long, value_name = "off|local|on", global = true)]
-    auto_deploy: Option<String>,
+    #[arg(long, value_enum, value_name = "off|local|on", global = true)]
+    auto_deploy: Option<AutoDeployArg>,
 }
 
+// Declaration order is what `--help` shows, so it runs from the commands an
+// agent reaches for first down to the ones it rarely needs. `daemon` used to
+// lead the list purely because it was declared first.
 #[derive(Subcommand)]
 enum Command {
-    /// Manage the local daemon
-    Daemon {
-        #[command(subcommand)]
-        action: DaemonAction,
-    },
     /// Run a command to completion (blocks up to --timeout, then backgrounds)
     Run {
         /// Remote host (SSH destination)
@@ -240,6 +303,11 @@ enum Command {
     },
     /// Print skill file (machine-readable usage guide)
     Skill,
+    /// Manage the local daemon (an opt-in read cache; direct SSH is the default)
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -255,20 +323,28 @@ enum DaemonAction {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    if compact_requested(cli.compact) {
+    if compact_requested(cli.compact, cli.pretty) {
         COMPACT_JSON.store(true, Ordering::Relaxed);
     }
 
     // Fix the deploy policy before anything can act on it. Unset falls back to
-    // REM_EXEC_AUTO_DEPLOY, then to "off" — rx never changes a host you did not
-    // point it at.
-    if let Some(raw) = cli.auto_deploy.as_deref() {
-        match rem_exec::deploy::parse_policy(raw) {
-            Some(policy) => rem_exec::deploy::set_policy(policy),
-            None => {
-                eprintln!("error: invalid --auto-deploy '{raw}' (expected off, local, or on)");
-                return ExitCode::FAILURE;
-            }
+    // RX_AUTO_DEPLOY / REM_EXEC_AUTO_DEPLOY, then to "off" — rx never changes a
+    // host you did not point it at.
+    if let Some(arg) = cli.auto_deploy {
+        rem_exec::deploy::set_policy(arg.into());
+    }
+
+    // Validate every destination once, before anything is spawned. `--` in
+    // ssh_command is what actually blocks option injection; this exists so a
+    // bad host is a typed `bad_host` an agent can branch on instead of an
+    // OpenSSH message about invalid hostname characters.
+    for host in command_hosts(&cli.command) {
+        if let Err(e) = rem_exec::ssh::validate_host(host) {
+            print_json_response(&Response::error_code(
+                rem_exec::protocol::ErrorCode::BadHost,
+                e.to_string(),
+            ));
+            return ExitCode::FAILURE;
         }
     }
 
@@ -360,15 +436,17 @@ fn main() -> ExitCode {
                 }));
                 ExitCode::SUCCESS
             }
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::FAILURE
-            }
+            Err(e) => fail(ErrorCode::Internal, e.to_string()),
         };
     }
 
     if matches!(cli.command, Command::Skill) {
-        print!("{}", include_str!("../../docs/llm.txt"));
+        // Stamped with the version that shipped it: a guide read from anywhere
+        // else can then be recognised as describing a different binary.
+        print!(
+            "{}",
+            include_str!("../../docs/llm.txt").replace("{{VERSION}}", env!("CARGO_PKG_VERSION"))
+        );
         return ExitCode::SUCCESS;
     }
 
@@ -393,7 +471,8 @@ fn main() -> ExitCode {
 /// is always the default; the daemon is used only when this is set, so a daemon
 /// that merely happens to be running never reroutes commands.
 fn daemon_enabled() -> bool {
-    daemon_opt_in(std::env::var("REM_EXEC_DAEMON").ok().as_deref())
+    let value = std::env::var("RX_DAEMON").or_else(|_| std::env::var("REM_EXEC_DAEMON"));
+    daemon_opt_in(value.ok().as_deref())
 }
 
 /// Pure predicate behind [`daemon_enabled`], split out so it is testable without
@@ -408,19 +487,43 @@ fn daemon_opt_in(value: Option<&str>) -> bool {
     }
 }
 
+/// Why inline stdin could not be used.
+///
+/// The split is what lets the CLI answer correctly: too much input is the
+/// caller's to fix and there is another command that takes it, while a read
+/// failure is ours and nothing the caller does differently would help.
+enum StdinError {
+    /// More than [`INLINE_STDIN_CAP`] bytes were piped in.
+    TooLarge,
+    /// Reading local stdin failed.
+    Io(std::io::Error),
+}
+
+impl StdinError {
+    /// Report as a typed response and fail.
+    fn into_exit(self) -> ExitCode {
+        match self {
+            StdinError::TooLarge => fail_hint(
+                ErrorCode::BadRequest,
+                format!("stdin exceeds the {INLINE_STDIN_CAP}-byte inline cap"),
+                "use `rx start --pipe HOST -- CMD`, which streams stdin unbounded",
+            ),
+            StdinError::Io(e) => fail(ErrorCode::Internal, format!("reading stdin: {e}")),
+        }
+    }
+}
+
 /// Read piped local stdin up to `INLINE_STDIN_CAP`. Returns None if stdin is a
 /// terminal (no piped input). Errors if input exceeds the cap.
-fn read_inline_stdin() -> Result<Option<Vec<u8>>, String> {
+fn read_inline_stdin() -> Result<Option<Vec<u8>>, StdinError> {
     if std::io::stdin().is_terminal() {
         return Ok(None);
     }
     let mut buf = Vec::new();
     let mut handle = std::io::stdin().lock().take((INLINE_STDIN_CAP + 1) as u64);
-    handle.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    handle.read_to_end(&mut buf).map_err(StdinError::Io)?;
     if buf.len() > INLINE_STDIN_CAP {
-        return Err(format!(
-            "stdin exceeds inline cap ({INLINE_STDIN_CAP} bytes); use `rx start --pipe` for large input"
-        ));
+        return Err(StdinError::TooLarge);
     }
     Ok(Some(buf))
 }
@@ -440,19 +543,49 @@ fn pipe_local_stdin_to_remote(host: &str, id: &str, no_close: bool) -> ExitCode 
     let mut child = match ssh_spawn_piped_stdin(host, &args.as_str_slice()) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("error: failed to spawn pipe-stdin: {e}");
-            return ExitCode::FAILURE;
+            return fail(
+                ErrorCode::Internal,
+                format!("failed to spawn pipe-stdin for {host}: {e}"),
+            );
         }
     };
 
     let mut remote_stdin = child.stdin.take().unwrap();
     let mut local_stdin = std::io::stdin().lock();
-    let _ = std::io::copy(&mut local_stdin, &mut remote_stdin);
+    // EPIPE means the remote command exited before consuming all of stdin —
+    // routine for something like `head`. Any other copy error is real.
+    if let Err(e) = std::io::copy(&mut local_stdin, &mut remote_stdin)
+        && e.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        print_json_response(&Response::error_code(
+            rem_exec::protocol::ErrorCode::Internal,
+            format!("feeding stdin to {host}: {e}"),
+        ));
+        let _ = child.wait();
+        return ExitCode::FAILURE;
+    }
     drop(remote_stdin);
 
+    // OpenSSH reserves 255 for its own failures (unreachable, auth, mux), while
+    // rxd only ever exits 0 or 1. That split is what lets us report a genuine
+    // transport failure without also failing the ordinary case where pipe-stdin
+    // exits 1 on EPIPE against a short-lived remote command.
     match child.wait() {
-        Ok(s) if s.success() => ExitCode::SUCCESS,
-        _ => ExitCode::SUCCESS, // pipe-stdin exits 1 on EPIPE, normal for short-lived commands
+        Ok(s) if s.code() == Some(255) => {
+            print_json_response(&Response::error_code(
+                rem_exec::protocol::ErrorCode::SshUnreachable,
+                format!("ssh to {host} failed while feeding stdin to process {id}"),
+            ));
+            ExitCode::FAILURE
+        }
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            print_json_response(&Response::error_code(
+                rem_exec::protocol::ErrorCode::Internal,
+                format!("waiting for ssh to {host}: {e}"),
+            ));
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -501,19 +634,17 @@ fn route_via_ssh(command: &Command) -> ExitCode {
             keep_stdin_open,
             keep,
         } => {
-            let body = match read_inline_stdin() {
-                Ok(b) => b.unwrap_or_default(),
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
+            // Arguments are validated before stdin is touched. Reading first
+            // would block on an idle pipe for a call that was never going to
+            // run, and would swallow whatever a producer had already written
+            // for a command that is about to be rejected.
             let env = match parse_env(env) {
                 Ok(m) => m,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::FAILURE;
-                }
+                Err(e) => return fail(ErrorCode::BadRequest, e),
+            };
+            let body = match read_inline_stdin() {
+                Ok(b) => b.unwrap_or_default(),
+                Err(e) => return e.into_exit(),
             };
             let request = Request::Run {
                 command: cmd.clone(),
@@ -545,10 +676,7 @@ fn route_via_ssh(command: &Command) -> ExitCode {
         } => {
             let env = match parse_env(env) {
                 Ok(m) => m,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::FAILURE;
-                }
+                Err(e) => return fail(ErrorCode::BadRequest, e),
             };
             let needs_pipe = *pipe || !std::io::stdin().is_terminal();
             let request = Request::Start {
@@ -556,10 +684,14 @@ fn route_via_ssh(command: &Command) -> ExitCode {
                 cwd: cwd.clone(),
                 env,
             };
+            // Classified like every other transport failure, so an unreachable
+            // host or a missing rxd reads as `ssh_unreachable`/`not_deployed`
+            // here too — `start` used to be the one command where that answer
+            // arrived as an untyped line.
             let response = match serve_request_auto_deploy(host, &request, &[]) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("error: {e}");
+                    print_json_response(&transport_error_json(host, &e));
                     return ExitCode::FAILURE;
                 }
             };
@@ -592,8 +724,11 @@ fn route_via_ssh(command: &Command) -> ExitCode {
             let input = match input {
                 Some(s) => s,
                 None => {
-                    eprintln!("error: no input provided and stdin is not piped");
-                    return ExitCode::FAILURE;
+                    return fail_hint(
+                        ErrorCode::BadRequest,
+                        "no input provided and stdin is not piped",
+                        "pass the text as an argument (`rx write HOST ID TEXT`) or pipe it in",
+                    );
                 }
             };
             let body = write_bytes(input, *raw);
@@ -813,17 +948,17 @@ fn do_put(
     let (host, path) = match remote.split_once(':') {
         Some((h, p)) if !h.is_empty() && !p.is_empty() => (h, p),
         _ => {
-            eprintln!("error: destination must be HOST:PATH");
-            return ExitCode::FAILURE;
+            return fail_hint(
+                ErrorCode::BadRequest,
+                format!("destination {remote:?} is not HOST:PATH"),
+                "write it as one argument, e.g. `rx put ./app.conf host:/etc/app.conf`",
+            );
         }
     };
     let mode = match mode {
         Some(s) => match parse_mode(s) {
             Ok(m) => Some(m),
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
+            Err(e) => return fail(ErrorCode::BadRequest, e),
         },
         None => None,
     };
@@ -979,17 +1114,33 @@ enum ReceiveError {
     Io(std::io::Error),
 }
 
-/// Stream exactly `size` bytes from `src` into `dest`, atomically: a private
-/// temp in the destination directory, verify the full size arrived, fsync, set
-/// `mode`, then rename into place. A short stream leaves no file behind — the
-/// mirror of the remote-side guarantee in `cp`.
-fn receive_file<R: std::io::Read>(
+/// A fully-received payload sitting in a private temp file, not yet visible at
+/// the destination.
+///
+/// Receiving and installing are two steps so that a caller can interpose a
+/// check between "all the bytes arrived" and "the file is installed" — `get`
+/// uses the gap to verify the remote exit status. A download that fails either
+/// half leaves no file behind, the same guarantee `cp` makes on the remote side.
+struct StagedFile {
+    tmp: std::path::PathBuf,
+    bytes: u64,
+}
+
+impl StagedFile {
+    /// Discard without installing. Used when a post-receive check fails.
+    fn discard(self) {
+        let _ = std::fs::remove_file(&self.tmp);
+    }
+}
+
+/// Stream exactly `size` bytes into a private temp beside `dest` and fsync it.
+/// Any shortfall removes the temp and reports `Incomplete`.
+fn receive_to_temp<R: std::io::Read>(
     src: &mut R,
     dest: &std::path::Path,
     size: u64,
-    mode: u32,
-) -> Result<u64, ReceiveError> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+) -> Result<StagedFile, ReceiveError> {
+    use std::os::unix::fs::OpenOptionsExt;
 
     let dir = match dest.parent() {
         Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
@@ -1005,34 +1156,51 @@ fn receive_file<R: std::io::Read>(
         .open(&tmp)
         .map_err(ReceiveError::Io)?;
 
+    let failed = |f: std::fs::File, tmp: &std::path::Path, e: ReceiveError| {
+        drop(f);
+        let _ = std::fs::remove_file(tmp);
+        e
+    };
+
     let copied = match std::io::copy(&mut (&mut *src).take(size), &mut f) {
         Ok(n) => n,
-        Err(e) => {
-            drop(f);
-            let _ = std::fs::remove_file(&tmp);
-            return Err(ReceiveError::Io(e));
-        }
+        Err(e) => return Err(failed(f, &tmp, ReceiveError::Io(e))),
     };
     if copied != size {
-        drop(f);
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ReceiveError::Incomplete {
-            expected: size,
-            got: copied,
-        });
+        return Err(failed(
+            f,
+            &tmp,
+            ReceiveError::Incomplete {
+                expected: size,
+                got: copied,
+            },
+        ));
+    }
+    if let Err(e) = f.sync_all() {
+        return Err(failed(f, &tmp, ReceiveError::Io(e)));
     }
 
-    let finish = || -> std::io::Result<()> {
-        f.sync_all()?;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
-        drop(f);
-        std::fs::rename(&tmp, dest)
+    Ok(StagedFile { tmp, bytes: copied })
+}
+
+/// Apply `mode` and rename the staged file into place. A failure leaves nothing
+/// behind, so the destination is either the old file or the complete new one.
+fn commit_temp(
+    staged: StagedFile,
+    dest: &std::path::Path,
+    mode: u32,
+) -> Result<(), ReceiveError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let install = || -> std::io::Result<()> {
+        std::fs::set_permissions(&staged.tmp, std::fs::Permissions::from_mode(mode))?;
+        std::fs::rename(&staged.tmp, dest)
     };
-    if let Err(e) = finish() {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = install() {
+        let _ = std::fs::remove_file(&staged.tmp);
         return Err(ReceiveError::Io(e));
     }
-    Ok(copied)
+    Ok(())
 }
 
 /// Download HOST:PATH to a local file, streaming and atomic, with the same
@@ -1044,17 +1212,17 @@ fn do_get(remote: &str, local: &str, mode: Option<&str>) -> ExitCode {
     let (host, path) = match remote.split_once(':') {
         Some((h, p)) if !h.is_empty() && !p.is_empty() => (h, p),
         _ => {
-            eprintln!("error: source must be HOST:PATH");
-            return ExitCode::FAILURE;
+            return fail_hint(
+                ErrorCode::BadRequest,
+                format!("source {remote:?} is not HOST:PATH"),
+                "write it as one argument, e.g. `rx get host:/var/log/app.log ./app.log`",
+            );
         }
     };
     let mode_override = match mode {
         Some(s) => match parse_mode(s) {
             Ok(m) => Some(m),
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
+            Err(e) => return fail(ErrorCode::BadRequest, e),
         },
         None => None,
     };
@@ -1096,18 +1264,63 @@ fn do_get(remote: &str, local: &str, mode: Option<&str>) -> ExitCode {
                 let src_mode = rem_exec::protocol::parse_octal_mode(&src_mode)
                     .map_err(rem_exec::error::RemExecError::Protocol)?;
                 let applied = mode_override.unwrap_or(src_mode);
-                let outcome = receive_file(&mut reader, std::path::Path::new(local), size, applied);
-                let _ = child.wait();
-                match outcome {
-                    Ok(bytes) => Ok(Response::Got {
+                let dest = std::path::Path::new(local);
+                let staged = match receive_to_temp(&mut reader, dest, size) {
+                    Ok(s) => s,
+                    Err(ReceiveError::Incomplete { expected, got }) => {
+                        let _ = child.wait();
+                        return Ok(Response::error_code(
+                            ErrorCode::IncompleteTransfer,
+                            format!("incomplete transfer from {path}: expected {expected} bytes, received {got}"),
+                        ));
+                    }
+                    Err(ReceiveError::Io(e)) => {
+                        let _ = child.wait();
+                        return Err(rem_exec::error::RemExecError::Io(e));
+                    }
+                };
+
+                // All the declared bytes arrived. Two things still have to be
+                // checked before this counts as a copy of the file.
+                //
+                // First: is there anything after them? A current rxd bounds the
+                // body to the declared size, so the answer is no. An rxd from
+                // before that fix copies to EOF and keeps writing as the file
+                // grows — which both proves the file changed and, if we simply
+                // stopped reading, would wedge it on a full pipe while we waited
+                // for it to exit. So drain a bounded amount rather than either
+                // trusting the count or reading forever, then close the pipe so
+                // a still-writing remote gets EPIPE and terminates.
+                const DRAIN_CAP: u64 = 64 * 1024;
+                let extra =
+                    std::io::copy(&mut (&mut reader).take(DRAIN_CAP), &mut std::io::sink())
+                        .unwrap_or(0);
+                drop(reader);
+                drop(stderr);
+
+                // Second: rxd re-stats the file and exits non-zero when its
+                // length moved. Both checks happen before the rename, so a file
+                // that changed leaves the destination exactly as it was.
+                let status = child.wait().map_err(rem_exec::error::RemExecError::Io)?;
+                if extra > 0 || !status.success() {
+                    staged.discard();
+                    return Ok(Response::error_code(
+                        ErrorCode::FileChanged,
+                        format!(
+                            "{path} changed while being read — nothing was written to {local}; \
+                             retry, or snapshot the file remotely first"
+                        ),
+                    ));
+                }
+
+                let bytes = staged.bytes;
+                match commit_temp(staged, dest, applied) {
+                    Ok(()) => Ok(Response::Got {
                         path: local.to_string(),
                         bytes,
                         mode: Some(rem_exec::protocol::octal_mode(applied)),
                     }),
-                    Err(ReceiveError::Incomplete { expected, got }) => Ok(Response::error_code(
-                        ErrorCode::IncompleteTransfer,
-                        format!("incomplete transfer from {path}: expected {expected} bytes, received {got}"),
-                    )),
+                    Err(ReceiveError::Incomplete { .. }) => unreachable!("commit cannot be short"),
                     Err(ReceiveError::Io(e)) => Err(rem_exec::error::RemExecError::Io(e)),
                 }
             }
@@ -1157,10 +1370,7 @@ fn route_via_daemon(command: &Command) -> ExitCode {
         if needs_pipe {
             let env = match parse_env(env) {
                 Ok(m) => m,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::FAILURE;
-                }
+                Err(e) => return fail(ErrorCode::BadRequest, e),
             };
             let request = DaemonRequest::Start {
                 host: host.clone(),
@@ -1185,10 +1395,7 @@ fn route_via_daemon(command: &Command) -> ExitCode {
                     print_json_response(&daemon_error_json(message));
                     ExitCode::FAILURE
                 }
-                Err(e) => {
-                    eprintln!("daemon error: {e}");
-                    ExitCode::FAILURE
-                }
+                Err(e) => fail(ErrorCode::Internal, format!("local daemon: {e}")),
             };
         }
     }
@@ -1204,20 +1411,15 @@ fn route_via_daemon(command: &Command) -> ExitCode {
             keep_stdin_open,
             keep,
         } => {
+            // Validate before reading stdin — see the direct-SSH path.
+            let env = match parse_env(env) {
+                Ok(m) => m,
+                Err(e) => return fail(ErrorCode::BadRequest, e),
+            };
             let stdin_b64 = match read_inline_stdin() {
                 Ok(Some(b)) if !b.is_empty() => Some(rem_exec::base64_encode(&b)),
                 Ok(_) => None,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let env = match parse_env(env) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::FAILURE;
-                }
+                Err(e) => return e.into_exit(),
             };
             DaemonRequest::Run {
                 host: host.clone(),
@@ -1244,10 +1446,7 @@ fn route_via_daemon(command: &Command) -> ExitCode {
         } => {
             let env = match parse_env(env) {
                 Ok(m) => m,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::FAILURE;
-                }
+                Err(e) => return fail(ErrorCode::BadRequest, e),
             };
             DaemonRequest::Start {
                 host: host.clone(),
@@ -1294,8 +1493,11 @@ fn route_via_daemon(command: &Command) -> ExitCode {
             let input = match input {
                 Some(s) => s,
                 None => {
-                    eprintln!("error: no input provided and stdin is not piped");
-                    return ExitCode::FAILURE;
+                    return fail_hint(
+                        ErrorCode::BadRequest,
+                        "no input provided and stdin is not piped",
+                        "pass the text as an argument (`rx write HOST ID TEXT`) or pipe it in",
+                    );
                 }
             };
             DaemonRequest::Write {
@@ -1339,14 +1541,45 @@ fn route_via_daemon(command: &Command) -> ExitCode {
             print_json_response(&daemon_error_json(message));
             ExitCode::FAILURE
         }
-        Err(e) => {
-            eprintln!("daemon error: {e}");
-            ExitCode::FAILURE
-        }
+        Err(e) => fail(ErrorCode::Internal, format!("local daemon: {e}")),
     }
 }
 
 /// Exit code for a non-run response: FAILURE only for an error response.
+/// Every SSH destination this command will touch.
+///
+/// Exhaustive on purpose — no `_` arm — so a new host-bearing subcommand fails
+/// to compile until it is listed here rather than silently skipping validation.
+/// For the `HOST:PATH` forms an unsplittable argument yields nothing; the
+/// command's own "must be HOST:PATH" error is the better message there.
+fn command_hosts(command: &Command) -> Vec<&str> {
+    fn host_of(spec: &str) -> Option<&str> {
+        match spec.split_once(':') {
+            Some((h, p)) if !h.is_empty() && !p.is_empty() => Some(h),
+            _ => None,
+        }
+    }
+    match command {
+        Command::Run { host, .. }
+        | Command::Start { host, .. }
+        | Command::Wait { host, .. }
+        | Command::Status { host, .. }
+        | Command::Stdout { host, .. }
+        | Command::Stderr { host, .. }
+        | Command::Write { host, .. }
+        | Command::CloseStdin { host, .. }
+        | Command::Kill { host, .. }
+        | Command::List { host, .. }
+        | Command::Clean { host, .. }
+        | Command::Ping { host, .. } => vec![host.as_str()],
+        Command::Deploy { hosts, .. } => hosts.iter().map(String::as_str).collect(),
+        Command::Put { remote, .. } | Command::Get { remote, .. } => {
+            host_of(remote).into_iter().collect()
+        }
+        Command::Daemon { .. } | Command::Setup { .. } | Command::Skill => Vec::new(),
+    }
+}
+
 fn exit_for(response: &Response) -> ExitCode {
     if matches!(response, Response::Error { .. }) {
         ExitCode::FAILURE
@@ -1430,6 +1663,26 @@ fn print_json_response(response: &Response) {
     println!("{}", render_json(response));
 }
 
+/// Report a client-side failure as a typed error object on stdout and exit 1.
+///
+/// The single place an argument rx cannot use becomes a response. The contract
+/// promises exactly one JSON object per invocation, so a bad `--mode` has to
+/// arrive in the same shape as an unreachable host: an agent that parses stdout
+/// and branches on `code` never has to fall back to reading prose off stderr,
+/// which is what it does right before it gives up on the tool.
+fn fail(code: ErrorCode, message: impl Into<String>) -> ExitCode {
+    print_json_response(&Response::error_code(code, message));
+    ExitCode::FAILURE
+}
+
+/// [`fail`] with a `hint` naming the fix. Use it when the fix is a *different*
+/// command or flag; when the message already states the expected form, the hint
+/// would only repeat it.
+fn fail_hint(code: ErrorCode, message: impl Into<String>, hint: impl Into<String>) -> ExitCode {
+    print_json_response(&Response::error_code(code, message).with_hint(hint));
+    ExitCode::FAILURE
+}
+
 fn print_json(value: &serde_json::Value) {
     println!("{}", render_json(value));
 }
@@ -1444,13 +1697,14 @@ fn render_json<T: serde::Serialize>(value: &T) -> String {
     .unwrap_or_default()
 }
 
-fn report(result: rem_exec::error::Result<()>) -> ExitCode {
+/// Print a daemon control result — or its failure — as one JSON object.
+fn report(result: rem_exec::error::Result<serde_json::Value>) -> ExitCode {
     match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::FAILURE
+        Ok(value) => {
+            print_json(&value);
+            ExitCode::SUCCESS
         }
+        Err(e) => fail(ErrorCode::Internal, e.to_string()),
     }
 }
 
@@ -1471,9 +1725,13 @@ mod tests {
         assert!(!daemon_opt_in(None));
     }
 
+    // An explicit flag decides on its own; only an unforced call may consult
+    // the environment or the terminal, which is what keeps a pipeline's output
+    // shape independent of where it happens to run.
     #[test]
-    fn compact_requested_honors_the_flag() {
-        assert!(compact_requested(true));
+    fn explicit_json_flags_win_over_everything_else() {
+        assert!(compact_requested(true, false));
+        assert!(!compact_requested(false, true));
     }
 
     fn test_dir(name: &str) -> std::path::PathBuf {
@@ -1481,6 +1739,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// receive + install, the way `get` composes them on the happy path.
+    fn receive_file<R: std::io::Read>(
+        src: &mut R,
+        dest: &std::path::Path,
+        size: u64,
+        mode: u32,
+    ) -> Result<u64, ReceiveError> {
+        let staged = receive_to_temp(src, dest, size)?;
+        let bytes = staged.bytes;
+        commit_temp(staged, dest, mode)?;
+        Ok(bytes)
     }
 
     #[test]
@@ -1533,5 +1804,68 @@ mod tests {
         assert_eq!(n, 0);
         assert_eq!(std::fs::read(&dest).unwrap(), b"");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // The whole point of staging: a post-receive check can reject a complete
+    // payload (rxd reporting the file changed mid-read) and the destination
+    // must be left exactly as it was.
+    #[test]
+    fn discarding_a_staged_file_leaves_the_destination_untouched() {
+        let dir = test_dir("discard");
+        let dest = dir.join("out.bin");
+        std::fs::write(&dest, b"original").unwrap();
+        let data = b"replacement payload";
+        let mut src = Cursor::new(data.to_vec());
+
+        let staged = receive_to_temp(&mut src, &dest, data.len() as u64).unwrap();
+        assert_eq!(staged.bytes, data.len() as u64);
+        let tmp = staged.tmp.clone();
+        staged.discard();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"original");
+        assert!(!tmp.exists(), "staged temp must be removed");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn command_hosts_covers_plain_and_host_path_destinations() {
+        let run = Command::Run {
+            host: "site-router1".to_string(),
+            command: vec!["true".to_string()],
+            cwd: None,
+            env: Vec::new(),
+            timeout: Some(30),
+            keep_stdin_open: false,
+            keep: false,
+        };
+        assert_eq!(command_hosts(&run), vec!["site-router1"]);
+
+        let put = Command::Put {
+            local: "-".to_string(),
+            remote: "-oProxyCommand=x:/run/secrets/db".to_string(),
+            mode: None,
+            owner: None,
+            group: None,
+            allow_empty: false,
+        };
+        assert_eq!(command_hosts(&put), vec!["-oProxyCommand=x"]);
+        assert!(rem_exec::ssh::validate_host(command_hosts(&put)[0]).is_err());
+
+        // Unsplittable HOST:PATH yields nothing — the command's own
+        // "must be HOST:PATH" message is the better error there.
+        let malformed = Command::Get {
+            remote: "no-colon".to_string(),
+            local: "/tmp/x".to_string(),
+            mode: None,
+        };
+        assert!(command_hosts(&malformed).is_empty());
+
+        let deploy = Command::Deploy {
+            hosts: vec!["a".to_string(), "b".to_string()],
+            binary: None,
+            offline: false,
+            allow_downgrade: false,
+        };
+        assert_eq!(command_hosts(&deploy), vec!["a", "b"]);
     }
 }
