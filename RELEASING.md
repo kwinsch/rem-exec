@@ -10,7 +10,32 @@ carry assets whose hashes match — build and checksum *before* publishing.
 - musl cross toolchain on PATH (see `MUSL_PATH` in `.cargo/config.toml`):
   `export PATH="$MUSL_PATH:$PATH"`
 - rustup targets: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `riscv64gc-unknown-linux-musl`, `armv7-unknown-linux-musleabihf`
-- `.cargo/config.toml` sets the per-target musl linkers.
+- `.cargo/config.toml` sets the per-target musl linkers and `crt-static`.
+- `gh` authenticated; `cargo` authenticated for crates.io.
+
+## Versioning
+
+Pre-1.0, so the **minor** is the breaking-change digit: anything that changes
+the JSON shapes, the CLI surface or an error code's meaning is a minor bump.
+0.3.0 → 0.4.0 was exactly this — errors moved from stderr prose to stdout JSON.
+Agents consume `rx skill` fresh each session, so a clean break beats a
+compatibility shim.
+
+`PROTOCOL_VERSION` (currently 2) is separate and tracks only the rx↔rxd wire.
+Bump it on a breaking wire change; leave it alone otherwise. The two are
+compared at different points, and the difference decides what a release asks of
+a fleet:
+
+- **Protocol** equality is what lets an ordinary command run at all. A mismatch
+  is the `not_deployed` error; an unchanged protocol means every deployed rxd
+  keeps working against the new rx.
+- **Full version** equality is what `ping`'s `up_to_date` and `rx deploy`'s
+  idempotence compare. So after a release that left the protocol alone, `ping`
+  still reports `up_to_date:false` and `rx deploy` still uploads — which is how
+  rxd-side fixes reach hosts that were never broken.
+
+So the release notes should say which of the two moved, and therefore whether a
+fleet redeploy is required or merely recommended.
 
 ## Gate (before anything irreversible)
 
@@ -30,9 +55,16 @@ runs here without a remote host.
 
 ## Build (all arches, fully static)
 
-Always build with `crt-static` forced. Without it, **riscv64gc-musl links
-dynamically** (interpreter `/lib/ld-musl-riscv64.so.1`), which breaks the
-static-portability guarantee and auto-deploy onto hosts without musl.
+`.cargo/config.toml` sets `crt-static` per target, so this is structural rather
+than remembered. Without it **riscv64gc-musl links dynamically** (interpreter
+`/lib/ld-musl-riscv64.so.1`), which breaks the static-portability guarantee and
+auto-deploy onto hosts without musl — and it is the one musl target that does
+not enable it by default, so a plain `cargo build --release --target` used to
+produce a dynamic rxd that looked fine until it reached a host without musl.
+
+Do **not** set `RUSTFLAGS` for the release build. Cargo lets it *replace* the
+config's per-target `rustflags` rather than merging, so a `RUSTFLAGS` set for
+any other reason silently drops `crt-static`.
 
 **Clear `dist/` first.** It is untracked staging, so whatever a previous release
 left behind survives — and step 4 below globs `dist/rx-*`, which would publish
@@ -43,7 +75,6 @@ at 0.3.0 while the source was 0.4.0.)
 ```bash
 rm -rf dist && mkdir dist
 export PATH="$MUSL_PATH:$PATH"
-export RUSTFLAGS="-C target-feature=+crt-static"
 for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl riscv64gc-unknown-linux-musl armv7-unknown-linux-musleabihf; do
   cargo build --release --target "$t"
 done
@@ -59,7 +90,13 @@ the armv7 asset comes from the `armv7-unknown-linux-musleabihf` target and its
 ```
 
 Verify every binary is self-contained — `file` must show `statically linked` or
-`static-pie linked`, never `dynamically linked` / `interpreter`.
+`static-pie linked`, never `dynamically linked` / `interpreter`. Check the
+*whole* line; a truncated `file` output is how a dynamic riscv64 build slips
+through:
+
+```bash
+file dist/rx-* dist/rxd-* | grep -i 'dynamic\|interpreter' && echo PROBLEM || echo "all static"
+```
 
 ## Checksums
 
@@ -77,6 +114,24 @@ from an earlier release, which is the failure this guards:
 VERSION=$(grep -m1 '^version' ../Cargo.toml | cut -d'"' -f2)
 for f in rx-* rxd-*; do grep -qa "$VERSION" "$f" || echo "STALE: $f"; done
 ```
+
+## Before pushing anything
+
+Run the compliance check from `SENSITIVE.md` (untracked, local only) over both
+the staged diff and the full history. It must come back empty.
+
+Note that the check's own pattern list is sensitive: keep it in `SENSITIVE.md`
+and never paste it into a tracked file — including this one.
+
+Also check what the crate tarball would carry:
+
+```bash
+cargo package --list        # neither SENSITIVE.md nor .cargo/ may appear
+```
+
+Both are excluded via `Cargo.toml`. `.cargo/config.toml` is dev-only
+cross-compilation config — useless to a `cargo install` consumer, and it names
+a local toolchain layout, so it stays out of the published crate.
 
 ## Publish (order matters)
 
