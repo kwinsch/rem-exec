@@ -1,15 +1,27 @@
 # Cross-compilation for static musl binaries.
 # Set MUSL_PATH to your musl-cross-make output/bin directory.
 # Example: export MUSL_PATH=/path/to/musl-cross-make/output/bin
+#
+# crt-static is set explicitly per target rather than relied upon as a default:
+# riscv64gc-unknown-linux-musl does NOT enable it by default (unlike the
+# x86_64 / aarch64 / armv7 musl targets), so a plain build there links
+# dynamically against ld-musl — which breaks the static-portability guarantee
+# and auto-deploy onto hosts without musl. Being explicit keeps all four
+# identical, and keeps the guarantee from depending on whoever runs the release
+# build remembering to export RUSTFLAGS.
 
 [target.x86_64-unknown-linux-musl]
 linker = "x86_64-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.aarch64-unknown-linux-musl]
 linker = "aarch64-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.riscv64gc-unknown-linux-musl]
 linker = "riscv64-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.armv7-unknown-linux-musleabihf]
 linker = "arm-linux-musleabihf-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
