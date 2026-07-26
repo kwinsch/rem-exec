@@ -589,33 +589,104 @@ fn write_bytes(input: &str, raw: bool) -> Vec<u8> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PipeStdinReport {
+    Quiet,
+    Written,
+}
+
+struct PipeCopy {
+    bytes: u64,
+    broken_pipe: bool,
+}
+
+fn copy_local_stdin_to_remote(remote_stdin: &mut impl std::io::Write) -> std::io::Result<PipeCopy> {
+    use std::io::ErrorKind;
+
+    let mut local_stdin = std::io::stdin().lock();
+    let mut buf = [0u8; 64 * 1024];
+    let mut copied = 0u64;
+
+    loop {
+        let n = match local_stdin.read(&mut buf) {
+            Ok(0) => {
+                return Ok(PipeCopy {
+                    bytes: copied,
+                    broken_pipe: false,
+                });
+            }
+            Ok(n) => n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+
+        let mut offset = 0;
+        while offset < n {
+            match remote_stdin.write(&buf[offset..n]) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::WriteZero,
+                        "failed to write piped stdin to ssh",
+                    ));
+                }
+                Ok(written) => {
+                    copied += written as u64;
+                    offset += written;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == ErrorKind::BrokenPipe => {
+                    return Ok(PipeCopy {
+                        bytes: copied,
+                        broken_pipe: true,
+                    });
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+fn print_pipe_error(response: Response) -> ExitCode {
+    print_json_response(&response);
+    exit_for(&response)
+}
+
 /// Pipe local stdin to a remote process via SSH pipe-stdin.
-fn pipe_local_stdin_to_remote(host: &str, id: &str, no_close: bool) -> ExitCode {
+fn pipe_local_stdin_to_remote(
+    host: &str,
+    id: &str,
+    no_close: bool,
+    report: PipeStdinReport,
+) -> ExitCode {
     let args = RemoteArgs::pipe_stdin(id, no_close);
     let mut child = match ssh_spawn_piped_stdin(host, &args.as_str_slice()) {
         Ok(c) => c,
         Err(e) => {
-            return fail(
-                ErrorCode::Internal,
-                format!("failed to spawn pipe-stdin for {host}: {e}"),
-            );
+            if report == PipeStdinReport::Written {
+                return fail(
+                    ErrorCode::Internal,
+                    format!("failed to spawn pipe-stdin for {host}: {e}"),
+                );
+            }
+            return ExitCode::FAILURE;
         }
     };
 
     let mut remote_stdin = child.stdin.take().unwrap();
-    let mut local_stdin = std::io::stdin().lock();
-    // EPIPE means the remote command exited before consuming all of stdin —
-    // routine for something like `head`. Any other copy error is real.
-    if let Err(e) = std::io::copy(&mut local_stdin, &mut remote_stdin)
-        && e.kind() != std::io::ErrorKind::BrokenPipe
-    {
-        print_json_response(&Response::error_code(
-            rem_exec::protocol::ErrorCode::Internal,
-            format!("feeding stdin to {host}: {e}"),
-        ));
-        let _ = child.wait();
-        return ExitCode::FAILURE;
-    }
+    let copied = match copy_local_stdin_to_remote(&mut remote_stdin) {
+        Ok(copied) => copied,
+        Err(e) => {
+            drop(remote_stdin);
+            let _ = child.wait();
+            if report == PipeStdinReport::Written {
+                return print_pipe_error(Response::error_code(
+                    rem_exec::protocol::ErrorCode::Internal,
+                    format!("feeding stdin to {host}: {e}"),
+                ));
+            }
+            return ExitCode::FAILURE;
+        }
+    };
     drop(remote_stdin);
 
     // OpenSSH reserves 255 for its own failures (unreachable, auth, mux), while
@@ -624,19 +695,77 @@ fn pipe_local_stdin_to_remote(host: &str, id: &str, no_close: bool) -> ExitCode 
     // exits 1 on EPIPE against a short-lived remote command.
     match child.wait() {
         Ok(s) if s.code() == Some(255) => {
-            print_json_response(&Response::error_code(
-                rem_exec::protocol::ErrorCode::SshUnreachable,
-                format!("ssh to {host} failed while feeding stdin to process {id}"),
-            ));
+            if report == PipeStdinReport::Written {
+                return print_pipe_error(Response::error_code(
+                    rem_exec::protocol::ErrorCode::SshUnreachable,
+                    format!("ssh to {host} failed while feeding stdin to process {id}"),
+                ));
+            }
             ExitCode::FAILURE
         }
-        Ok(_) => ExitCode::SUCCESS,
+        Ok(s) if s.success() && !copied.broken_pipe => {
+            if report == PipeStdinReport::Written {
+                print_json_response(&Response::Written {
+                    bytes: copied.bytes as usize,
+                });
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(s) => {
+            if report == PipeStdinReport::Written {
+                return print_pipe_error(Response::error_code(
+                    rem_exec::protocol::ErrorCode::ProcessExited,
+                    format!(
+                        "process {id} on {host} did not accept piped stdin (rxd pipe-stdin exited with {s})"
+                    ),
+                ));
+            }
+            ExitCode::SUCCESS
+        }
         Err(e) => {
-            print_json_response(&Response::error_code(
-                rem_exec::protocol::ErrorCode::Internal,
-                format!("waiting for ssh to {host}: {e}"),
-            ));
+            if report == PipeStdinReport::Written {
+                return print_pipe_error(Response::error_code(
+                    rem_exec::protocol::ErrorCode::Internal,
+                    format!("waiting for ssh to {host}: {e}"),
+                ));
+            }
             ExitCode::FAILURE
+        }
+    }
+}
+
+fn preflight_piped_write(host: &str, id: &str) -> Option<ExitCode> {
+    let response =
+        match serve_request_auto_deploy(host, &Request::Status { id: id.to_string() }, &[]) {
+            Ok(response) => response,
+            Err(e) => {
+                let response = transport_error_json(host, &e);
+                print_json_response(&response);
+                return Some(exit_for(&response));
+            }
+        };
+
+    match response {
+        Response::Status { state, .. } if state == "running" => None,
+        Response::Status { state, .. } => {
+            let response = Response::error_code(
+                rem_exec::protocol::ErrorCode::ProcessExited,
+                format!("process {id} on {host} is {state}; cannot write stdin"),
+            );
+            print_json_response(&response);
+            Some(exit_for(&response))
+        }
+        response @ Response::Error { .. } => {
+            print_json_response(&response);
+            Some(exit_for(&response))
+        }
+        other => {
+            let response = Response::error_code(
+                rem_exec::protocol::ErrorCode::Internal,
+                format!("unexpected status response before piped write: {other:?}"),
+            );
+            print_json_response(&response);
+            Some(exit_for(&response))
         }
     }
 }
@@ -653,7 +782,7 @@ fn run_pipe_mode(host: &str, id: &str, response_data: &serde_json::Value) -> Exi
 
     // Thread 1: local stdin → remote stdin
     let stdin_thread = thread::spawn(move || {
-        pipe_local_stdin_to_remote(&host_stdin, &id_stdin, false);
+        pipe_local_stdin_to_remote(&host_stdin, &id_stdin, false, PipeStdinReport::Quiet);
     });
 
     // Main thread: remote stdout → local stdout
@@ -757,7 +886,12 @@ fn route_via_ssh(command: &Command) -> ExitCode {
                         run_pipe_mode(host, id, &data)
                     } else {
                         print_json_response(&response);
-                        pipe_local_stdin_to_remote(host, id, *no_close_stdin)
+                        pipe_local_stdin_to_remote(
+                            host,
+                            id,
+                            *no_close_stdin,
+                            PipeStdinReport::Quiet,
+                        )
                     }
                 }
                 _ => {
@@ -774,7 +908,10 @@ fn route_via_ssh(command: &Command) -> ExitCode {
             raw,
         } => {
             if input.is_none() && !std::io::stdin().is_terminal() {
-                return pipe_local_stdin_to_remote(host, id, true);
+                if let Some(exit) = preflight_piped_write(host, id) {
+                    return exit;
+                }
+                return pipe_local_stdin_to_remote(host, id, true, PipeStdinReport::Written);
             }
             let input = match input {
                 Some(s) => s,
@@ -1234,6 +1371,56 @@ impl StagedFile {
     }
 }
 
+fn get_temp_path(dir: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    dir.join(format!(".rxd-get-{suffix}.tmp"))
+}
+
+fn random_get_temp_suffix() -> std::io::Result<String> {
+    let a = rem_exec::process::generate_id()
+        .map_err(|e| std::io::Error::other(format!("generate temp name: {e}")))?;
+    let b = rem_exec::process::generate_id()
+        .map_err(|e| std::io::Error::other(format!("generate temp name: {e}")))?;
+    Ok(format!("{a}{b}"))
+}
+
+fn create_get_temp_with_suffix(
+    dir: &std::path::Path,
+    suffix: &str,
+) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let tmp = get_temp_path(dir, suffix);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)?;
+    Ok((tmp, file))
+}
+
+fn is_get_temp_name_collision(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::AlreadyExists || e.raw_os_error() == Some(libc::ELOOP)
+}
+
+fn create_get_temp(dir: &std::path::Path) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+    const ATTEMPTS: usize = 128;
+
+    for _ in 0..ATTEMPTS {
+        let suffix = random_get_temp_suffix()?;
+        match create_get_temp_with_suffix(dir, &suffix) {
+            Ok(created) => return Ok(created),
+            Err(e) if is_get_temp_name_collision(&e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not create a unique local staging file",
+    ))
+}
+
 /// Stream exactly `size` bytes into a private temp beside `dest` and fsync it.
 /// Any shortfall removes the temp and reports `Incomplete`.
 fn receive_to_temp<R: std::io::Read>(
@@ -1241,21 +1428,11 @@ fn receive_to_temp<R: std::io::Read>(
     dest: &std::path::Path,
     size: u64,
 ) -> Result<StagedFile, ReceiveError> {
-    use std::os::unix::fs::OpenOptionsExt;
-
     let dir = match dest.parent() {
         Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
         _ => std::path::PathBuf::from("."),
     };
-    let tmp = dir.join(format!(".rxd-get-{}.tmp", std::process::id()));
-
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&tmp)
-        .map_err(ReceiveError::Io)?;
+    let (tmp, mut f) = create_get_temp(&dir).map_err(ReceiveError::Io)?;
 
     let failed = |f: std::fs::File, tmp: &std::path::Path, e: ReceiveError| {
         drop(f);
@@ -1543,7 +1720,7 @@ fn route_via_daemon(command: &Command) -> ExitCode {
                         return run_pipe_mode(host, id, &data);
                     }
                     print_json(&data);
-                    pipe_local_stdin_to_remote(host, id, *no_close_stdin)
+                    pipe_local_stdin_to_remote(host, id, *no_close_stdin, PipeStdinReport::Quiet)
                 }
                 Ok(DaemonResponse::Error { message }) => {
                     let response = daemon_error_json(message);
@@ -1643,7 +1820,10 @@ fn route_via_daemon(command: &Command) -> ExitCode {
             raw,
         } => {
             if input.is_none() && !std::io::stdin().is_terminal() {
-                return pipe_local_stdin_to_remote(host, id, true);
+                if let Some(exit) = preflight_piped_write(host, id) {
+                    return exit;
+                }
+                return pipe_local_stdin_to_remote(host, id, true, PipeStdinReport::Written);
             }
             let input = match input {
                 Some(s) => s,
@@ -2379,6 +2559,19 @@ mod tests {
         dir
     }
 
+    fn staged_temp_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".rxd-get-") && name.ends_with(".tmp"))
+            })
+            .collect()
+    }
+
     /// receive + install, the way `get` composes them on the happy path.
     fn receive_file<R: std::io::Read>(
         src: &mut R,
@@ -2433,8 +2626,59 @@ mod tests {
             !dest.exists(),
             "no file must be installed after a short stream"
         );
-        let tmp = dir.join(format!(".rxd-get-{}.tmp", std::process::id()));
-        assert!(!tmp.exists(), "temp must be cleaned up");
+        assert!(
+            staged_temp_files(&dir).is_empty(),
+            "temp files must be cleaned up"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn receive_temp_creation_refuses_an_existing_symlink() {
+        let dir = test_dir("symlink");
+        let target = dir.join("target");
+        std::fs::write(&target, b"do not overwrite").unwrap();
+        let tmp = get_temp_path(&dir, "deadbeefdeadbeef");
+        std::os::unix::fs::symlink(&target, &tmp).unwrap();
+
+        let err = create_get_temp_with_suffix(&dir, "deadbeefdeadbeef").unwrap_err();
+
+        assert!(
+            is_get_temp_name_collision(&err),
+            "expected existing symlink to be refused, got {err}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not overwrite");
+        assert!(
+            std::fs::symlink_metadata(&tmp)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn receive_file_ignores_the_old_predictable_temp_name() {
+        let dir = test_dir("legacy-symlink");
+        let dest = dir.join("out.bin");
+        let target = dir.join("target");
+        std::fs::write(&target, b"do not overwrite").unwrap();
+        let legacy = dir.join(format!(".rxd-get-{}.tmp", std::process::id()));
+        std::os::unix::fs::symlink(&target, &legacy).unwrap();
+        let data = b"complete payload";
+        let mut src = Cursor::new(data.to_vec());
+
+        let n = receive_file(&mut src, &dest, data.len() as u64, 0o600).unwrap();
+
+        assert_eq!(n, data.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not overwrite");
+        assert!(
+            std::fs::symlink_metadata(&legacy)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

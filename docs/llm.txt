@@ -200,7 +200,8 @@ Notes:
 - stdout/stderr read from --offset and return at most --limit bytes (default
   1 MiB), so draining a large stream is a loop over --offset, not one call.
 - write TEXT appends a newline unless --raw. With TEXT omitted and stdin piped,
-  the stream is forwarded raw and unbounded (binary-safe). close-stdin sends EOF.
+  the stream is forwarded raw and unbounded (binary-safe); the command still
+  answers with one `written` or `error` JSON object afterward. close-stdin sends EOF.
 - start --pipe: local stdin → remote stdin and remote stdout → local stdout as
   raw bytes; the JSON handle is written to stderr.
 - The local daemon (daemon start|stop|status) is an optional accelerator that

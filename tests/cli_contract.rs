@@ -6,9 +6,11 @@
 //! by 0.3.1 — an agent that had been told to parse stdout got an empty stream
 //! and no way to tell *why* the call failed.
 //!
-//! Every case here is a client-side rejection: no host is contacted, so these
-//! run anywhere, with no network and no rxd.
+//! Most cases here are client-side rejections: no host is contacted, so they run
+//! anywhere, with no network and no rxd. The few transport-shaped cases install a
+//! fake `ssh` at the front of PATH and still never leave the machine.
 
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Output, Stdio};
 
@@ -224,6 +226,132 @@ fn piped_output_is_compact_without_being_asked() {
         stdout.trim().lines().count() > 1,
         "--pretty must win over the pipe default: {stdout}"
     );
+}
+
+fn fake_ssh_dir(script: &str, tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("rx-fake-ssh-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("fake ssh dir");
+    let ssh = dir.join("ssh");
+    std::fs::write(&ssh, script).expect("fake ssh script");
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700))
+        .expect("fake ssh executable");
+    dir
+}
+
+fn path_with_fake_ssh(fake: &std::path::Path) -> String {
+    let old = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{old}", fake.display())
+}
+
+fn rx_write_with_piped_stdin(fake: &std::path::Path, payload: &[u8], pipe_status: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rx"))
+        .args(["--compact", "write", "h", "deadbeef"])
+        .env("PATH", path_with_fake_ssh(fake))
+        .env("RX_FAKE_STATUS", "running")
+        .env("RX_FAKE_PIPE_STATUS", pipe_status)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("rx should be runnable");
+
+    child
+        .stdin
+        .take()
+        .expect("stdin should be piped")
+        .write_all(payload)
+        .expect("payload should be written to rx");
+    child.wait_with_output().expect("rx should exit")
+}
+
+fn fake_ssh_for_piped_write() -> &'static str {
+    r#"#!/bin/sh
+mode=""
+for arg in "$@"; do
+    if [ "$arg" = "serve" ]; then
+        mode="serve"
+    fi
+    if [ "$arg" = "pipe-stdin" ]; then
+        mode="pipe"
+    fi
+done
+
+if [ "$mode" = "serve" ]; then
+    read request
+    case "$RX_FAKE_STATUS" in
+        running)
+            printf '%s\n' '{"type":"status","id":"deadbeef","state":"running","cmd":"cat","started":1,"ended":null,"exit_code":null,"signal":null,"stdout_size":0,"stderr_size":0}'
+            exit 0
+            ;;
+        not_found)
+            printf '%s\n' '{"type":"error","message":"process not found: deadbeef","code":"process_not_found","retryable":false}'
+            exit 0
+            ;;
+    esac
+fi
+
+if [ "$mode" = "pipe" ]; then
+    cat >/dev/null
+    exit "${RX_FAKE_PIPE_STATUS:-0}"
+fi
+
+exit 99
+"#
+}
+
+#[test]
+fn piped_write_reports_one_written_object() {
+    let fake = fake_ssh_dir(fake_ssh_for_piped_write(), "write-ok");
+    let out = rx_write_with_piped_stdin(&fake, b"payload", "0");
+
+    assert_eq!(out.status.code(), Some(0));
+    let value: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("piped write must print one object");
+    assert_eq!(value["type"], "written", "{value}");
+    assert_eq!(value["bytes"], 7, "{value}");
+    assert!(
+        out.stderr.is_empty(),
+        "fake ssh wrote no stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(fake);
+}
+
+#[test]
+fn piped_write_remote_failure_is_a_typed_error_not_silent_success() {
+    let fake = fake_ssh_dir(fake_ssh_for_piped_write(), "write-fail");
+    let out = rx_write_with_piped_stdin(&fake, b"payload", "1");
+
+    assert_eq!(out.status.code(), Some(1));
+    let value: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("piped write failure must print one object");
+    assert_eq!(value["type"], "error", "{value}");
+    assert_eq!(value["code"], "process_exited", "{value}");
+    let _ = std::fs::remove_dir_all(fake);
+}
+
+#[test]
+fn piped_write_preflight_keeps_remote_error_codes() {
+    let fake = fake_ssh_dir(fake_ssh_for_piped_write(), "write-preflight");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rx"))
+        .args(["--compact", "write", "h", "deadbeef"])
+        .env("PATH", path_with_fake_ssh(&fake))
+        .env("RX_FAKE_STATUS", "not_found")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("rx should be runnable");
+    drop(child.stdin.take());
+    let out = child.wait_with_output().expect("rx should exit");
+
+    assert_eq!(out.status.code(), Some(1));
+    let value: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("preflight failure must print one object");
+    assert_eq!(value["type"], "error", "{value}");
+    assert_eq!(value["code"], "process_not_found", "{value}");
+    let _ = std::fs::remove_dir_all(fake);
 }
 
 /// The guide is the product of `rx skill`, so it is text — and it must say which
