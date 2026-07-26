@@ -63,13 +63,18 @@ pub fn parse_policy(value: &str) -> Option<DeployPolicy> {
 
 static POLICY: std::sync::OnceLock<DeployPolicy> = std::sync::OnceLock::new();
 
-/// Fix the policy for this process (from `--auto-deploy`). First call wins.
+/// Fix the policy for this process, overriding the environment. First call wins.
+///
+/// The programmatic equivalent of `RX_AUTO_DEPLOY`, for a library embedder that
+/// decides the policy itself. `rx` does not call it: the policy there is
+/// env-only by design, so the choice belongs to the harness rather than to each
+/// invocation.
 pub fn set_policy(policy: DeployPolicy) {
     let _ = POLICY.set(policy);
 }
 
-/// The effective policy: `--auto-deploy` if given, else `RX_AUTO_DEPLOY` (or
-/// the older `REM_EXEC_AUTO_DEPLOY`), else off.
+/// The effective policy: [`set_policy`] if it was called, else `RX_AUTO_DEPLOY`
+/// (or the older `REM_EXEC_AUTO_DEPLOY`), else off.
 pub fn policy() -> DeployPolicy {
     if let Some(p) = POLICY.get() {
         return *p;
@@ -233,7 +238,7 @@ fn cached_binary_path(version: &str, arch: &str) -> PathBuf {
 ///
 /// Fetching during an explicit `rx deploy` is not "auto" anything — it finishes
 /// the job that was asked for. It is refused when the caller says so
-/// (`--offline`, or an implicit deploy under `--auto-deploy=local`), and then
+/// (`--offline`, or an implicit deploy under `RX_AUTO_DEPLOY=local`), and then
 /// the error names the exact command that fills the cache.
 fn binary_for_arch(arch: &str, allow_fetch: bool) -> Result<PathBuf> {
     let version = own_version();
@@ -708,8 +713,8 @@ pub fn not_deployed_response(host: &str, status: &DeployStatus) -> Response {
     // host), so it names RX_AUTO_DEPLOY: pointing an agent at the older
     // REM_EXEC_* spelling teaches the name we are moving away from.
     Response::error_code(ErrorCode::NotDeployed, detail).with_hint(format!(
-        "run `rx deploy {host}` to install rxd {}; or --auto-deploy=on \
-         (env RX_AUTO_DEPLOY=on) to deploy during a command instead",
+        "run `rx deploy {host}` to install rxd {}; or set RX_AUTO_DEPLOY=on to \
+         deploy during a command instead",
         own_version(),
     ))
 }
@@ -797,15 +802,25 @@ mod tests {
     }
 
     #[test]
-    fn policy_parses_flag_values_and_the_legacy_env_form() {
-        assert_eq!(parse_policy("off"), Some(DeployPolicy::Off));
-        assert_eq!(parse_policy("local"), Some(DeployPolicy::Local));
-        assert_eq!(parse_policy("on"), Some(DeployPolicy::On));
+    fn policy_parses_every_accepted_env_spelling() {
+        // `RX_AUTO_DEPLOY` is the only way in now that `--auto-deploy` is gone,
+        // so this parser is the whole entry surface: clap used to reject a bad
+        // value before it could ever reach here.
+        for v in ["off", "0", "false", "no", "", "OFF", " off "] {
+            assert_eq!(parse_policy(v), Some(DeployPolicy::Off), "{v:?}");
+        }
+        for v in ["local", "cache", "LOCAL"] {
+            assert_eq!(parse_policy(v), Some(DeployPolicy::Local), "{v:?}");
+        }
         // REM_EXEC_AUTO_DEPLOY=1 kept meaning what it did in 0.2.x.
-        assert_eq!(parse_policy("1"), Some(DeployPolicy::On));
-        assert_eq!(parse_policy("0"), Some(DeployPolicy::Off));
-        assert_eq!(parse_policy(" On "), Some(DeployPolicy::On));
-        assert_eq!(parse_policy("sometimes"), None);
+        for v in ["on", "1", "true", "yes", " On "] {
+            assert_eq!(parse_policy(v), Some(DeployPolicy::On), "{v:?}");
+        }
+        // Unusable values yield None so the caller falls back to the default
+        // rather than guessing — a typo must never read as "on".
+        for v in ["sometimes", "offf", "2", "enable"] {
+            assert_eq!(parse_policy(v), None, "{v:?}");
+        }
         // Default is the careful one: hosts never change as a side effect.
         assert_eq!(DeployPolicy::default(), DeployPolicy::Off);
     }

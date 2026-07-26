@@ -61,32 +61,6 @@ fn compact_requested(compact: bool, pretty: bool) -> bool {
     }
 }
 
-/// `--auto-deploy`, as the CLI accepts it.
-///
-/// A separate type from [`rem_exec::deploy::DeployPolicy`] so the library does
-/// not grow a clap dependency. Being an enum rather than a parsed string is what
-/// puts the three choices in `--help` and makes an invalid one a parser error
-/// (exit 2) instead of something rx has to hand-check.
-#[derive(Clone, Copy, clap::ValueEnum)]
-enum AutoDeployArg {
-    /// Never deploy as a side effect of another command (default).
-    Off,
-    /// May deploy during another command, from the local cache only.
-    Local,
-    /// May fetch and deploy during another command.
-    On,
-}
-
-impl From<AutoDeployArg> for rem_exec::deploy::DeployPolicy {
-    fn from(arg: AutoDeployArg) -> Self {
-        match arg {
-            AutoDeployArg::Off => rem_exec::deploy::DeployPolicy::Off,
-            AutoDeployArg::Local => rem_exec::deploy::DeployPolicy::Local,
-            AutoDeployArg::On => rem_exec::deploy::DeployPolicy::On,
-        }
-    }
-}
-
 #[derive(Parser)]
 #[command(name = "rx")]
 #[command(version)]
@@ -118,11 +92,6 @@ struct Cli {
     /// Emit pretty-printed JSON (the default when stdout is a terminal)
     #[arg(long, global = true)]
     pretty: bool,
-    /// When rx may deploy rxd during another command. Env: RX_AUTO_DEPLOY (or
-    /// REM_EXEC_AUTO_DEPLOY). `rx deploy` is always allowed — this governs
-    /// whether a host can change as a side effect of something else.
-    #[arg(long, value_enum, value_name = "off|local|on", global = true)]
-    auto_deploy: Option<AutoDeployArg>,
 }
 
 // Declaration order is what `--help` shows. It runs in the order an agent
@@ -368,12 +337,12 @@ fn main() -> ExitCode {
         OBJECT_TO_STDERR.store(true, Ordering::Relaxed);
     }
 
-    // Fix the deploy policy before anything can act on it. Unset falls back to
-    // RX_AUTO_DEPLOY / REM_EXEC_AUTO_DEPLOY, then to "off" — rx never changes a
-    // host you did not point it at.
-    if let Some(arg) = cli.auto_deploy {
-        rem_exec::deploy::set_policy(arg.into());
-    }
+    // The deploy policy is read from RX_AUTO_DEPLOY where it is needed, and
+    // defaults to "off" — rx never changes a host you did not point it at.
+    // There is deliberately no flag: whether a fleet may self-heal is a property
+    // of the harness, not a decision to re-make on every call, and as a flag it
+    // was accepted-but-inert on `skill`, `cache` and `daemon`. Same reasoning as
+    // RX_CONNECT_TIMEOUT (see `ssh::connect_timeout`).
 
     // Validate every destination once, before anything is spawned. `--` in
     // ssh_command is what actually blocks option injection; this exists so a

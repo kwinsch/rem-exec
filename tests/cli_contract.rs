@@ -108,11 +108,11 @@ fn arguments_are_rejected_before_stdin_is_read() {
 fn unparseable_invocations_exit_two_with_empty_stdout() {
     for args in [
         vec!["bogus-subcommand"],
-        vec!["run"],                                // missing HOST and COMMAND
-        vec!["stdout", "host"],                     // missing ID
-        vec!["put", "--mode", "0644"],              // missing both positionals
-        vec!["--auto-deploy=bogus", "ping", "h"],   // not one of the three choices
-        vec!["--compact", "--pretty", "ping", "h"], // mutually exclusive
+        vec!["run"],                                         // missing HOST and COMMAND
+        vec!["stdout", "host"],                              // missing ID
+        vec!["put", "--mode", "0644"],                       // missing both positionals
+        vec!["run", "h", "--timeout", "soon", "--", "true"], // not a number
+        vec!["--compact", "--pretty", "ping", "h"],          // mutually exclusive
     ] {
         let out = rx(&args);
         assert_eq!(out.status.code(), Some(2), "for {args:?}");
@@ -255,11 +255,12 @@ fn expect_parse_error(args: &[&str]) -> serde_json::Value {
 
 #[test]
 fn parser_rejections_are_typed_objects_on_stderr() {
-    // An unknown subcommand, a missing required argument, a bad enum value and
-    // a surplus positional are one class of mistake and answer the same way.
+    // An unknown subcommand, a missing required argument, a value the parser
+    // cannot use and a surplus positional are one class of mistake and answer
+    // the same way.
     expect_parse_error(&["nosuchcommand"]);
     expect_parse_error(&["run"]);
-    expect_parse_error(&["--auto-deploy", "bogus", "ping", "h"]);
+    expect_parse_error(&["run", "h", "--timeout", "soon", "--", "true"]);
     expect_parse_error(&["ping", "h1", "h2"]);
     expect_parse_error(&["--nosuchflag"]);
 }

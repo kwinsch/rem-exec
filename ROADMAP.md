@@ -105,17 +105,20 @@ verbatim in rem-exec-vault):
 - JSON follows the destination — pretty on a terminal, compact otherwise, with
   `--compact`/`--pretty` and `RX_JSON` to force it. Nobody should have to know a
   flag exists to stop paying for indentation in a pipe.
-- `--auto-deploy` is a real enum: clap validates it, lists the three choices in
-  `--help`, and rejects a bad one as a usage error (exit 2, was 1).
+- `--auto-deploy` is gone: the deploy policy is `RX_AUTO_DEPLOY` only. It briefly
+  became a validated enum during 0.4.0 development, which is what exposed the
+  real problem — eight lines of it in all 18 subcommand helps, inert on four of
+  them. Whether hosts may change under you is a property of the environment, not
+  a per-call choice, so it follows `RX_CONNECT_TIMEOUT` and stays out of `--help`.
 - Env vars are guessable from the binary name: `RX_JSON`, `RX_DAEMON`,
-  `RX_AUTO_DEPLOY`. The `REM_EXEC_*` names still work.
+  `RX_AUTO_DEPLOY`, `RX_CONNECT_TIMEOUT`. The `REM_EXEC_*` names still work.
 - The guide is stamped with the version that shipped it, opens with the
   first-contact sequence (`ping` → `deploy` → work), states the stdin/TTY
   hazard, and names rxv — its secret-delivery example used to invoke a tool that
   does not exist.
 
 Breaking, and deliberate before 1.0: argument errors moved from stderr text to
-stdout JSON; `--auto-deploy=bogus` now exits 2; piped JSON is compact; `rx
+stdout JSON; an unusable argument value now exits 2; piped JSON is compact; `rx
 daemon` prints objects. `PROTOCOL_VERSION` is unchanged — the rx↔rxd wire did
 not move — but the version bump means `ping` reports `up_to_date:false` for a
 0.3.x rxd, so run `rx deploy` across the fleet after upgrading.
@@ -236,7 +239,8 @@ existing `skill` noun rather than a new `rx plugin` / `rx install` top-level:
 **Slice 4 — what an agent's error handling actually does with the answer.**
 Found by walking the same podman path with an external CLI review in hand. The
 review's presentation findings (top-level density, `--auto-deploy` spam on every
-subcommand help, clap prose inside `message`) are real and still open; these are
+subcommand help — since fixed by removing the flag — and clap prose inside
+`message`, still open) are real; these are
 the ones underneath them, where the response was not merely noisy but wrong.
 
 - **`put` reported caller errors as `internal`, which is retryable.** A missing
@@ -281,7 +285,11 @@ Breaking: `put` and `get` error *codes* changed for missing/unwritable paths
 (`internal` → `not_found`/`bad_request`) and those errors are no longer
 `retryable`. A caller branching on `code` sees a more accurate answer; one
 branching on `retryable` stops looping. BatchMode is a behaviour change for
-anyone relying on an interactive password prompt — use ssh-agent.
+anyone relying on an interactive password prompt — use ssh-agent. The
+`--auto-deploy` flag is REMOVED; `RX_AUTO_DEPLOY=off|local|on` is the only knob,
+so an invocation carrying the flag now exits 2. `rxd skill` is removed too — the
+guide describes rx, and shipping it inside the remote binary put 22 KB and a
+second copy on every host.
 
 **Scope guard for the rest of 0.4.x: no new top-level command.** The remaining
 work is fixing and pruning, and the surface is already the thing an agent has to
@@ -292,11 +300,16 @@ was fixed by reusing the mapping `get` already had, not by inventing a code.
 
 **Still open, roughly in the order they are worth doing:**
 
-1. **Presentation — the external review's findings, all verified.** The
-   `--auto-deploy` enum (14 lines) is dumped into *every* subcommand help,
-   including `rx skill --help`, which trains a reader to skip help entirely; it
-   should be visible at the top level only, with `RX_AUTO_DEPLOY` as the
-   agent-facing knob. Parser rejections carry clap prose inside `message`, with
+1. **Presentation — the external review's findings, all verified.**
+   ~~The `--auto-deploy` enum dumped into every subcommand help~~ — **done**:
+   the flag is gone and `RX_AUTO_DEPLOY` is the only knob. Top-level-only was
+   the other candidate and was rejected: it makes flag *position* load-bearing
+   (`rx run --auto-deploy=on` would start failing) for a caller that composes
+   command lines. Env-only follows the rule `RX_CONNECT_TIMEOUT` already sets —
+   a harness decision, not a per-call one — and it removes a flag that was
+   accepted-but-inert on `skill`, `cache`, `daemon` and `deploy`. It cost 8 of
+   the 21 lines of `rx skill --help`.
+   Parser rejections carry clap prose inside `message`, with
    `Usage:` duplicated into a field meant for one short sentence — the `code` is
    right, the text is not. The skill needs a choose-your-path table (`run` vs
    `start`+`wait` vs `start --pipe` vs `put`/`get`) near the top, and should say

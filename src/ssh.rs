@@ -320,8 +320,8 @@ fn parse_serve_output(output: Output) -> Result<Response> {
         .map_err(|e| RemExecError::Protocol(format!("invalid JSON from remote: {e}: {stdout}")))
 }
 
-/// [`serve_request`] with auto-deploy: when REM_EXEC_AUTO_DEPLOY=1 and the error
-/// looks like a missing/old rxd, deploy the correct binary and retry once.
+/// [`serve_request`] with auto-deploy: when `RX_AUTO_DEPLOY` permits it and the
+/// error looks like a missing/old rxd, deploy the correct binary and retry once.
 pub fn serve_request_auto_deploy(host: &str, request: &Request, body: &[u8]) -> Result<Response> {
     match serve_request(host, request, body) {
         Ok(resp) => Ok(resp),

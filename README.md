@@ -48,7 +48,7 @@ other.
 - **Bidirectional pipe mode** — `stdin→remote`, `remote stdout→local stdout`
 - **Deploy you control** — `rx deploy` detects the remote architecture and
   fetches the matching binary; deploying as a *side effect* of another command
-  is opt-in (`--auto-deploy`), off by default
+  is opt-in (`RX_AUTO_DEPLOY`), off by default
 - **Connection reuse** — SSH multiplexing across operations to a host
 - **Multi-arch** — static musl binaries for x86_64, aarch64, riscv64, armv7
 - **Embedded skill file** — `rx skill` prints complete machine-readable docs
@@ -120,19 +120,20 @@ rxv get host1/db_password | rx put - host:/run/secrets/db_pass --mode 0600
 ## Agent usage
 
 Point the agent at the target host; it runs `rx skill` once to learn the tool,
-then operates autonomously. Add `--auto-deploy=on` when the agent should also
+then operates autonomously. Set `RX_AUTO_DEPLOY=on` when the agent should also
 be allowed to install `rxd` on hosts it finds unprepared.
 
 ```bash
 rx run host -- doas apt-get -y update
-rx --auto-deploy=on run host -- doas apt-get -y update   # deploys rxd if needed
+RX_AUTO_DEPLOY=on rx run host -- doas apt-get -y update   # deploys rxd if needed
 ```
 
 By default `rx` never changes a host you did not point it at: a missing or
 mismatched `rxd` is reported as a typed `not_deployed` error naming the command
-that fixes it. `--auto-deploy=local` allows that repair from the local cache
-without any download; `=on` allows fetching too. The env var
-`RX_AUTO_DEPLOY` sets the same policy (`REM_EXEC_AUTO_DEPLOY` still works).
+that fixes it. `RX_AUTO_DEPLOY=local` allows that repair from the local cache
+without any download; `=on` allows fetching too. There is no flag for it: whether
+hosts may change under you belongs to the environment rx runs in, not to each
+invocation. (`REM_EXEC_AUTO_DEPLOY` still works.)
 
 ## Security notes
 

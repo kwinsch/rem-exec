@@ -121,7 +121,9 @@ observe, control, move files, local machinery.
   cache fetch [--version V] [--arch ARCH]... [--force]
   daemon start|stop|status
 
-Global: --compact, --pretty, --auto-deploy off|local|on
+Global: --compact, --pretty
+Env:    RX_AUTO_DEPLOY=off|local|on (see Deploy and connections), RX_JSON,
+        RX_DAEMON, RX_CONNECT_TIMEOUT
 
 Notes:
 - Everything after `--` is the remote argv. `--` is optional but disambiguates a
@@ -166,8 +168,9 @@ Notes:
   Scope: put guarantees "exactly what rx read landed, or nothing landed". It
   cannot tell a producer that finished from one that died mid-output — a pipe
   carries no exit status. Where that matters, write a file first and put that.
-- `put -` cannot be retried (stdin does not rewind). Under --auto-deploy=local|on
-  it settles that before reading a byte: it probes the host and deploys first.
+- `put -` cannot be retried (stdin does not rewind). Under
+  RX_AUTO_DEPLOY=local|on it settles that before reading a byte: it probes the
+  host and deploys first.
   Under the default (off) there is no probe — the transfer runs once and a
   mismatched host answers `not_deployed` afterwards. Nothing is installed
   remotely either way, but the producer HAS been read by then, so re-run the
@@ -294,16 +297,19 @@ connection.
 
 rx and rxd are two halves of one wire protocol, so the only correct rxd for a
 given rx is its own version — there is nothing separate to pin, and upgrading rx
-is what moves the pair. What --auto-deploy controls is when *hosts* change:
+is what moves the pair. What RX_AUTO_DEPLOY controls is when *hosts* change:
 
   off    (default) never deploy as a side effect; a mismatch is a typed
          not_deployed error naming the command that fixes it
   local  may deploy during another command, but only from the local cache
   on     may fetch and deploy during another command
 
-`rx deploy` is explicit and always allowed regardless of this setting. Env
-equivalent: RX_AUTO_DEPLOY=off|local|on (1/true still mean on; the older
-REM_EXEC_* names still work). rx never
+There is no flag for this, deliberately: whether hosts may change under you is a
+property of the environment rx runs in, not a decision to re-make per call —
+the same reasoning that keeps RX_CONNECT_TIMEOUT env-only. (1/true still mean
+on; the older REM_EXEC_AUTO_DEPLOY still works but is not the name to learn.)
+
+`rx deploy` is explicit and always allowed regardless of this setting. rx never
 downgrades a host that is ahead of it — by protocol or by version — without
 --allow-downgrade; that host belongs to a newer rx.
 
@@ -349,7 +355,7 @@ visible here rather than as a warning on every command — an older rxd is still
 correct for most requests, so ping is where you check a fleet.
 
 A missing or outdated remote is detected by probing rxd's `version` (its
-protocol), not by guessing from stderr. Under --auto-deploy=local|on rx deploys
+protocol), not by guessing from stderr. Under RX_AUTO_DEPLOY=local|on rx deploys
 the matching rxd and retries; otherwise you get a typed `not_deployed` error
 whose hint names the fix. rx never silently falls back to a plain SSH command.
 Note: protocol equality is what makes a host "current", so a same-protocol rxd
