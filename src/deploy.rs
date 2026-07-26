@@ -163,6 +163,10 @@ pub struct DeployResult {
     pub host: String,
     pub arch: String,
     pub version: String,
+    /// False when the host already ran this exact rxd and nothing was uploaded.
+    /// "Ensure rxd is current" is what a caller actually wants, and a fleet-wide
+    /// `rx deploy` should be able to say which hosts it touched.
+    pub changed: bool,
 }
 
 /// Result of preparing the local deploy cache from GitHub release assets.
@@ -236,7 +240,7 @@ fn binary_for_arch(arch: &str, allow_fetch: bool) -> Result<PathBuf> {
     }
     if !allow_fetch {
         return Err(RemExecError::Other(format!(
-            "no cached rxd {version} for {arch} at {} — run `rx setup --arch {arch}` \
+            "no cached rxd {version} for {arch} at {} — run `rx cache fetch --arch {arch}` \
              (needs network), or pass --binary PATH to deploy a local build",
             path.display(),
         )));
@@ -438,10 +442,10 @@ fn sha256_file(path: &Path) -> Result<String> {
 /// one. Only refuses when the remote is *provably* ahead: an unreadable version
 /// must not block an explicit deploy, which is the very thing that repairs a
 /// host in an unknown state.
-fn downgrade_refusal(host: &str) -> Option<String> {
+fn downgrade_refusal(host: &str, status: &DeployStatus) -> Option<String> {
     let own = env!("CARGO_PKG_VERSION");
-    match remote_deploy_status(host) {
-        DeployStatus::Incompatible { version, protocol } if protocol > PROTOCOL_VERSION => {
+    match status {
+        DeployStatus::Incompatible { version, protocol } if *protocol > PROTOCOL_VERSION => {
             Some(format!(
                 "refusing to downgrade {host}: it runs rxd {version} (protocol {protocol}), \
                  newer than this rx {own} (protocol {PROTOCOL_VERSION}) — upgrade rx, or pass \
@@ -475,13 +479,37 @@ pub fn deploy_to_host(host: &str) -> Result<DeployResult> {
 /// 5. SCP binary to remote
 /// 6. Verify with version check
 pub fn deploy_to_host_with(host: &str, opts: &DeployOpts) -> Result<DeployResult> {
+    // Probed once and reused by both the downgrade guard and the
+    // already-current check below, so idempotence costs no extra round trip.
+    let remote = remote_deploy_status(host);
+
     if !opts.allow_downgrade
-        && let Some(refusal) = downgrade_refusal(host)
+        && let Some(refusal) = downgrade_refusal(host, &remote)
     {
         return Err(RemExecError::Other(refusal));
     }
 
     let arch = detect_arch(host)?;
+
+    // Asking for a state that already holds is success, not work — the same
+    // rule `rx daemon start` and `rxv unlock` follow. Version equality is the
+    // test, not protocol equality: a same-protocol rxd can still be an older
+    // build carrying rxd-side fixes, which is exactly the skew `ping` reports.
+    //
+    // An explicit --binary always uploads. A local build can carry the same
+    // version string as the release and still be a different binary, and
+    // pushing it is the whole point of the flag.
+    if opts.binary.is_none()
+        && let DeployStatus::Current { version } = &remote
+        && version.trim_start_matches('v') == env!("CARGO_PKG_VERSION")
+    {
+        return Ok(DeployResult {
+            host: host.to_string(),
+            arch,
+            version: version.clone(),
+            changed: false,
+        });
+    }
     let local_binary = match &opts.binary {
         Some(path) => {
             if !path.exists() {
@@ -560,6 +588,7 @@ pub fn deploy_to_host_with(host: &str, opts: &DeployOpts) -> Result<DeployResult
         host: host.to_string(),
         arch,
         version,
+        changed: true,
     })
 }
 
@@ -577,7 +606,7 @@ fn verify_remote_version(host: &str) -> Result<String> {
                 return Err(RemExecError::Protocol(format!(
                     "deployed rxd {version} on {host} speaks protocol {protocol}, but rx \
                      {} needs {PROTOCOL_VERSION} — the deployed binary is not the matching \
-                     build (retry without --binary, or `rx setup --force`)",
+                     build (retry without --binary, or `rx cache fetch --force`)",
                     env!("CARGO_PKG_VERSION"),
                 )));
             }

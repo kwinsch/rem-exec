@@ -44,7 +44,9 @@ same way — use it if you want that, or keep whatever you already have.
 - Exit 0 = success · 1 = the call was understood and failed · 2 = the call was
   malformed (rejected by the argument parser, stdout empty). `run`/`wait` also
   propagate the remote command's status: `rx run HOST -- false` → exit 1, killed
-  by signal N → 128+N. The JSON is the source of truth.
+  by signal N → 128+N, and a command that never started (see exec_error) → 127,
+  so `rx run HOST -- missing-tool && next` does not run `next`. The JSON is the
+  source of truth.
 - A transport failure (unreachable host, auth) is the one case where the command
   never ran — it still prints a JSON `error` with a `code` on stdout and exits 1.
   Always read stdout JSON.
@@ -64,7 +66,9 @@ same way — use it if you want that, or keep whatever you already have.
 - JSON follows the destination: pretty on a terminal, compact otherwise. Force
   it with --compact / --pretty, or RX_JSON=compact|pretty.
 - Idempotence: asking for a state that already holds succeeds with
-  `"changed": false` (`rx daemon start` on a running daemon).
+  `"changed": false` (`rx daemon start` on a running daemon; `rx deploy` on a
+  host already running this exact rxd, which answers `status:"current"` and
+  uploads nothing).
 
 ## Model
 
@@ -95,7 +99,7 @@ that substrate:
   get   HOST:PATH LOCAL [--mode OCTAL]
   ping  HOST
   deploy HOST... [--binary PATH] [--offline] [--allow-downgrade]
-  setup [--version V] [--arch ARCH]... [--force]
+  cache fetch [--version V] [--arch ARCH]... [--force]
   skill
   daemon start|stop|status
 
@@ -194,9 +198,10 @@ stdout/stderr/data fields pair with an `encoding`:
   killed    {id}
   list      {processes:[{id, state, cmd}]}
   cleaned   {removed:[id...]}
-  deployed  {host, arch, version, status}            # one host
-            {hosts:[{host, status, code?, message?, retryable?, hint?}]}
-                                                     # several hosts
+  deployed  {host, arch, version, status, changed}   # one host
+            {hosts:[{host, status, changed?, code?, message?, retryable?,
+                     hint?}]}                        # several hosts
+  cache     {action, version, binaries:[{arch, path, sha256, status}]}
   version   {version, protocol}
   ping      {version, protocol, arch, os, kernel, hostname,
              distro_id?, distro_version?,
@@ -209,7 +214,8 @@ stdout/stderr/data fields pair with an `encoding`:
   found or wasn't executable) — then exit_code and signal are both null and
   stderr carries a `rx: exec …` line. Values: command_not_found · permission_denied
   · exec_format_error · errno_<n>. Branch on this to tell "the tool isn't there"
-  (install it, or use another) from "the tool ran and exited 127".
+  (install it, or use another) from "the tool ran and exited 127" — the JSON
+  distinguishes them even though rx exits 127 in both cases.
 - After an ephemeral completed run the process id is still in the response for
   logging, but status/stdout/stderr for that id return process_not_found.
 - state: running | exited(N) | signaled(N) | exited(killed) | exited(unknown) |
@@ -270,7 +276,7 @@ downgrades a host that is ahead of it — by protocol or by version — without
 --allow-downgrade; that host belongs to a newer rx.
 
 Only the controller (where rx runs) needs external tools — ssh for every
-operation, plus scp/curl/sha256sum for setup/deploy. The remote needs nothing
+operation, plus scp/curl/sha256sum for cache fetch/deploy. The remote needs nothing
 preinstalled: rxd is a single static binary. Those tools are resolved through
 PATH, so rx assumes a trusted PATH on the controller; it is a single-user
 machine by design.

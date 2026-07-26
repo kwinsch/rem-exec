@@ -146,18 +146,17 @@ rootless podman containers, see the note at the end of this section.
 - `retryable` is always serialized. It was omitted when false, so most errors
   lacked a field `docs/CONTRACT.md` advertises unconditionally.
 
-**Decided, not yet implemented:**
-- `rx run HOST -- /nonexistent` exits **0** with `exec_error:"command_not_found"`.
-  The JSON is honest but `rx run … && next-step` proceeds after a command that
-  never ran. → **exit 127.** "The process exit is a convenience" is fine; a
-  convenience that is actively wrong is worse than none.
-- `deploy` opts out of the contract's own idempotence rule: re-deploying a
-  current host reports `status:"deployed"` again with no `changed` marker, so a
-  caller cannot tell "installed it" from "already had it". → **`status:"current"`
-  with `changed:false` when the host already matches**, `"deployed"` /
-  `changed:true` when it did work.
-- `rx setup` is misnamed — it populates the local rxd binary cache, but reads
-  like mandatory bootstrap. → **`rx cache fetch`**, see below.
+**Landed — breaking, all three in one commit:**
+- `rx run HOST -- /nonexistent` exited **0** with `exec_error:"command_not_found"`,
+  so `rx run … && next-step` proceeded after a command that never ran. Now exits
+  **127**. A real exit 127 and a failed exec share the status but stay
+  distinguishable in the JSON, which remains the source of truth.
+- `deploy` is idempotent: a host already running this exact rxd answers
+  `status:"current"` with `changed:false` and uploads nothing. The check runs
+  before the binary is resolved, so an already-current host needs neither cache
+  nor network. An explicit `--binary` always uploads — a local build can carry
+  the same version string as the release and still be a different binary.
+- `rx setup` → **`rx cache fetch`**, a namespace from the start (see below).
 
 ### Local-machinery namespaces
 

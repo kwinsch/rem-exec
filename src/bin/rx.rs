@@ -289,8 +289,27 @@ enum Command {
         #[arg(long)]
         mode: Option<String>,
     },
-    /// Download static rxd binaries into the local deploy cache
-    Setup {
+    /// Manage the local cache of rxd binaries that `deploy` installs from
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+    /// Print skill file (machine-readable usage guide)
+    Skill,
+    /// Manage the local daemon (an opt-in read cache; direct SSH is the default)
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+}
+
+/// `cache` is a namespace rather than a single command because pruning is
+/// already planned; a leaf `rx cache` would have to become this later, and
+/// renaming twice is worse than naming it right once.
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Download static rxd binaries into the local cache
+    Fetch {
         /// Release tag or version (default: current rx version)
         #[arg(long)]
         version: Option<String>,
@@ -300,13 +319,6 @@ enum Command {
         /// Re-download even if the cached binary already matches SHA256SUMS
         #[arg(long)]
         force: bool,
-    },
-    /// Print skill file (machine-readable usage guide)
-    Skill,
-    /// Manage the local daemon (an opt-in read cache; direct SSH is the default)
-    Daemon {
-        #[command(subcommand)]
-        action: DaemonAction,
     },
 }
 
@@ -404,11 +416,13 @@ fn main() -> ExitCode {
         return do_get(remote, local, mode.as_deref());
     }
 
-    // Setup is always local: it populates the rxd deploy cache.
-    if let Command::Setup {
-        version,
-        arch,
-        force,
+    // Cache is always local: it populates the rxd binary cache deploy reads.
+    if let Command::Cache {
+        action: CacheAction::Fetch {
+            version,
+            arch,
+            force,
+        },
     } = &cli.command
     {
         return match rem_exec::deploy::setup_release_binaries(version.as_deref(), arch, *force) {
@@ -429,8 +443,11 @@ fn main() -> ExitCode {
                         })
                     })
                     .collect();
+                // `action` mirrors the `daemon` namespace, so a namespaced
+                // command answers the same way wherever one appears.
                 print_json(&serde_json::json!({
-                    "type": "setup",
+                    "type": "cache",
+                    "action": "fetch",
                     "version": result.version,
                     "binaries": binaries,
                 }));
@@ -780,7 +797,7 @@ fn route_via_ssh(command: &Command) -> ExitCode {
         | Command::Ping { .. }
         | Command::Get { .. }
         | Command::Put { .. }
-        | Command::Setup { .. }
+        | Command::Cache { .. }
         | Command::Skill
         | Command::Daemon { .. } => unreachable!("handled before routing"),
     }
@@ -855,11 +872,15 @@ fn do_deploy(
     let mut failed = false;
     for host in hosts {
         match rem_exec::deploy::deploy_to_host_with(host, &opts) {
+            // "current" means the host already ran this exact rxd and nothing
+            // was uploaded; "deployed" means it did work. `changed` carries the
+            // same distinction in the form the rest of the contract uses.
             Ok(result) => results.push(serde_json::json!({
                 "host": result.host,
                 "arch": result.arch,
                 "version": result.version,
-                "status": "deployed",
+                "status": if result.changed { "deployed" } else { "current" },
+                "changed": result.changed,
             })),
             Err(e) => {
                 failed = true;
@@ -1544,7 +1565,7 @@ fn route_via_daemon(command: &Command) -> ExitCode {
         | Command::Ping { .. }
         | Command::Get { .. }
         | Command::Put { .. }
-        | Command::Setup { .. }
+        | Command::Cache { .. }
         | Command::Skill
         | Command::Daemon { .. } => unreachable!("handled before routing"),
     };
@@ -1600,7 +1621,7 @@ fn command_hosts(command: &Command) -> Vec<&str> {
         Command::Put { remote, .. } | Command::Get { remote, .. } => {
             host_of(remote).into_iter().collect()
         }
-        Command::Daemon { .. } | Command::Setup { .. } | Command::Skill => Vec::new(),
+        Command::Daemon { .. } | Command::Cache { .. } | Command::Skill => Vec::new(),
     }
 }
 
@@ -1612,15 +1633,29 @@ fn exit_for(response: &Response) -> ExitCode {
     }
 }
 
+/// Exit status for a command that never started, following the shell
+/// convention for "command not found".
+///
+/// exec failure used to exit 0: the JSON said `exec_error:"command_not_found"`
+/// while the process reported success, so `rx run HOST -- missing-tool &&
+/// next-step` ran the next step. The JSON stays the source of truth, but a
+/// convenience that is actively wrong is worse than no convenience.
+const EXEC_FAILED_EXIT: u8 = 127;
+
 /// Exit code for a `run`: propagate the remote command's exit status so
 /// `rx run host false` behaves like a normal command runner. Agents still read
 /// the structured result from the JSON.
 fn run_exit(response: &Response) -> ExitCode {
     match response {
         Response::Completed {
-            exit_code, signal, ..
+            exit_code,
+            signal,
+            exec_error,
+            ..
         } => {
-            if let Some(code) = exit_code {
+            if exec_error.is_some() {
+                ExitCode::from(EXEC_FAILED_EXIT)
+            } else if let Some(code) = exit_code {
                 ExitCode::from((*code).clamp(0, 255) as u8)
             } else if let Some(sig) = signal {
                 ExitCode::from((128 + *sig).clamp(0, 255) as u8)
@@ -1635,6 +1670,10 @@ fn run_exit(response: &Response) -> ExitCode {
 
 fn run_exit_from_value(data: &serde_json::Value) -> ExitCode {
     if data.get("type").and_then(|v| v.as_str()) == Some("completed") {
+        // Checked before exit_code/signal, which are both null in this case.
+        if data.get("exec_error").is_some_and(|v| !v.is_null()) {
+            return ExitCode::from(EXEC_FAILED_EXIT);
+        }
         if let Some(code) = data.get("exit_code").and_then(|v| v.as_i64()) {
             return ExitCode::from(code.clamp(0, 255) as u8);
         }
@@ -1657,7 +1696,7 @@ fn transport_error_json(host: &str, e: &rem_exec::error::RemExecError) -> Respon
         return Response::error_code(code, message);
     }
     // A failed auto-deploy already carries the precise reason (e.g. a missing
-    // local cache → "run `rx setup` first"); surface it verbatim instead of
+    // local cache → "run `rx cache fetch` first"); surface it verbatim instead of
     // re-probing into a generic not_deployed.
     if message.contains("auto-deploy to ") {
         return Response::error_code(rem_exec::protocol::ErrorCode::NotDeployed, message);
@@ -1737,6 +1776,72 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::os::unix::fs::PermissionsExt;
+
+    fn completed(exit_code: Option<i32>, signal: Option<i32>, exec_error: Option<&str>) -> Response {
+        Response::Completed {
+            id: "abcdef01".into(),
+            exit_code,
+            signal,
+            exec_error: exec_error.map(str::to_string),
+            duration_ms: 1,
+            stdout: String::new(),
+            stdout_encoding: rem_exec::protocol::Encoding::Utf8,
+            stderr: String::new(),
+            stderr_encoding: rem_exec::protocol::Encoding::Utf8,
+            stdout_size: 0,
+            stderr_size: 0,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        }
+    }
+
+    /// A command that never started must not look like success to a shell.
+    /// `rx run HOST -- missing-tool && next-step` used to run `next-step`.
+    #[test]
+    fn exec_failure_exits_127_not_zero() {
+        let response = completed(None, None, Some("command_not_found"));
+        assert_eq!(
+            format!("{:?}", run_exit(&response)),
+            format!("{:?}", ExitCode::from(127u8))
+        );
+    }
+
+    /// A real exit 127 and a failed exec share an exit status but stay
+    /// distinguishable in the JSON, which is the source of truth.
+    #[test]
+    fn a_genuine_exit_127_is_still_propagated() {
+        let response = completed(Some(127), None, None);
+        assert_eq!(
+            format!("{:?}", run_exit(&response)),
+            format!("{:?}", ExitCode::from(127u8))
+        );
+    }
+
+    #[test]
+    fn ordinary_statuses_are_unaffected_by_the_exec_failure_path() {
+        for (code, signal, want) in [(Some(0), None, 0u8), (Some(1), None, 1), (None, Some(9), 137)]
+        {
+            assert_eq!(
+                format!("{:?}", run_exit(&completed(code, signal, None))),
+                format!("{:?}", ExitCode::from(want)),
+                "exit_code={code:?} signal={signal:?}"
+            );
+        }
+    }
+
+    /// The daemon path reads the same shape out of a JSON value and must agree
+    /// with `run_exit`, or the exit status would depend on RX_DAEMON.
+    #[test]
+    fn the_value_path_agrees_about_exec_failure() {
+        let data = serde_json::json!({
+            "type": "completed", "exit_code": null, "signal": null,
+            "exec_error": "command_not_found",
+        });
+        assert_eq!(
+            format!("{:?}", run_exit_from_value(&data)),
+            format!("{:?}", ExitCode::from(127u8))
+        );
+    }
 
     #[test]
     fn daemon_opt_in_requires_an_explicit_truthy_value() {

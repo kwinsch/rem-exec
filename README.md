@@ -60,17 +60,17 @@ other.
 cargo install rem-exec
 
 # Download static rxd binaries for remote deployment.
-rx setup
+rx cache fetch
 ```
 
 `rx deploy HOST` downloads the matching `rxd` release asset itself if the local
-cache lacks it, so `rx setup` is only needed to pre-seed a cache — before
+cache lacks it, so `rx cache fetch` is only needed to pre-seed a cache — before
 travelling to a site with no internet, or to warm all architectures at once:
 
 ```bash
-rx setup                  # cache every supported rxd architecture
-rx setup --arch x86_64    # one architecture
-rx setup --version v0.1.0 # a specific release
+rx cache fetch                  # cache every supported rxd architecture
+rx cache fetch --arch x86_64    # one architecture
+rx cache fetch --version v0.1.0 # a specific release
 
 rx deploy host1 host2                   # several hosts in one call
 rx deploy host --offline                # refuse to download; use the cache only
@@ -82,7 +82,7 @@ can never deploy the previous version's binary.
 
 `rx` runs locally. `rxd` is the binary copied to remote hosts by `rx deploy` and
 auto-deploy. Only the controller needs external tools installed — `ssh` for
-every operation, plus `scp`/`curl`/`sha256sum` for setup and deploy; the remote
+every operation, plus `scp`/`curl`/`sha256sum` for `cache fetch` and deploy; the remote
 needs nothing but the single static `rxd` binary.
 
 ## Quick start
@@ -175,7 +175,7 @@ Communication flows over SSH. No custom ports, no daemons to manage on the remot
 
 - crates.io: `cargo install rem-exec`
 - GitHub Releases: static `rx` and `rxd` binaries for x86_64, aarch64, riscv64, and armv7
-- Auto-deploy cache: `~/.local/share/rem-exec/bin/rxd-{arch}` (`rx setup`)
+- Auto-deploy cache: `~/.local/share/rem-exec/bin/rxd-{arch}` (`rx cache fetch`)
 
 Release downloads include `SHA256SUMS`. Verify downloaded assets before use in
 production workflows.
