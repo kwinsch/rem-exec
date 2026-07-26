@@ -283,11 +283,41 @@ Breaking: `put` and `get` error *codes* changed for missing/unwritable paths
 branching on `retryable` stops looping. BatchMode is a behaviour change for
 anyone relying on an interactive password prompt — use ssh-agent.
 
-**Still open (minor):** `rx daemon status` reports `changed:false` on a pure
-query, where the field means nothing. rx orders the error envelope
-`type,message,code,…` while rxv uses `type,code,message,…` — `docs/CONTRACT.md`
-shows rxv's order, and `preserve_order` exists precisely so the same error reads
-the same way in both tools.
+**Scope guard for the rest of 0.4.x: no new top-level command.** The remaining
+work is fixing and pruning, and the surface is already the thing an agent has to
+get past — 18 commands where the daily path is three. Anything shaped like
+`rx which` or `skill install` waits for 0.5.0 and gets argued on its own merits
+there. New *error codes* are held to the same test: `put`'s misclassification
+was fixed by reusing the mapping `get` already had, not by inventing a code.
+
+**Still open, roughly in the order they are worth doing:**
+
+1. **Presentation — the external review's findings, all verified.** The
+   `--auto-deploy` enum (14 lines) is dumped into *every* subcommand help,
+   including `rx skill --help`, which trains a reader to skip help entirely; it
+   should be visible at the top level only, with `RX_AUTO_DEPLOY` as the
+   agent-facing knob. Parser rejections carry clap prose inside `message`, with
+   `Usage:` duplicated into a field meant for one short sentence — the `code` is
+   right, the text is not. The skill needs a choose-your-path table (`run` vs
+   `start`+`wait` vs `start --pipe` vs `put`/`get`) near the top, and should say
+   outright that most work is `run` + `put`/`get` and the nine process verbs are
+   the advanced section. `daemon` should be demoted in both help and skill: it is
+   opt-in behind `RX_DAEMON`, does not handle ping/put/get, and sitting beside
+   `run` overstates it.
+2. **`rx daemon status` reports `changed:false` on a pure query**, where the
+   field means nothing.
+3. **The error envelope's key order differs between the tools** — rx emits
+   `type,message,code,…`, rxv `type,code,message,…`, and `docs/CONTRACT.md`
+   shows rxv's. `preserve_order` was adopted precisely so the same error reads
+   the same way in both; it does not yet.
+
+**Deliberately not doing:** renaming `get`/`status`/`list` for symmetry between
+the tools (natural in each domain, and the collision is documented at the top of
+`rxv skill`), and namespacing the process verbs under `rx proc`. The density is
+real, but `cache`/`daemon`/`skill install` are *local-machine* namespaces —
+`proc` would split the top level on a second axis while lengthening the
+most-typed debugging commands. Treat it as a help-text problem first; revisit
+only if item 1 does not fix the feel.
 
 **Release hygiene:** `dist/` is untracked staging and the publish step globs it,
 so a leftover set ships under the new tag — which nearly happened: the whole
