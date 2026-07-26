@@ -1261,6 +1261,29 @@ fn commit_temp(
     Ok(())
 }
 
+/// Turn a LOCAL filesystem failure during `get` into a typed response.
+///
+/// These deliberately do not travel as `RemExecError::Io` to
+/// [`transport_error_json`]: the remote answered correctly and the failure is on
+/// this machine. Routing them through the transport classifier dropped the
+/// `code` entirely — the one shape `docs/CONTRACT.md` tells callers to branch on
+/// — and paid a `remote_deploy_status` round trip to diagnose a local directory.
+fn local_io_error_json(local: &str, e: &std::io::Error) -> Response {
+    let resp = Response::error_code(
+        rem_exec::protocol::io_error_code(e),
+        format!("cannot write {local}: {e}"),
+    );
+    match e.kind() {
+        std::io::ErrorKind::NotFound => resp.with_hint(
+            "the local parent directory does not exist — create it, or pick another path",
+        ),
+        std::io::ErrorKind::PermissionDenied => {
+            resp.with_hint("no write permission for that local path — pick another destination")
+        }
+        _ => resp,
+    }
+}
+
 /// Download HOST:PATH to a local file, streaming and atomic, with the same
 /// completeness guarantee as `cp`. Honors auto-deploy like other commands.
 fn do_get(remote: &str, local: &str, mode: Option<&str>) -> ExitCode {
@@ -1334,7 +1357,7 @@ fn do_get(remote: &str, local: &str, mode: Option<&str>) -> ExitCode {
                     }
                     Err(ReceiveError::Io(e)) => {
                         let _ = child.wait();
-                        return Err(rem_exec::error::RemExecError::Io(e));
+                        return Ok(local_io_error_json(local, &e));
                     }
                 };
 
@@ -1379,7 +1402,7 @@ fn do_get(remote: &str, local: &str, mode: Option<&str>) -> ExitCode {
                         mode: Some(rem_exec::protocol::octal_mode(applied)),
                     }),
                     Err(ReceiveError::Incomplete { .. }) => unreachable!("commit cannot be short"),
-                    Err(ReceiveError::Io(e)) => Err(rem_exec::error::RemExecError::Io(e)),
+                    Err(ReceiveError::Io(e)) => Ok(local_io_error_json(local, &e)),
                 }
             }
             _ => Err(rem_exec::error::RemExecError::Protocol(
@@ -1722,7 +1745,10 @@ fn transport_error_json(host: &str, e: &rem_exec::error::RemExecError) -> Respon
     ) {
         return rem_exec::deploy::not_deployed_response(host, &status);
     }
-    Response::error(message)
+    // Nothing classified it, but every error still carries a code: `internal` is
+    // the contract's "no better answer available", and an agent that switches on
+    // `code` must never fall through to `undefined`.
+    Response::error_code(rem_exec::protocol::ErrorCode::Internal, message)
 }
 
 /// Classify a daemon-relayed error message. The daemon already forwarded the
@@ -1731,7 +1757,7 @@ fn transport_error_json(host: &str, e: &rem_exec::error::RemExecError) -> Respon
 fn daemon_error_json(message: String) -> Response {
     match rem_exec::ssh::classify_ssh_failure(&message) {
         Some(code) => Response::error_code(code, message),
-        None => Response::error(message),
+        None => Response::error_code(rem_exec::protocol::ErrorCode::Internal, message),
     }
 }
 
@@ -1909,6 +1935,40 @@ mod tests {
             format!("{:?}", run_exit(&response)),
             format!("{:?}", ExitCode::from(127u8))
         );
+    }
+
+    /// A local write failure during `get` is not a transport problem. It used to
+    /// travel as `RemExecError::Io` into `transport_error_json`, which fell
+    /// through to an error with NO `code` — the single field both skills tell
+    /// callers to branch on — after paying a `remote_deploy_status` probe to
+    /// diagnose a directory on this machine.
+    #[test]
+    fn a_local_get_failure_is_typed_and_names_the_local_path() {
+        use std::io::{Error, ErrorKind};
+
+        let missing = local_io_error_json("/no/such/dir/f", &Error::from(ErrorKind::NotFound));
+        let value = serde_json::to_value(&missing).unwrap();
+        assert_eq!(value["code"], "not_found", "{value}");
+        assert_eq!(value["retryable"], false, "{value}");
+        assert!(value["message"].as_str().unwrap().contains("/no/such/dir/f"));
+        assert!(value["hint"].is_string(), "{value}");
+
+        let denied = local_io_error_json("/etc/f", &Error::from(ErrorKind::PermissionDenied));
+        let value = serde_json::to_value(&denied).unwrap();
+        assert_eq!(value["code"], "bad_request", "{value}");
+        assert_eq!(value["retryable"], false, "{value}");
+    }
+
+    /// The contract advertises `code` unconditionally. `Response::error()` — the
+    /// only constructor that could omit it — is gone, so this pins the one path
+    /// that used it: a transport failure nothing else could classify.
+    #[test]
+    fn an_unclassifiable_transport_failure_still_carries_a_code() {
+        let response = daemon_error_json("something the classifier has never seen".into());
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["type"], "error", "{value}");
+        assert_eq!(value["code"], "internal", "{value}");
+        assert!(value.get("retryable").is_some(), "{value}");
     }
 
     /// A real exit 127 and a failed exec share an exit status but stay

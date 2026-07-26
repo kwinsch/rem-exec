@@ -249,16 +249,16 @@ fn serve_get(path: &str) -> ExitCode {
 }
 
 /// Map a file-open error to a typed response for the `get` header.
+///
+/// The codes come from the shared [`crate::protocol::io_error_code`] mapping, so
+/// `get` and `put` answer the same OS condition with the same code; only the
+/// message is phrased for reading.
 fn get_open_error(path: &str, e: &std::io::Error) -> Response {
     use std::io::ErrorKind;
-    match e.kind() {
-        ErrorKind::NotFound => {
-            Response::error_code(ErrorCode::NotFound, format!("no such file: {path}"))
-        }
-        ErrorKind::PermissionDenied => Response::error_code(
-            ErrorCode::BadRequest,
-            format!("cannot read {path}: permission denied"),
-        ),
-        _ => Response::error_code(ErrorCode::Internal, format!("open {path}: {e}")),
-    }
+    let message = match e.kind() {
+        ErrorKind::NotFound => format!("no such file: {path}"),
+        ErrorKind::PermissionDenied => format!("cannot read {path}: permission denied"),
+        _ => format!("open {path}: {e}"),
+    };
+    Response::error_code(crate::protocol::io_error_code(e), message)
 }

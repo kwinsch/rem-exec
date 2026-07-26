@@ -842,6 +842,61 @@ fn get_missing_file_is_typed_not_found() {
     assert!(body.is_empty(), "an error header carries no body");
 }
 
+/// A missing parent directory is permanent and the caller's to fix. It used to
+/// answer `internal` — which `retryable()` reports as true — so the one class of
+/// put failure that can never succeed was the one rx told agents to retry.
+/// `get` of a missing file has always answered `not_found`; the two halves of
+/// the documented pair now classify the same OS condition the same way.
+#[test]
+fn put_into_a_missing_directory_is_typed_not_found_and_not_retryable() {
+    let runtime = Runtime::new("put-missing-dir");
+    let target = runtime.dir.join("no-such-dir").join("out.conf");
+
+    let resp = runtime.serve(
+        json!({"action": "put", "path": target.to_str().unwrap()}),
+        b"payload",
+    );
+
+    assert_eq!(resp["type"], "error", "{resp}");
+    assert_eq!(resp["code"], "not_found", "{resp}");
+    assert_eq!(resp["retryable"], false, "{resp}");
+    assert!(
+        resp["hint"].as_str().unwrap_or_default().contains("mkdir"),
+        "the hint must name the command that fixes it: {resp}"
+    );
+    assert!(!target.exists());
+}
+
+/// EACCES is equally permanent, and equally not `internal`.
+///
+/// The precondition is checked rather than assumed: root ignores these mode
+/// bits, so the test would otherwise pass a writable directory to rxd and
+/// silently assert nothing.
+#[test]
+fn put_into_an_unwritable_directory_is_typed_and_not_retryable() {
+    let runtime = Runtime::new("put-unwritable-dir");
+    let locked = runtime.dir.join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+
+    if fs::write(locked.join(".probe"), b"").is_ok() {
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        return; // running as root — the mode bits do not bind
+    }
+
+    let resp = runtime.serve(
+        json!({"action": "put", "path": locked.join("out.conf").to_str().unwrap()}),
+        b"payload",
+    );
+
+    // Restore before asserting so a failure cannot leave an undeletable dir.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(resp["type"], "error", "{resp}");
+    assert_eq!(resp["code"], "bad_request", "{resp}");
+    assert_eq!(resp["retryable"], false, "{resp}");
+}
+
 #[test]
 fn get_directory_is_rejected() {
     let runtime = Runtime::new("get-dir");

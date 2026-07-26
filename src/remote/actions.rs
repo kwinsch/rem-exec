@@ -486,10 +486,27 @@ fn install_file(
         {
             Ok(f) => f,
             Err(e) => {
-                return Response::error_code(
-                    ErrorCode::Internal,
+                // The temp file is created beside the target, so this is the
+                // first thing that touches the destination directory: a missing
+                // parent or an unwritable one surfaces here, and both are the
+                // caller's to fix rather than something a retry resolves.
+                let resp = Response::error_code(
+                    crate::protocol::io_error_code(&e),
                     format!("create temp file in {}: {e}", dir.display()),
                 );
+                return match e.kind() {
+                    std::io::ErrorKind::NotFound => resp.with_hint(format!(
+                        "{} does not exist — create it first, e.g. `rx run HOST -- mkdir -p {}`",
+                        dir.display(),
+                        dir.display()
+                    )),
+                    std::io::ErrorKind::PermissionDenied => resp.with_hint(format!(
+                        "the SSH user cannot write {} — choose a writable path, or run rxd \
+                         privileged (deploy+invoke via doas)",
+                        dir.display()
+                    )),
+                    _ => resp,
+                };
             }
         };
         match fill(&mut f) {
@@ -509,7 +526,10 @@ fn install_file(
         && let Err(e) = fs::set_permissions(&tmp, fs::Permissions::from_mode(m))
     {
         let _ = fs::remove_file(&tmp);
-        return Response::error_code(ErrorCode::Internal, format!("chmod failed: {e}"));
+        return Response::error_code(
+            crate::protocol::io_error_code(&e),
+            format!("chmod failed: {e}"),
+        );
     }
 
     if (owner.is_some() || group.is_some())
@@ -528,7 +548,10 @@ fn install_file(
 
     if let Err(e) = fs::rename(&tmp, target) {
         let _ = fs::remove_file(&tmp);
-        return Response::error_code(ErrorCode::Internal, format!("rename to {path}: {e}"));
+        return Response::error_code(
+            crate::protocol::io_error_code(&e),
+            format!("rename to {path}: {e}"),
+        );
     }
 
     // The file contents are fsynced above; fsync the directory too so the

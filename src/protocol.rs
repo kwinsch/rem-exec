@@ -455,17 +455,27 @@ pub enum DaemonResponse {
     Error { message: String },
 }
 
-impl Response {
-    /// Create an untyped error response.
-    pub fn error(msg: impl Into<String>) -> Self {
-        Response::Error {
-            message: msg.into(),
-            code: None,
-            retryable: false,
-            hint: None,
-        }
+/// Classify a filesystem error into the code a caller branches on.
+///
+/// ENOENT and EACCES are permanent and caller-fixable — a missing parent
+/// directory does not appear on a retry, and neither does permission. Both used
+/// to land on `Internal` at most call sites, which [`ErrorCode::retryable`]
+/// reports as `true`, so the answers that could never succeed were exactly the
+/// ones rx told the caller to try again. Only genuinely unclassified failures
+/// stay `Internal`.
+///
+/// Call sites format their own message: `no such file: /etc/app.conf` reads
+/// better than the raw `os error 2`, and the code is the part that is stable.
+pub fn io_error_code(e: &std::io::Error) -> ErrorCode {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::NotFound => ErrorCode::NotFound,
+        ErrorKind::PermissionDenied => ErrorCode::BadRequest,
+        _ => ErrorCode::Internal,
     }
+}
 
+impl Response {
     /// Create a typed error response; `retryable` is derived from the code.
     pub fn error_code(code: ErrorCode, msg: impl Into<String>) -> Self {
         Response::Error {
