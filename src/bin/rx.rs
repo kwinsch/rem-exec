@@ -21,6 +21,15 @@ const INLINE_STDIN_CAP: usize = 4 * 1024 * 1024;
 /// Set once at startup from [`compact_requested`].
 static COMPACT_JSON: AtomicBool = AtomicBool::new(false);
 
+/// Process-wide switch: this invocation's stdout carries raw bytes, so the JSON
+/// object goes to stderr. Set once at startup from [`object_goes_to_stdout`].
+///
+/// A switch rather than three careful call sites. `start --pipe` failed on
+/// stdout from the host check, the transport classifier and the rxd error arm
+/// alike, and each was individually plausible — the guarantee only holds if it
+/// is structural, so every object this binary prints goes through [`emit_json`].
+static OBJECT_TO_STDERR: AtomicBool = AtomicBool::new(false);
+
 /// `RX_JSON`, or the older `REM_EXEC_JSON`, normalized.
 fn json_env() -> Option<String> {
     std::env::var("RX_JSON")
@@ -124,7 +133,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// The full guide: commands, response shapes, error codes (agent-oriented,
-    /// ~390 lines — pipe it to a pager)
+    /// ~400 lines — pipe it to a pager)
     Skill,
     /// Probe reachability + host identity (rxd version, OS, kernel, arch, distro)
     Ping {
@@ -142,7 +151,7 @@ enum Command {
         /// Never download; deploy only what the local cache already has
         #[arg(long)]
         offline: bool,
-        /// Allow replacing an rxd that speaks a newer protocol than this rx
+        /// Allow replacing an rxd that is ahead of this rx — by protocol or by version
         #[arg(long)]
         allow_downgrade: bool,
     },
@@ -352,6 +361,13 @@ fn main() -> ExitCode {
         COMPACT_JSON.store(true, Ordering::Relaxed);
     }
 
+    // Fixed before the host check below, which is the first thing that can
+    // print — under `--pipe` an object on stdout lands in the consumer's byte
+    // stream, which is the failure `docs/CONTRACT.md` exists to prevent.
+    if !object_goes_to_stdout(&cli.command) {
+        OBJECT_TO_STDERR.store(true, Ordering::Relaxed);
+    }
+
     // Fix the deploy policy before anything can act on it. Unset falls back to
     // RX_AUTO_DEPLOY / REM_EXEC_AUTO_DEPLOY, then to "off" — rx never changes a
     // host you did not point it at.
@@ -507,7 +523,7 @@ fn main() -> ExitCode {
         if daemon::is_running() {
             route_via_daemon(&cli.command)
         } else {
-            eprintln!("note: REM_EXEC_DAEMON set but no daemon running — using direct SSH");
+            eprintln!("note: RX_DAEMON set but no daemon running — using direct SSH");
             route_via_ssh(&cli.command)
         }
     } else {
@@ -638,9 +654,11 @@ fn pipe_local_stdin_to_remote(host: &str, id: &str, no_close: bool) -> ExitCode 
 }
 
 /// Bidirectional pipe mode: stdin→remote stdin, remote stdout→local stdout.
-/// JSON response goes to stderr so stdout carries only data.
+/// The handle goes to stderr — via [`emit_json`] like every other object, so
+/// this path is not a second mechanism that can drift from the first — and
+/// stdout carries only data.
 fn run_pipe_mode(host: &str, id: &str, response_data: &serde_json::Value) -> ExitCode {
-    eprintln!("{}", serde_json::to_string(response_data).unwrap_or_default());
+    print_json(response_data);
 
     let host_stdin = host.to_string();
     let id_stdin = id.to_string();
@@ -1818,8 +1836,30 @@ fn daemon_error_json(message: String) -> Response {
     }
 }
 
+/// Which stream this command's JSON object goes to.
+///
+/// stdout carries the *product*. For almost every command the product is the
+/// object itself; for `start --pipe` it is the remote process's bytes, so the
+/// object — the handle on success, the typed error on failure — goes to stderr
+/// instead and stdout stays byte-clean. rxv applies the same rule to `get`.
+///
+/// `start` WITHOUT `--pipe` is not an exception: it forwards local stdin but
+/// never puts remote stdout on ours, so its object belongs on stdout.
+fn object_goes_to_stdout(command: &Command) -> bool {
+    !matches!(command, Command::Start { pipe: true, .. })
+}
+
+/// Print one JSON object to the stream [`object_goes_to_stdout`] assigns it.
+fn emit_json(text: &str) {
+    if OBJECT_TO_STDERR.load(Ordering::Relaxed) {
+        eprintln!("{text}");
+    } else {
+        println!("{text}");
+    }
+}
+
 fn print_json_response(response: &Response) {
-    println!("{}", render_json(response));
+    emit_json(&render_json(response));
 }
 
 /// Collapse a multi-line rendering into one line for a JSON string field.
@@ -1935,7 +1975,7 @@ fn fail_hint(code: ErrorCode, message: impl Into<String>, hint: impl Into<String
 }
 
 fn print_json(value: &serde_json::Value) {
-    println!("{}", render_json(value));
+    emit_json(&render_json(value));
 }
 
 /// Serialize a value as JSON, honoring the process-wide compact/pretty choice.

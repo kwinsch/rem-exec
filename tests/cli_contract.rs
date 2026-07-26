@@ -181,6 +181,40 @@ fn skill_prints_the_guide_stamped_with_its_version() {
     );
 }
 
+/// `start --pipe` puts the remote process's bytes on stdout, so NOTHING else may
+/// go there — the same rule `rxv get` holds, and for the same reason: whatever
+/// consumes the pipe would otherwise receive a JSON error object as data.
+///
+/// This failed in 0.4.0. The success path wrote its handle to stderr correctly,
+/// but every failure — the host check before dispatch, the transport
+/// classifier, and an error answered by rxd — went to stdout. Each site looked
+/// right on its own, which is why the routing is now one switch rather than
+/// three decisions.
+#[test]
+fn a_piped_start_never_writes_an_object_to_stdout() {
+    for args in [
+        // Rejected by the host check in main, before anything is dispatched.
+        vec!["start", "--pipe", "bad host", "--", "true"],
+        // Rejected inside the start arm, after dispatch and before any SSH.
+        vec!["start", "--pipe", "h", "--env", "NOEQUALS", "--", "true"],
+    ] {
+        let out = rx(&args);
+        assert_eq!(out.status.code(), Some(1), "expected exit 1 for {args:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "stdout carries the process stream and must stay byte-empty for \
+             {args:?}, got {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let value: serde_json::Value = serde_json::from_str(stderr.trim())
+            .unwrap_or_else(|e| panic!("stderr must be one typed object for {args:?}: {e}"));
+        assert_eq!(value["type"], "error", "for {args:?}");
+        assert!(value["code"].is_string(), "code is always present: {value}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Discovery vs. operations.
 //

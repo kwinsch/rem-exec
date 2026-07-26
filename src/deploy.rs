@@ -453,7 +453,7 @@ fn downgrade_refusal(host: &str, status: &DeployStatus) -> Option<String> {
             ))
         }
         DeployStatus::Current { version } | DeployStatus::Incompatible { version, .. } => {
-            is_newer_than_own(&version).then(|| {
+            is_newer_than_own(version).then(|| {
                 format!(
                     "refusing to downgrade {host}: it runs rxd {version}, newer than this rx \
                      {own} — upgrade rx, or pass --allow-downgrade to overwrite it anyway"
