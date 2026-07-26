@@ -3,6 +3,14 @@
 This guide ships with rx {{VERSION}} and describes that binary. `rx --version`
 tells you what is installed; check it before reporting behaviour.
 
+Two separate tools, either usable on its own:
+
+  rx   — rem-exec        run commands and move files on remote hosts, over SSH
+  rxv  — rem-exec-vault  hold secrets, age-encrypted, unlocked in the keyring
+
+Neither requires the other. They share one output contract, so an agent that has
+learned one already reads the other: `rx skill`, `rxv skill`.
+
 Read this whole file once; it is short and complete. It describes capabilities,
 not a mandatory workflow — compose the commands as the task needs.
 
@@ -11,9 +19,7 @@ task. Prefer rx when you want its edges: verbatim argv/stdin (nothing to quote),
 structured exit/signal/error results, or detach-and-reattach. For running a
 command and needing its exit code or clean output, rx beats ad-hoc `ssh host
 '…'`. rx has no secret store of its own and no dependency on one: `put -` takes
-whatever a pipeline hands it — `pass`, `op read`, `sops -d`, or rxv
-(`rxv skill`), a separate tool built to this same contract, so its output and
-errors read the way rx's do.
+whatever a pipeline hands it — `pass`, `op read`, `sops -d`, `rxv get`, a script.
 
 ## Start here
 
