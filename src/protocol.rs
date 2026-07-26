@@ -176,6 +176,12 @@ pub enum ErrorCode {
     /// installed locally. Synthesized by rx from the remote exit status; rxd
     /// never emits this on the wire.
     FileChanged,
+    /// `deploy` could not install rxd: the release asset is missing from the
+    /// download source, the cache lacks it under `--offline`, or the upload
+    /// failed for a reason that is not an SSH transport error (those keep their
+    /// own codes). Not retryable — a release that 404s does not appear on a
+    /// second attempt, and the hint names the fixes that do work.
+    DeployFailed,
     /// Unexpected internal failure.
     Internal,
 }
@@ -327,15 +333,15 @@ pub enum Response {
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         code: Option<ErrorCode>,
-        #[serde(default, skip_serializing_if = "is_false")]
+        // Always serialized, even when false. Omitting it made `retryable`
+        // absent on most errors, so a caller reading the documented error shape
+        // had to treat "missing" and "false" as the same thing — and the
+        // contract advertises the field unconditionally.
+        #[serde(default)]
         retryable: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hint: Option<String>,
     },
-}
-
-fn is_false(b: &bool) -> bool {
-    !*b
 }
 
 /// Render permission bits the way `--mode` accepts them (`0600`), so what a

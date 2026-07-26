@@ -658,7 +658,7 @@ pub fn remote_deploy_status(host: &str) -> DeployStatus {
 
 /// Build the actionable "remote rxd needs (re)deploying" error for the CLI to
 /// print as JSON. Names the remote's state and both ways to fix it, so an agent
-/// deploys (or sets REM_EXEC_AUTO_DEPLOY) rather than falling back to raw ssh.
+/// deploys (or sets RX_AUTO_DEPLOY) rather than falling back to raw ssh.
 pub fn not_deployed_response(host: &str, status: &DeployStatus) -> Response {
     let detail = match status {
         DeployStatus::Incompatible { version, protocol } => format!(
@@ -666,17 +666,92 @@ pub fn not_deployed_response(host: &str, status: &DeployStatus) -> Response {
         ),
         _ => format!("rxd is missing or unversioned on {host}"),
     };
+    // One named fix first, the alternative second — the shape `empty_stream`
+    // uses. This is the most-seen hint in the tool (every first contact with a
+    // host), so it names RX_AUTO_DEPLOY: pointing an agent at the older
+    // REM_EXEC_* spelling teaches the name we are moving away from.
     Response::error_code(ErrorCode::NotDeployed, detail).with_hint(format!(
-        "run `rx deploy {host}` — it installs rxd {}, fetching it if the local cache lacks it; \
-         or pass --auto-deploy=on (env REM_EXEC_AUTO_DEPLOY=on) to let rx do that during a \
-         command instead of failing",
+        "run `rx deploy {host}` to install rxd {}; or --auto-deploy=on \
+         (env RX_AUTO_DEPLOY=on) to deploy during a command instead",
         own_version(),
     ))
+}
+
+/// Collapse a subprocess's multi-line stderr into one line.
+///
+/// curl and scp report failures across several lines and with a trailing
+/// newline; embedded in a JSON string that renders as `\n` in the middle of a
+/// compact one-line object, which is exactly where a caller is reading it.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Turn a failed deploy into the same typed error shape every other command
+/// produces.
+///
+/// A deploy failure used to be reported as `{"type":"deployed",
+/// "status":"failed","error":"<raw curl output>"}` — a failure wearing a
+/// success type, with no `code` to branch on, on the one path every new host
+/// must cross. SSH-level failures keep their own codes (and therefore their own
+/// retryability) by reusing the classifier the rest of rx uses, so an
+/// unreachable host reports `ssh_unreachable` here exactly as it would
+/// anywhere else.
+pub fn deploy_error_response(host: &str, err: &RemExecError) -> Response {
+    if let RemExecError::Ssh(detail) = err
+        && let Some(code) = crate::ssh::classify_ssh_failure(detail)
+    {
+        return Response::error_code(code, one_line(&format!("deploy to {host} failed: {detail}")));
+    }
+    Response::error_code(
+        ErrorCode::DeployFailed,
+        one_line(&format!("deploy to {host} failed: {err}")),
+    )
+    .with_hint(
+        "pass --binary PATH to push a local rxd build, or --offline to use only \
+         what the deploy cache already has",
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deploy_failure_is_a_typed_error_not_a_deployed_object() {
+        let err = RemExecError::Other("failed to download SHA256SUMS: curl: (22) 404\n".into());
+        let response = deploy_error_response("host1", &err);
+        let json = serde_json::to_value(&response).expect("serializes");
+
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["code"], "deploy_failed");
+        // A release that 404s does not appear on a second attempt.
+        assert_eq!(json["retryable"], false);
+        assert!(json["hint"].as_str().expect("hint").contains("--binary"));
+    }
+
+    /// The message reaches the caller as one line: a compact JSON object is
+    /// what an agent reads, and a raw `\n` in the middle of it is noise.
+    #[test]
+    fn deploy_failure_message_is_collapsed_to_one_line() {
+        let err = RemExecError::Other("failed to download:\ncurl: (22) 404\n".into());
+        let response = deploy_error_response("host1", &err);
+        let json = serde_json::to_value(&response).expect("serializes");
+
+        let message = json["message"].as_str().expect("message");
+        assert!(!message.contains('\n'), "message must be one line: {message:?}");
+    }
+
+    /// An unreachable host is not a deploy problem, and saying `deploy_failed`
+    /// would send an agent looking for a missing release instead of retrying.
+    #[test]
+    fn ssh_transport_failures_keep_their_own_code_during_deploy() {
+        let err = RemExecError::Ssh("ssh: Could not resolve hostname host1".into());
+        let response = deploy_error_response("host1", &err);
+        let json = serde_json::to_value(&response).expect("serializes");
+
+        assert_eq!(json["code"], "ssh_unreachable");
+        assert_eq!(json["retryable"], true);
+    }
 
     #[test]
     fn policy_parses_flag_values_and_the_legacy_env_form() {
@@ -805,7 +880,10 @@ mod tests {
                 assert!(message.contains("protocol 1"), "{message}");
                 let hint = hint.expect("hint present");
                 assert!(hint.contains("rx deploy host1"), "{hint}");
-                assert!(hint.contains("REM_EXEC_AUTO_DEPLOY"), "{hint}");
+                // The most-seen hint in the tool must teach the current env
+                // name, not the one being retired.
+                assert!(hint.contains("RX_AUTO_DEPLOY"), "{hint}");
+                assert!(!hint.contains("REM_EXEC_AUTO_DEPLOY"), "{hint}");
             }
             other => panic!("expected error response, got {other:?}"),
         }

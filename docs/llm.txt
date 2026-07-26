@@ -194,12 +194,15 @@ stdout/stderr/data fields pair with an `encoding`:
   killed    {id}
   list      {processes:[{id, state, cmd}]}
   cleaned   {removed:[id...]}
+  deployed  {host, arch, version, status}            # one host
+            {hosts:[{host, status, code?, message?, retryable?, hint?}]}
+                                                     # several hosts
   version   {version, protocol}
   ping      {version, protocol, arch, os, kernel, hostname,
              distro_id?, distro_version?,
              local_version, up_to_date, hint?}
   daemon    {action, running, changed, pid?, detail?}   # daemon start|stop|status
-  error     {message, code?, retryable?, hint?}
+  error     {message, code?, retryable, hint?}   # retryable is always present
 
 - run and wait yield completed or running. exit_code is null when signal is set.
 - exec_error is present only when the command never started (the binary wasn't
@@ -222,7 +225,7 @@ stdout/stderr/data fields pair with an `encoding`:
   bad_request · invalid_process_id · process_not_found · process_exited ·
   timeout · not_deployed · unsupported · ssh_unreachable · ssh_auth ·
   not_found · incomplete_transfer · empty_stream · bad_host · file_changed ·
-  internal
+  deploy_failed · internal
 
 Branch on code, not message text. `retryable:true` means the same call may
 succeed on retry (e.g. after an auto-deploy, or a transient ssh_unreachable).
@@ -275,6 +278,16 @@ machine by design.
 deploy uploads to a temp name and renames over ~/.local/bin/rxd, so a failed
 transfer cannot leave a truncated binary and a currently-running rxd does not
 block the install (an in-place write would fail with ETXTBSY).
+
+Deploying ONE host that fails answers with a plain `error` object like any other
+command — `deploy_failed` when the binary could not be obtained (no such release
+asset, or nothing cached under --offline), or the usual `ssh_unreachable` /
+`ssh_auth` when the transport is what broke. `deploy_failed` is not retryable:
+its hint names the fixes that work (`--binary PATH` to push a local build,
+`--offline` to use only the cache). Deploying SEVERAL hosts keeps the `deployed`
+aggregate, since some may have succeeded, and each failed entry carries the same
+code/retryable/hint — check `status` per host and exit 1 means at least one
+failed.
 
 `ping` is the preflight: one round trip tells you the host is reachable, what
 rxd version/protocol it runs, and what it is (os/kernel/arch/distro) — enough to

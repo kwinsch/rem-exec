@@ -863,22 +863,46 @@ fn do_deploy(
             })),
             Err(e) => {
                 failed = true;
+                let response = rem_exec::deploy::deploy_error_response(host, &e);
+
+                // Deploying one host is the first-contact case, and it answers
+                // with the same typed error every other command produces —
+                // rather than a `type:"deployed"` object with `status:"failed"`
+                // inside it, which is a failure an agent has to be taught to
+                // recognize.
+                if hosts.len() == 1 {
+                    print_json_response(&response);
+                    return ExitCode::FAILURE;
+                }
+
+                // A batch keeps the per-host aggregate (some hosts succeeded),
+                // but each failure carries the same code/retryable/hint as the
+                // single-host error instead of a bare message string.
                 eprintln!("error: {host}: {e}");
-                results.push(serde_json::json!({
-                    "host": host,
-                    "status": "failed",
-                    "error": e.to_string(),
-                }));
+                let mut entry = serde_json::json!({"host": host, "status": "failed"});
+                if let (Some(obj), Ok(serde_json::Value::Object(fields))) =
+                    (entry.as_object_mut(), serde_json::to_value(&response))
+                {
+                    for key in ["code", "message", "retryable", "hint"] {
+                        if let Some(value) = fields.get(key) {
+                            obj.insert(key.to_string(), value.clone());
+                        }
+                    }
+                }
+                results.push(entry);
             }
         }
     }
 
     // One host stays a flat object; several become a list, so the common case
-    // reads exactly as it did before.
+    // reads exactly as it did before. `type` is inserted first so it leads the
+    // object once key order is preserved.
     if let [only] = results.as_slice() {
-        let mut value = only.clone();
-        if let Some(obj) = value.as_object_mut() {
-            obj.insert("type".into(), serde_json::json!("deployed"));
+        let mut value = serde_json::json!({"type": "deployed"});
+        if let (Some(obj), Some(fields)) = (value.as_object_mut(), only.as_object()) {
+            for (key, field) in fields {
+                obj.insert(key.clone(), field.clone());
+            }
         }
         print_json(&value);
     } else {

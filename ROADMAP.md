@@ -122,6 +122,128 @@ not move — but the version bump means `ping` reports `up_to_date:false` for a
 
 Everything below is proposed, not committed. Ordered by agent-experience value.
 
+## 0.4.x CLI polish (before any 0.5.0 bump)
+
+The 0.4.0 line is where CLI structure gets polished; no 0.4.0 artefacts are
+public, so breaking changes are still free here. Findings came from walking the
+documented first-contact path (`ping` → `deploy` → `run`) against real hosts —
+rootless podman containers, see the note at the end of this section.
+
+**Landed (uncommitted at time of writing):**
+- Deploy failures are typed. A single-host failure is a plain `error` object
+  with `deploy_failed` (or `ssh_unreachable`/`ssh_auth` when the transport is
+  what broke); a batch keeps the aggregate with typed per-host entries. It used
+  to report `{"type":"deployed","status":"failed","error":"<raw curl>"}` — a
+  failure wearing a success type, with no code to branch on, on the one path
+  every new host must cross.
+- `type` leads every response (`serde_json` `preserve_order`). `json!()` sorted
+  keys while struct-derived responses did not, so the identical `not_deployed`
+  error read two different ways on `ping` and `run` — commands one and two of a
+  first-time agent's experience.
+- `not_deployed`'s hint names `RX_AUTO_DEPLOY`, not the retired `REM_EXEC_*`
+  spelling, and is one line instead of a 200-char run-on. It is the most-seen
+  hint in the tool.
+- `retryable` is always serialized. It was omitted when false, so most errors
+  lacked a field `docs/CONTRACT.md` advertises unconditionally.
+
+**Decided, not yet implemented:**
+- `rx run HOST -- /nonexistent` exits **0** with `exec_error:"command_not_found"`.
+  The JSON is honest but `rx run … && next-step` proceeds after a command that
+  never ran. → **exit 127.** "The process exit is a convenience" is fine; a
+  convenience that is actively wrong is worse than none.
+- `deploy` opts out of the contract's own idempotence rule: re-deploying a
+  current host reports `status:"deployed"` again with no `changed` marker, so a
+  caller cannot tell "installed it" from "already had it". → **`status:"current"`
+  with `changed:false` when the host already matches**, `"deployed"` /
+  `changed:true` when it did work.
+- `rx setup` is misnamed — it populates the local rxd binary cache, but reads
+  like mandatory bootstrap. → **`rx cache fetch`**, see below.
+
+### Local-machinery namespaces
+
+Three things are local-machine concerns rather than remote operations: the rxd
+binary cache, the read-cache daemon, and (planned) installing rx's guide into an
+agent harness. `daemon` is already a noun namespace with verb subcommands; the
+other two should match, so the top-level list stays short and the shape is
+predictable:
+
+    rx cache  fetch [--version V] [--arch A]... [--force]
+              prune                                   # planned, see below
+    rx daemon start | stop | status
+    rx skill  [install [--harness auto|claude-code|…]] # planned, see below
+
+`setup` → `cache fetch` is a namespace from the start rather than a leaf that
+gets converted later — cache pruning is already on this roadmap, so renaming to
+a leaf `rx cache` now would buy a second breaking change when prune lands.
+Nothing is published, so this is the free window for exactly one break.
+
+**Harness plugin install (planned).** A command that detects an agent harness
+(Claude Code and similar) and installs rx's guide into it, so an agent picks up
+rx as a skill without being told about it by hand. This belongs under the
+existing `skill` noun rather than a new `rx plugin` / `rx install` top-level:
+
+- The artifact IS the skill — `rx skill` already means exactly this content.
+  A second noun for the same artifact fragments it, and "plugin" overclaims
+  where harnesses distinguish the two (in Claude Code a plugin is a bundle that
+  may *contain* skills, commands, agents, MCP servers; what rx ships is one
+  skill).
+- `rx install` is out: it sits next to `rx deploy`, which installs rxd on remote
+  hosts, and the two would read as variants of one another.
+- Bare `rx skill` keeps printing and stays effect-free. Installation is an
+  explicit verb the caller has to type — the same discovery-must-not-have-
+  effects rule that removed the implicit unlock from bare `rxv`. Auto-detection
+  chooses *where* to install, never *whether*, which is the
+  no-implicit-mutation stance applied to the local machine.
+- Open questions for the design: whether install is idempotent-by-default and
+  reports `changed` like the rest of the contract (it should); whether it writes
+  a version marker so a stale installed guide can be detected after an rx
+  upgrade (`ping` already treats version skew as a first-class concern, and a
+  guide that describes an older binary is the same class of problem); and
+  whether `--harness auto` refusing on an unrecognized harness is a typed error
+  with a hint naming the explicit flag (yes).
+
+**Open — no decision needed, just work:**
+- Scope the contract to *operations, not discovery*. `CONTRACT.md:20` claims
+  "no exceptions", then the document itself carves out two (exit-2 has empty
+  stdout; `skill` prints bytes) and a third exists unwritten (`--version`
+  prints `rx 0.4.0` while `llm.txt` tells agents to call it). Naming the
+  discovery surface — `--help`, `-h`, `help`, `--version`, `skill`, bare
+  invocation — makes the agent-facing invariant genuinely absolute instead of
+  nominally absolute with silent carve-outs. Contract text is shared verbatim
+  with rem-exec-vault; change both in the same release.
+- Type the parser's own rejections. 0.4.0 typed the 19 argument errors rx checks
+  itself but left clap's (unknown flag, missing arg) as prose — same class of
+  mistake, two shapes, and the untyped one is hit more often. Split by clap
+  error kind: `DisplayHelpOnMissingArgumentOrSubcommand` (bare `rx`) stays plain
+  help with no JSON, so a human's first keystroke is not answered with a JSON
+  blob; everything else gets a typed object **on stderr**, keeping stdout
+  byte-empty so `rxv get | rx put -` safety holds unconditionally.
+- `--help` command order contradicts its own "Start here": `ping`/`deploy` are
+  13th and 12th, below `close-stdin` and `clean`. Suggested:
+  `skill · ping deploy · run start wait · status stdout stderr list clean ·
+  write close-stdin kill · put get · setup daemon`.
+- `--help`'s after_help says "Secrets live in rxv, the companion vault", which
+  overstates a coupling `CONTRACT.md:3` is at pains to deny. `--help` is the
+  highest-traffic surface making the strongest dependency claim. Match
+  `llm.txt`: any producer works, rx needs none of them.
+- `deploy`'s help still says "rem-execd" (`bin/rx.rs`), as do doc comments in
+  `deploy.rs` and `daemon/stream.rs`. Everything else says `rxd`.
+- `skill`'s command description ("Print skill file") is jargon to a human
+  admin. Name the audience and the size; add the repo URL to after_help, since
+  someone who unpacked a release tarball has no README beside it.
+- Minor: `rx status HOST <malformed-id>` validates remotely, so the error
+  depends on host reachability — deterministic locally would cost one round
+  trip less. `rx daemon status` reports `changed:false` on a pure query.
+
+**Release hygiene:** `dist/rxd-x86_64` is stale — it deploys **0.3.0** against
+0.4.0 source. Rebuild before any release.
+
+**Test hosts:** rootless podman, two distros so `ping`'s distro detection is
+exercised for real. rx shells out to bare `ssh`/`scp` with no `-F` and no option
+escape hatch, so point it at non-default ports with a PATH shim (`bin/ssh`,
+`bin/scp` execing the real binary with `-F <test config>`) rather than editing
+`~/.ssh/config`. Leaves no residue.
+
 ## Next
 
 ### Declared capabilities instead of inferred compatibility
