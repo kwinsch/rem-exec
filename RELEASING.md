@@ -12,6 +12,22 @@ carry assets whose hashes match — build and checksum *before* publishing.
 - rustup targets: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `riscv64gc-unknown-linux-musl`, `armv7-unknown-linux-musleabihf`
 - `.cargo/config.toml` sets the per-target musl linkers.
 
+## Gate (before anything irreversible)
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+Formatting is stock rustfmt — no `rustfmt.toml`, so `cargo fmt` is whatever the
+installed toolchain does and a contributor's editor agrees with it out of the
+box. Adopted in 0.4.0; before that the tree was hand-formatted, so `git log`
+crosses one mechanical reformat (see `.git-blame-ignore-revs`).
+
+`tests/rxd_integration.rs` drives a real `rxd` over the local filesystem, so it
+runs here without a remote host.
+
 ## Build (all arches, fully static)
 
 Always build with `crt-static` forced. Without it, **riscv64gc-musl links
