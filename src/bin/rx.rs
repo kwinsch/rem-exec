@@ -2067,16 +2067,11 @@ fn daemon_error_json(message: String) -> Response {
 fn classify_transport_message(message: &str) -> Option<Response> {
     if let Some(code) = rem_exec::ssh::classify_ssh_failure(message) {
         let response = Response::error_code(code, message.to_string());
-        // rx runs ssh with BatchMode=yes, so this is now always a refusal rather
-        // than a prompt nobody answered. Name the fix: the credential has to be
-        // one ssh can use unattended.
-        return Some(if code == rem_exec::protocol::ErrorCode::SshAuth {
-            response.with_hint(
-                "rx never prompts — load the key into ssh-agent (`ssh-add`), or use a key \
-                 usable without a passphrase; verify with `ssh -o BatchMode=yes HOST true`",
-            )
-        } else {
-            response
+        // The hint belongs to the code, not to this call site: `deploy` reports
+        // the same failures and must name the same fix.
+        return Some(match rem_exec::ssh::transport_hint(code) {
+            Some(hint) => response.with_hint(hint),
+            None => response,
         });
     }
     // A failed auto-deploy already carries the precise reason (e.g. a missing

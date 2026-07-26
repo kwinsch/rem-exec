@@ -774,10 +774,16 @@ pub fn deploy_error_response(host: &str, err: &RemExecError) -> Response {
     if let RemExecError::Ssh(detail) = err
         && let Some(code) = crate::ssh::classify_ssh_failure(detail)
     {
-        return Response::error_code(
+        let response = Response::error_code(
             code,
             one_line(&format!("deploy to {host} failed: {detail}")),
         );
+        // The transport's own fix, not deploy's: `--binary`/`--offline` say
+        // nothing useful about a refused host key or an unusable credential.
+        return match crate::ssh::transport_hint(code) {
+            Some(hint) => response.with_hint(hint),
+            None => response,
+        };
     }
 
     let message = one_line(&format!("deploy to {host} failed: {err}"));

@@ -244,6 +244,53 @@ fn path_with_fake_ssh(fake: &std::path::Path) -> String {
     format!("{}:{old}", fake.display())
 }
 
+/// A refused host key is the default first-contact failure, and it must not be
+/// retryable.
+///
+/// rx runs ssh with `BatchMode=yes`, which turns ssh's default
+/// `StrictHostKeyChecking=ask` into a refusal — so *every* host the controller
+/// has not seen before fails this way, on the first command of the documented
+/// `ping` → `deploy` → work sequence. It used to answer `not_deployed`
+/// (deploy forever into the same wall), then `internal` + `retryable:true`
+/// (retry forever). Both told an agent to loop on something only an operator
+/// can clear.
+#[test]
+fn a_refused_host_key_is_typed_and_not_retryable() {
+    let script = "#!/bin/sh\n\
+                  echo 'No ED25519 host key is known for [127.0.0.1]:2201 and you have \
+                  requested strict checking.' >&2\n\
+                  echo 'Host key verification failed.' >&2\n\
+                  exit 255\n";
+    let fake = fake_ssh_dir(script, "hostkey");
+
+    for args in [
+        vec!["--compact", "ping", "h"],
+        vec!["--compact", "run", "h", "--", "true"],
+        vec!["--compact", "deploy", "h"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_rx"))
+            .args(&args)
+            .env("PATH", path_with_fake_ssh(&fake))
+            .stdin(Stdio::null())
+            .output()
+            .expect("rx should be runnable");
+
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("one object for {args:?}: {e}"));
+        assert_eq!(value["code"], "ssh_host_key", "for {args:?}: {value}");
+        assert_eq!(value["retryable"], false, "for {args:?}: {value}");
+        assert!(
+            value["hint"]
+                .as_str()
+                .is_some_and(|h| h.contains("known_hosts")),
+            "the fix must be named, including on deploy: {value}"
+        );
+        assert_eq!(out.status.code(), Some(1), "for {args:?}");
+    }
+
+    let _ = std::fs::remove_dir_all(fake);
+}
+
 fn rx_write_with_piped_stdin(fake: &std::path::Path, payload: &[u8], pipe_status: &str) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rx"))
         .args(["--compact", "write", "h", "deadbeef"])

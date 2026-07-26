@@ -274,8 +274,8 @@ stdout/stderr/data fields pair with an `encoding`:
 
   bad_request · invalid_process_id · process_not_found · process_exited ·
   timeout · not_deployed · unsupported · ssh_unreachable · ssh_auth ·
-  not_found · incomplete_transfer · empty_stream · bad_host · file_changed ·
-  deploy_failed · internal
+  ssh_host_key · not_found · incomplete_transfer · empty_stream · bad_host ·
+  file_changed · deploy_failed · internal
 
 Branch on code, not message text. `code` is ALWAYS present — when nothing more
 specific fits, it is `internal`, never absent — so a switch on it never falls
@@ -289,6 +289,18 @@ ID answers `invalid_process_id` locally, without contacting the host at all — 
 a typo cannot come back as a retryable `ssh_unreachable` from a host that happens
 to be down. A release tag that 404s answers `deploy_failed`, not `internal`:
 `cache fetch --version v9.9.9` is a typo, not a blip.
+
+The three transport codes answer different questions, and `ssh_host_key` is the
+one you are most likely to meet first: rx runs ssh with BatchMode=yes, so ssh's
+default `StrictHostKeyChecking=ask` REFUSES rather than prompts, and any host
+the controller has never connected to fails there before rxd is even reached.
+It is not retryable — the hint names the fix, and adding a key you have not
+checked is the failure host verification exists to prevent.
+
+  ssh_unreachable  the host did not answer (DNS, refused, timeout) — retryable
+  ssh_auth         YOUR credential was refused — load a usable key
+  ssh_host_key     THE HOST's key was refused: unknown, changed, or a type this
+                   client will not negotiate — verify it and add it
 
 Three of these mean the command line is unusable and exit 2 rather than 1:
 `bad_request`, `bad_host`, `invalid_process_id`. Everything else is exit 1.

@@ -359,9 +359,40 @@ were on the list below; the fifth was not, and is the one that mattered most.
   "For more information…" are dropped, since the hint already points at
   `--help`.
 
+- **A refused host key is `ssh_host_key`, not a retry loop.** rx runs ssh with
+  `BatchMode=yes`, which turns ssh's default `StrictHostKeyChecking=ask` into a
+  refusal — so *every host the controller has not connected to before* fails
+  there, on `ping`, the first command of the documented first-contact sequence.
+  It used to answer `not_deployed` (deploy forever into the same wall); after
+  the probe fix above it answered `internal` + `retryable:true` (retry forever).
+  Both told an agent to loop on something only an operator can clear.
+
+  A new code rather than folding it into `ssh_auth`, against the standing
+  preference for reusing one: the recoveries are disjoint — verify and add a
+  host key versus load a usable client key — and one code covering both sends a
+  caller back to matching message text, which the contract forbids. Server
+  authentication is simply the third transport class beside `ssh_unreachable`
+  and `ssh_auth`. The hint deliberately does not say "run ssh-keyscan and move
+  on": accepting an unverified key is the failure host verification exists to
+  prevent, and a *changed* key is where that matters most. Hints now hang off
+  the code (`ssh::transport_hint`), so `deploy` stops answering a refused key
+  with its own `--binary`/`--offline` advice.
+
+  Only phrases ssh prints when it *refuses* are matched. The "REMOTE HOST
+  IDENTIFICATION HAS CHANGED" banner is excluded on purpose: under
+  `StrictHostKeyChecking=no` it is printed on a connection that then succeeds,
+  so matching it would relabel whatever failed later — a missing rxd, usually —
+  and cost the caller the `not_deployed` answer it needed.
+
+  Worth recording how it hid: the podman rig sets `StrictHostKeyChecking=no`,
+  so every round of verification this cycle ran with host checking disabled. It
+  took building a strict config on purpose to see the default path at all.
+
 Breaking: the five codes above exit 2 where they exited 1, `rx daemon status` no
-longer carries `changed`, and the error envelope's key order changed (a
-positional reader would notice; nothing branching on names does).
+longer carries `changed`, the error envelope's key order changed (a positional
+reader would notice; nothing branching on names does), and `ssh_host_key` is a
+new code a caller may not know — it was `internal` before, so a `switch` with a
+default arm is unaffected.
 
 **`rx daemon start` no longer holds its caller's stderr.** Found while writing
 the test above, which needed an explicit `Stdio::null()` to finish. The forked

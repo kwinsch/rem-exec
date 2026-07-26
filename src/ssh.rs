@@ -271,12 +271,23 @@ pub fn serve_stream_download(host: &str, request: &Request) -> Result<Child> {
 /// [`ErrorCode`] the CLI can surface as JSON, so agents branch on `code` for
 /// connectivity/auth failures the same way they do for rxd-side errors.
 ///
-/// Returns `None` for text that doesn't clearly indicate an unreachable host or
-/// an authentication failure (e.g. a host-key mismatch), leaving those as an
-/// untyped transport error rather than mislabeling them.
+/// Returns `None` for text that doesn't clearly indicate one of the three
+/// transport failures, leaving it as an untyped error rather than mislabeling it.
 pub fn classify_ssh_failure(stderr: &str) -> Option<ErrorCode> {
     let s = stderr.to_ascii_lowercase();
-    // Authentication is unambiguous when present, so check it first. Matching
+    // Host key first: when ssh refuses the server's key the connection never
+    // reaches authentication, so this is the operative failure.
+    //
+    // Only phrases ssh prints when it *refuses*. The "REMOTE HOST
+    // IDENTIFICATION HAS CHANGED" banner is deliberately not among them: under
+    // `StrictHostKeyChecking=no` it is printed on a connection that then
+    // succeeds, so matching it would relabel an ordinary later failure — a
+    // missing rxd, say — as a host-key problem and cost the caller the
+    // `not_deployed` answer it needed.
+    if s.contains("host key verification failed") || s.contains("no matching host key") {
+        return Some(ErrorCode::SshHostKey);
+    }
+    // Authentication is unambiguous when present, so check it next. Matching
     // is on whole phrases only: a bare "publickey" would also fire on a remote
     // command's own output (the ssh channel merges it into this stderr), and a
     // false positive here suppresses auto-deploy in `serve_request_auto_deploy`.
@@ -298,6 +309,33 @@ pub fn classify_ssh_failure(stderr: &str) -> Option<ErrorCode> {
         return Some(ErrorCode::SshUnreachable);
     }
     None
+}
+
+/// The fix for a transport failure, when there is a concrete one to name.
+///
+/// Lives beside the classifier so every path that reports a transport error
+/// carries the same hint: `deploy` used to classify the code correctly and then
+/// answer with its own `--binary`/`--offline` advice, which is unrelated to a
+/// refused key of either kind.
+pub fn transport_hint(code: ErrorCode) -> Option<&'static str> {
+    match code {
+        // rx runs ssh with BatchMode=yes, so this is always a refusal rather
+        // than a prompt nobody answered. Name the fix: the credential has to be
+        // one ssh can use unattended.
+        ErrorCode::SshAuth => Some(
+            "rx never prompts — load the key into ssh-agent (`ssh-add`), or use a key \
+             usable without a passphrase; verify with `ssh -o BatchMode=yes HOST true`",
+        ),
+        // Deliberately not "run ssh-keyscan and move on": accepting a key you
+        // have not checked is the whole failure mode host verification exists to
+        // prevent, and a changed key is the case where that matters most.
+        ErrorCode::SshHostKey => Some(
+            "the host's key is not in known_hosts, or no longer matches — check the \
+             fingerprint against the host (`ssh-keyscan HOST`), then add it; if it \
+             CHANGED, find out why before trusting it",
+        ),
+        _ => None,
+    }
 }
 
 /// Validate an `ssh ... serve` invocation and decode its single JSON response.
@@ -499,9 +537,56 @@ mod tests {
             classify_ssh_failure("Received disconnect from x: Too many authentication failures"),
             Some(ErrorCode::SshAuth)
         );
-        // Host-key mismatch and unknown text stay untyped rather than mislabeled.
-        assert_eq!(classify_ssh_failure("Host key verification failed."), None);
         assert_eq!(classify_ssh_failure("some unrelated failure"), None);
+    }
+
+    /// A refused host key is its own class, and the most likely first-contact
+    /// failure there is: `BatchMode=yes` turns ssh's default
+    /// `StrictHostKeyChecking=ask` into a refusal, so every host the controller
+    /// has not seen before arrives here. It answered `internal` +
+    /// `retryable:true` until 0.4.0 — a retry loop spinning on something only an
+    /// operator can clear.
+    #[test]
+    fn classify_ssh_failure_types_a_refused_host_key() {
+        assert_eq!(
+            classify_ssh_failure(
+                "No ED25519 host key is known for [127.0.0.1]:2201 and you have requested \
+                 strict checking.\r\nHost key verification failed."
+            ),
+            Some(ErrorCode::SshHostKey)
+        );
+        assert_eq!(
+            classify_ssh_failure(
+                "Unable to negotiate with 10.0.0.1 port 22: no matching host key type found."
+            ),
+            Some(ErrorCode::SshHostKey)
+        );
+        assert!(
+            !ErrorCode::SshHostKey.retryable(),
+            "only an operator can clear a refused host key"
+        );
+        assert!(
+            transport_hint(ErrorCode::SshHostKey).is_some_and(|h| h.contains("known_hosts")),
+            "the hint must name where the key goes"
+        );
+    }
+
+    /// The changed-key banner alone is NOT a refusal: under
+    /// `StrictHostKeyChecking=no` ssh prints it and connects anyway, so matching
+    /// it would relabel whatever failed later — a missing rxd, typically — and
+    /// cost the caller the `not_deployed` answer it needed.
+    #[test]
+    fn classify_ssh_failure_ignores_the_changed_key_banner_alone() {
+        assert_eq!(
+            classify_ssh_failure(
+                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\r\n\
+                 @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\r\n\
+                 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\r\n\
+                 bash: line 1: .local/bin/rxd: No such file or directory"
+            ),
+            None,
+            "an unrefused banner must leave the real failure classifiable"
+        );
     }
 
     // A remote command's own stdout/stderr is merged into the ssh channel's

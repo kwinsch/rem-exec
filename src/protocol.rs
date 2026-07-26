@@ -155,8 +155,22 @@ pub enum ErrorCode {
     Unsupported,
     /// SSH could not reach the host (network/DNS/refused).
     SshUnreachable,
-    /// SSH authentication failed.
+    /// SSH authentication failed — *our* credential was refused.
     SshAuth,
+    /// The *host's* key was refused: absent from `known_hosts`, changed, or of a
+    /// type this client will not negotiate. The connection never reached
+    /// authentication.
+    ///
+    /// Its own code rather than `ssh_auth` because the recovery is disjoint —
+    /// add or verify a host key versus load a usable client key — and a caller
+    /// that cannot tell them apart is back to matching message text, which the
+    /// contract forbids. It is also the *default* first-contact failure for an
+    /// agent: rx runs ssh with `BatchMode=yes`, and ssh's default
+    /// `StrictHostKeyChecking=ask` refuses rather than prompts under BatchMode,
+    /// so every host the controller has not seen before lands here. It used to
+    /// answer `internal` + `retryable:true`, which told a retry loop to spin on
+    /// a condition only an operator can clear.
+    SshHostKey,
     /// A streamed transfer ended before the declared byte count (e.g. a dropped
     /// connection); the partial file was discarded, not installed.
     IncompleteTransfer,
@@ -537,6 +551,7 @@ mod tests {
         ErrorCode::Unsupported,
         ErrorCode::SshUnreachable,
         ErrorCode::SshAuth,
+        ErrorCode::SshHostKey,
         ErrorCode::IncompleteTransfer,
         ErrorCode::EmptyStream,
         ErrorCode::NotFound,
