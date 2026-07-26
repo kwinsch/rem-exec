@@ -486,7 +486,7 @@ fn main() -> ExitCode {
 
     // Direct SSH is the canonical path. The local daemon is an optional
     // accelerator for repeated reads of long-running processes; it handles a
-    // command only when explicitly opted in (REM_EXEC_DAEMON=1), so a daemon
+    // command only when explicitly opted in (RX_DAEMON=1), so a daemon
     // that merely happens to be running never silently changes how a command is
     // transported or how it fails.
     if daemon_enabled() {

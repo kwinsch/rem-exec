@@ -111,7 +111,9 @@ verbatim in rem-exec-vault):
   them. Whether hosts may change under you is a property of the environment, not
   a per-call choice, so it follows `RX_CONNECT_TIMEOUT` and stays out of `--help`.
 - Env vars are guessable from the binary name: `RX_JSON`, `RX_DAEMON`,
-  `RX_AUTO_DEPLOY`, `RX_CONNECT_TIMEOUT`. The `REM_EXEC_*` names still work.
+  `RX_AUTO_DEPLOY`, `RX_CONNECT_TIMEOUT`. The older `REM_EXEC_AUTO_DEPLOY`,
+  `REM_EXEC_JSON` and `REM_EXEC_DAEMON` are still honored as fallbacks;
+  `RX_CONNECT_TIMEOUT` arrived with the rename and never had a `REM_EXEC_` form.
 - The guide is stamped with the version that shipped it, opens with the
   first-contact sequence (`ping` → `deploy` → work), states the stdin/TTY
   hazard, and names rxv — its secret-delivery example used to invoke a tool that
@@ -373,11 +375,12 @@ release — up to four arches, ~4.5 MB — and 0.2.x's unversioned `rxd-<arch>`
 files are orphaned outright by the rename, since only `rxd-<version>-<arch>` is
 ever read now.
 
-Prune from `rx setup`: drop entries older than the running rx, plus the
-unversioned leftovers. Keeping the current version and one predecessor is the
-useful shape — the predecessor is what you deploy when rolling a host back —
-so this is "keep N", not "delete everything else". `--prune-all` for reclaiming
-the lot. Worth doing before the cache has enough versions in it to matter.
+`rx cache prune` (the second verb the `cache` namespace was created for): drop
+entries older than the running rx, plus the unversioned leftovers. Keeping the
+current version and one predecessor is the useful shape — the predecessor is
+what you deploy when rolling a host back — so this is "keep N", not "delete
+everything else". `--prune-all` for reclaiming the lot. Worth doing before the
+cache has enough versions in it to matter.
 
 ### Stale transfer temps
 

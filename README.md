@@ -133,7 +133,7 @@ mismatched `rxd` is reported as a typed `not_deployed` error naming the command
 that fixes it. `RX_AUTO_DEPLOY=local` allows that repair from the local cache
 without any download; `=on` allows fetching too. There is no flag for it: whether
 hosts may change under you belongs to the environment rx runs in, not to each
-invocation. (`REM_EXEC_AUTO_DEPLOY` still works.)
+invocation. (The pre-0.4 `REM_EXEC_*` spellings still work.)
 
 ## Security notes
 
@@ -176,7 +176,7 @@ Communication flows over SSH. No custom ports, no daemons to manage on the remot
 
 - crates.io: `cargo install rem-exec`
 - GitHub Releases: static `rx` and `rxd` binaries for x86_64, aarch64, riscv64, and armv7
-- Auto-deploy cache: `~/.local/share/rem-exec/bin/rxd-{arch}` (`rx cache fetch`)
+- Auto-deploy cache: `~/.local/share/rem-exec/bin/rxd-{version}-{arch}` (`rx cache fetch`)
 
 Release downloads include `SHA256SUMS`. Verify downloaded assets before use in
 production workflows.

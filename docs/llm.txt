@@ -123,7 +123,9 @@ observe, control, move files, local machinery.
 
 Global: --compact, --pretty
 Env:    RX_AUTO_DEPLOY=off|local|on (see Deploy and connections), RX_JSON,
-        RX_DAEMON, RX_CONNECT_TIMEOUT
+        RX_DAEMON, RX_CONNECT_TIMEOUT. The pre-0.4 spellings
+        REM_EXEC_AUTO_DEPLOY / REM_EXEC_JSON / REM_EXEC_DAEMON are still
+        honored as fallbacks; RX_CONNECT_TIMEOUT is newer and never had one.
 
 Notes:
 - Everything after `--` is the remote argv. `--` is optional but disambiguates a
@@ -307,7 +309,7 @@ is what moves the pair. What RX_AUTO_DEPLOY controls is when *hosts* change:
 There is no flag for this, deliberately: whether hosts may change under you is a
 property of the environment rx runs in, not a decision to re-make per call —
 the same reasoning that keeps RX_CONNECT_TIMEOUT env-only. (1/true still mean
-on; the older REM_EXEC_AUTO_DEPLOY still works but is not the name to learn.)
+on; the older REM_EXEC_* spellings still work but are not the names to learn.)
 
 `rx deploy` is explicit and always allowed regardless of this setting. rx never
 downgrades a host that is ahead of it — by protocol or by version — without
