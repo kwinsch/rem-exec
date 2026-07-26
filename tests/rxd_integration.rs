@@ -905,7 +905,7 @@ fn put_into_an_unwritable_directory_is_typed_and_not_retryable() {
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
 
     assert_eq!(resp["type"], "error", "{resp}");
-    assert_eq!(resp["code"], "bad_request", "{resp}");
+    assert_eq!(resp["code"], "permission_denied", "{resp}");
     assert_eq!(resp["retryable"], false, "{resp}");
 }
 

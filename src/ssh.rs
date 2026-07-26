@@ -413,13 +413,19 @@ pub fn ssh_exec(host: &str, args: &[&str]) -> Result<Response> {
 }
 
 /// Spawn an SSH process with stdin piped (raw streaming to remote).
+///
+/// stderr is piped, not inherited: a transport failure (exit 255) has to reach
+/// [`classify_ssh_failure`] so auth / host-key refusals are not reported as
+/// retryable `ssh_unreachable`. Callers must drain stderr (typically on a
+/// background thread while writing stdin) so a chatty ssh cannot fill the pipe
+/// and block.
 pub fn ssh_spawn_piped_stdin(host: &str, args: &[&str]) -> Result<Child> {
     let mut cmd = ssh_command(host);
     cmd.arg(REMOTE_BIN);
     cmd.args(args);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::inherit());
+    cmd.stderr(Stdio::piped());
     cmd.spawn().map_err(RemExecError::Io)
 }
 

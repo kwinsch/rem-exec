@@ -766,6 +766,24 @@ fn one_line(s: &str) -> String {
 /// unreachable host reports `ssh_unreachable` here exactly as it would
 /// anywhere else.
 ///
+/// Classify a release-asset download / cache failure (no host, no SSH).
+///
+/// Shared by `rx cache fetch` and the download leg of `deploy` so a checksum
+/// mismatch never answers `internal`+retryable on one path and `deploy_failed`
+/// on the other. Permanent asset problems are [`ErrorCode::DeployFailed`];
+/// transient download transport and local IO stay [`ErrorCode::Internal`].
+pub fn release_download_error_code(err: &RemExecError) -> ErrorCode {
+    match err {
+        RemExecError::AssetNotFound(_) => ErrorCode::DeployFailed,
+        // curl/network blip while fetching an asset that may exist.
+        RemExecError::Other(msg) if msg.starts_with("failed to download") => ErrorCode::Internal,
+        RemExecError::Io(_) => ErrorCode::Internal,
+        // Checksum mismatch, missing SUMS entry, missing local binary under
+        // --offline, downgrade refusal, …
+        _ => ErrorCode::DeployFailed,
+    }
+}
+
 /// Download failures keep the AssetNotFound / Other split that `cache fetch`
 /// already uses: a 404 is permanent `deploy_failed`, while a DNS/connect/
 /// timeout is `internal` + `retryable:true` so an agent does not give up on a
@@ -789,21 +807,7 @@ pub fn deploy_error_response(host: &str, err: &RemExecError) -> Response {
     let message = one_line(&format!("deploy to {host} failed: {err}"));
     let hint = "pass --binary PATH to push a local rxd build, or --offline to use only \
          what the deploy cache already has";
-
-    match err {
-        // HTTP 404 (or equivalent): the release is not there.
-        RemExecError::AssetNotFound(_) => {
-            Response::error_code(ErrorCode::DeployFailed, message).with_hint(hint)
-        }
-        // Transient download / local IO while fetching: same answer as `cache fetch`.
-        RemExecError::Other(msg) if msg.starts_with("failed to download") => {
-            Response::error_code(ErrorCode::Internal, message).with_hint(hint)
-        }
-        RemExecError::Io(_) => Response::error_code(ErrorCode::Internal, message).with_hint(hint),
-        // Permanent deploy problems (missing local binary, downgrade refusal,
-        // checksum mismatch, unreadable scp that was not SSH-classified, …).
-        _ => Response::error_code(ErrorCode::DeployFailed, message).with_hint(hint),
-    }
+    Response::error_code(release_download_error_code(err), message).with_hint(hint)
 }
 
 #[cfg(test)]
@@ -856,6 +860,30 @@ mod tests {
         assert_eq!(json["type"], "error");
         assert_eq!(json["code"], "internal");
         assert_eq!(json["retryable"], true);
+    }
+
+    /// A corrupt or substituted release asset must never be `internal`+retryable:
+    /// the bytes do not become good on a second attempt, and an agent that
+    /// retries forever on checksum mismatch is exactly the failure mode the
+    /// 404 → `deploy_failed` fix closed for missing tags.
+    #[test]
+    fn a_checksum_mismatch_is_permanent_deploy_failed() {
+        let err =
+            RemExecError::Other("checksum mismatch for rxd-x86_64: expected abcd, got efgh".into());
+        assert_eq!(
+            release_download_error_code(&err),
+            ErrorCode::DeployFailed,
+            "checksum mismatch is permanent"
+        );
+        assert!(!ErrorCode::DeployFailed.retryable());
+
+        let missing_sums = RemExecError::Other(
+            "SHA256SUMS for 0.4.0 does not contain checksum for rxd-x86_64".into(),
+        );
+        assert_eq!(
+            release_download_error_code(&missing_sums),
+            ErrorCode::DeployFailed
+        );
     }
 
     /// The message reaches the caller as one line: a compact JSON object is

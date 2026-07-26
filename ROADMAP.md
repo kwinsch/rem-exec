@@ -252,9 +252,11 @@ the ones underneath them, where the response was not merely noisy but wrong.
   that can *never* succeed were the two rx told a caller to try again, on one of
   the two daily verbs. `get` had answered `not_found` for the same OS condition
   since it shipped. The mapping lives in `protocol::io_error_code` now, and both
-  halves of the pair share it: ENOENT → `not_found`, EACCES → `bad_request`, and
-  `internal` means only what the contract says it means. ENOENT's hint names
-  `mkdir -p`; EACCES's names the privileged-rxd option.
+  halves of the pair share it: ENOENT → `not_found`, EACCES →
+  `permission_denied` (exit 1 — a usable call the world refused; never
+  `bad_request`/exit 2), and `internal` means only what the contract says it
+  means. ENOENT's hint names `mkdir -p`; EACCES's names the privileged-rxd
+  option.
 - **Errors could still arrive with no `code` at all.** `Response::error()` — the
   untyped constructor — survived 0.4.0's typing pass at two call sites in the
   transport classifier's fall-through. A *local* `get` failure (unwritable
@@ -285,7 +287,7 @@ the ones underneath them, where the response was not merely noisy but wrong.
   not depend on which side caught it.
 
 Breaking: `put` and `get` error *codes* changed for missing/unwritable paths
-(`internal` → `not_found`/`bad_request`) and those errors are no longer
+(`internal` → `not_found`/`permission_denied`) and those errors are no longer
 `retryable`. A caller branching on `code` sees a more accurate answer; one
 branching on `retryable` stops looping. BatchMode is a behaviour change for
 anyone relying on an interactive password prompt — use ssh-agent. The

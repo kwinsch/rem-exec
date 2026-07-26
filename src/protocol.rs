@@ -196,6 +196,12 @@ pub enum ErrorCode {
     /// own codes). Not retryable — a release that 404s does not appear on a
     /// second attempt, and the hint names the fixes that do work.
     DeployFailed,
+    /// A filesystem path was refused by the OS because the caller lacks
+    /// permission (EACCES / EPERM). Permanent and caller-fixable — a retry
+    /// does not grant access. Distinct from [`ErrorCode::BadRequest`]: the
+    /// command line was well-formed and the world refused it, so the process
+    /// exits 1 (usable call failed), not 2 (unusable call).
+    PermissionDenied,
     /// Unexpected internal failure.
     Internal,
 }
@@ -224,9 +230,9 @@ impl ErrorCode {
     /// both check and emit one code.
     ///
     /// The line is "is my command line usable", not "is this permanent":
-    /// `not_found`, `empty_stream` and `deploy_failed` are all permanent, but
-    /// the call that produced them was well-formed and something about the
-    /// world, not the invocation, has to change.
+    /// `not_found`, `empty_stream`, `permission_denied` and `deploy_failed` are
+    /// all permanent, but the call that produced them was well-formed and
+    /// something about the world, not the invocation, has to change.
     pub fn exit_code(self) -> u8 {
         match self {
             ErrorCode::BadRequest | ErrorCode::BadHost | ErrorCode::InvalidProcessId => 2,
@@ -504,13 +510,18 @@ pub enum DaemonResponse {
 /// ones rx told the caller to try again. Only genuinely unclassified failures
 /// stay `Internal`.
 ///
+/// EACCES maps to [`ErrorCode::PermissionDenied`] (exit 1), not
+/// [`ErrorCode::BadRequest`] (exit 2): the invocation was usable; the OS
+/// refused the path. Overloading `bad_request` for both made agents rewrite
+/// argv when the fix was permissions.
+///
 /// Call sites format their own message: `no such file: /etc/app.conf` reads
 /// better than the raw `os error 2`, and the code is the part that is stable.
 pub fn io_error_code(e: &std::io::Error) -> ErrorCode {
     use std::io::ErrorKind;
     match e.kind() {
         ErrorKind::NotFound => ErrorCode::NotFound,
-        ErrorKind::PermissionDenied => ErrorCode::BadRequest,
+        ErrorKind::PermissionDenied => ErrorCode::PermissionDenied,
         _ => ErrorCode::Internal,
     }
 }
@@ -558,13 +569,15 @@ mod tests {
         ErrorCode::BadHost,
         ErrorCode::FileChanged,
         ErrorCode::DeployFailed,
+        ErrorCode::PermissionDenied,
         ErrorCode::Internal,
     ];
 
     /// Exit 2 means "this call is unusable as written". The line is not "is it
-    /// permanent" — `not_found`, `empty_stream` and `deploy_failed` are all
-    /// permanent, but the invocation that produced them was well-formed and it
-    /// is the world, not the command line, that has to change.
+    /// permanent" — `not_found`, `empty_stream`, `permission_denied` and
+    /// `deploy_failed` are all permanent, but the invocation that produced them
+    /// was well-formed and it is the world, not the command line, that has to
+    /// change.
     #[test]
     fn exit_two_is_exactly_the_unusable_call() {
         for code in ALL_CODES {
@@ -590,6 +603,21 @@ mod tests {
                 "{code:?} tells a caller both 'fix your call' and 'try again'"
             );
         }
+    }
+
+    /// EACCES is a world refusal, not a malformed call: exit 1 and not retryable.
+    #[test]
+    fn permission_denied_is_a_usable_call_that_the_world_refused() {
+        assert_eq!(ErrorCode::PermissionDenied.exit_code(), 1);
+        assert!(!ErrorCode::PermissionDenied.retryable());
+        assert_eq!(
+            io_error_code(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            ErrorCode::PermissionDenied
+        );
+        assert_eq!(
+            io_error_code(&std::io::Error::from(std::io::ErrorKind::NotFound)),
+            ErrorCode::NotFound
+        );
     }
 
     /// `code` leads the object, ahead of `message`: it is the field callers

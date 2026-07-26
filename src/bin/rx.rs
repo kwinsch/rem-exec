@@ -11,7 +11,8 @@ use rem_exec::daemon::server;
 use rem_exec::error::RemExecError;
 use rem_exec::protocol::{DaemonRequest, DaemonResponse, ErrorCode, Request, Response};
 use rem_exec::ssh::{
-    REMOTE_BIN, RemoteArgs, serve_request_auto_deploy, ssh_command, ssh_spawn_piped_stdin,
+    REMOTE_BIN, RemoteArgs, classify_ssh_failure, serve_request_auto_deploy, ssh_command,
+    ssh_spawn_piped_stdin, transport_hint,
 };
 
 /// Cap on stdin inlined into a `run`/`write` request. Larger inputs should use
@@ -476,14 +477,25 @@ fn main() -> ExitCode {
                 "check the tag with `gh release list` (or the releases page); \
                  `--version vX.Y.Z` selects another one",
             ),
-            // Unsupported `--arch` is a permanent client mistake, same class as
-            // a missing release: never `internal`/`retryable:true`.
+            // Unsupported `--arch` is a permanent client mistake (exit 2).
+            // Everything else shares `release_download_error_code` with deploy:
+            // checksum mismatch / missing SUMS entry → permanent `deploy_failed`,
+            // never `internal`+retryable (an agent would loop forever on a
+            // corrupt or substituted asset).
             Err(e) => {
                 let message = e.to_string();
                 if message.starts_with("unsupported architecture") {
                     fail(ErrorCode::BadRequest, message)
                 } else {
-                    fail(ErrorCode::Internal, message)
+                    match rem_exec::deploy::release_download_error_code(&e) {
+                        ErrorCode::DeployFailed => fail_hint(
+                            ErrorCode::DeployFailed,
+                            message,
+                            "check the release assets and SHA256SUMS; re-run after the \
+                             release is fixed, or pass `--force` once a good asset lands",
+                        ),
+                        code => fail(code, message),
+                    }
                 }
             }
         };
@@ -672,12 +684,25 @@ fn pipe_local_stdin_to_remote(
         }
     };
 
+    // Drain stderr while we write stdin so a chatty ssh cannot fill the pipe
+    // buffer and block. On exit 255 the text is what [`classify_ssh_failure`]
+    // needs; inheriting it used to make every 255 look like bare
+    // `ssh_unreachable` because the classifier never saw the phrase.
+    let stderr_handle = child.stderr.take().map(|mut stderr| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stderr, &mut buf);
+            buf
+        })
+    });
+
     let mut remote_stdin = child.stdin.take().unwrap();
     let copied = match copy_local_stdin_to_remote(&mut remote_stdin) {
         Ok(copied) => copied,
         Err(e) => {
             drop(remote_stdin);
             let _ = child.wait();
+            let _ = stderr_handle.and_then(|h| h.join().ok());
             if report == PipeStdinReport::Written {
                 return print_pipe_error(Response::error_code(
                     rem_exec::protocol::ErrorCode::Internal,
@@ -689,6 +714,11 @@ fn pipe_local_stdin_to_remote(
     };
     drop(remote_stdin);
 
+    let stderr = stderr_handle
+        .and_then(|h| h.join().ok())
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+
     // OpenSSH reserves 255 for its own failures (unreachable, auth, mux), while
     // rxd only ever exits 0 or 1. That split is what lets us report a genuine
     // transport failure without also failing the ordinary case where pipe-stdin
@@ -696,10 +726,26 @@ fn pipe_local_stdin_to_remote(
     match child.wait() {
         Ok(s) if s.code() == Some(255) => {
             if report == PipeStdinReport::Written {
-                return print_pipe_error(Response::error_code(
-                    rem_exec::protocol::ErrorCode::SshUnreachable,
-                    format!("ssh to {host} failed while feeding stdin to process {id}"),
-                ));
+                let code = classify_ssh_failure(&stderr)
+                    .unwrap_or(rem_exec::protocol::ErrorCode::SshUnreachable);
+                let message = if stderr.trim().is_empty() {
+                    format!("ssh to {host} failed while feeding stdin to process {id}")
+                } else {
+                    format!(
+                        "ssh to {host} failed while feeding stdin to process {id}: {}",
+                        stderr.trim().lines().next().unwrap_or("").trim()
+                    )
+                };
+                let response = Response::error_code(code, message);
+                let response = match transport_hint(code) {
+                    Some(hint) => response.with_hint(hint),
+                    None => response,
+                };
+                return print_pipe_error(response);
+            }
+            // Quiet path: human note only — the started object already went out.
+            if !stderr.trim().is_empty() {
+                eprint!("{stderr}");
             }
             ExitCode::FAILURE
         }
@@ -2445,8 +2491,13 @@ mod tests {
 
         let denied = local_io_error_json("/etc/f", &Error::from(ErrorKind::PermissionDenied));
         let value = serde_json::to_value(&denied).unwrap();
-        assert_eq!(value["code"], "bad_request", "{value}");
+        assert_eq!(value["code"], "permission_denied", "{value}");
         assert_eq!(value["retryable"], false, "{value}");
+        // Usable call, world refused: exit 1, not the "fix the command line" 2.
+        assert_eq!(
+            rem_exec::protocol::ErrorCode::PermissionDenied.exit_code(),
+            1
+        );
     }
 
     /// A local source failure during `put` is the same class: never a transport

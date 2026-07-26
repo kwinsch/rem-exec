@@ -275,7 +275,7 @@ stdout/stderr/data fields pair with an `encoding`:
   bad_request · invalid_process_id · process_not_found · process_exited ·
   timeout · not_deployed · unsupported · ssh_unreachable · ssh_auth ·
   ssh_host_key · not_found · incomplete_transfer · empty_stream · bad_host ·
-  file_changed · deploy_failed · internal
+  file_changed · deploy_failed · permission_denied · internal
 
 Branch on code, not message text. `code` is ALWAYS present — when nothing more
 specific fits, it is `internal`, never absent — so a switch on it never falls
@@ -284,10 +284,11 @@ through to undefined. `retryable:true` means the same call may succeed on retry
 
 Anything you have to fix yourself is NOT retryable, so a retry loop terminates:
 a missing target directory or a path the SSH user cannot write answers
-`not_found` / `bad_request` with a hint (not `internal`), and a malformed process
-ID answers `invalid_process_id` locally, without contacting the host at all — so
-a typo cannot come back as a retryable `ssh_unreachable` from a host that happens
-to be down. A release tag that 404s answers `deploy_failed`, not `internal`:
+`not_found` / `permission_denied` with a hint (not `internal`), and a malformed
+process ID answers `invalid_process_id` locally, without contacting the host at
+all — so a typo cannot come back as a retryable `ssh_unreachable` from a host
+that happens to be down. A release tag that 404s, or a release asset whose
+checksum does not match SHA256SUMS, answers `deploy_failed`, not `internal`:
 `cache fetch --version v9.9.9` is a typo, not a blip.
 
 The three transport codes answer different questions, and `ssh_host_key` is the
@@ -303,7 +304,9 @@ checked is the failure host verification exists to prevent.
                    client will not negotiate — verify it and add it
 
 Three of these mean the command line is unusable and exit 2 rather than 1:
-`bad_request`, `bad_host`, `invalid_process_id`. Everything else is exit 1.
+`bad_request`, `bad_host`, `invalid_process_id`. Everything else is exit 1 —
+including `permission_denied` (EACCES): the call was well-formed and the OS
+refused the path.
 
 ## HOST argument
 
