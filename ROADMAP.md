@@ -130,10 +130,12 @@ Everything below is proposed, not committed. Ordered by agent-experience value.
 
 ## 0.4.x CLI polish (before any 0.5.0 bump)
 
-The 0.4.0 line is where CLI structure gets polished; no 0.4.0 artefacts are
-public, so breaking changes are still free here. Findings came from walking the
-documented first-contact path (`ping` → `deploy` → `run`) against real hosts —
-rootless podman containers, see the note at the end of this section.
+The 0.4.0 line is where CLI structure got polished. v0.4.0 shipped 2026-07-27
+(GitHub release + crates.io), which closed the free-break window this section
+kept invoking — anything breaking from here on is a 0.5.0 conversation.
+Findings came from walking the documented first-contact path (`ping` →
+`deploy` → `run`) against real hosts — rootless podman containers, see the
+note at the end of this section.
 
 All of it landed across three commits; what follows is the record of what
 changed and why, not a plan.
